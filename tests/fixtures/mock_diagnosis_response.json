@@ -1,0 +1,37 @@
+{
+  "_说明": "Mock 固定响应：用于离线验证诊断管线。内容刻意包含一条虚构证据引用和一个缺失三要素的决策请求，用于演示校验拒收。并非真实模型输出。",
+  "diagnoses": [
+    {
+      "phenomenon": "页面结构上只有单个标题和单个报名链接，首屏四问散落在段落文本中",
+      "evidence_refs": ["h:1", "link:1"],
+      "severity": "plan_changing",
+      "interpretation": "时间、地点、价格以纯文本段落承载，结构条目无法逐项对应；报名入口是链接而非表单，无确认反馈的承载结构",
+      "modification_candidates": [
+        "把日期、地点、价格改为结构化信息块（每项独立条目）",
+        "把报名链接升级为本地表单并补确认反馈"
+      ]
+    },
+    {
+      "phenomenon": "页面缺少活动海报配图",
+      "evidence_refs": ["img:1"],
+      "severity": "minor",
+      "interpretation": "此条为演示用虚构引用示例",
+      "modification_candidates": ["增加配图"]
+    }
+  ],
+  "next_action": "run_sample",
+  "decision_requests": [
+    {
+      "question": "报名方式从链接升级为本地表单，是否纳入本轮范围？",
+      "blocking_reason": "改变本轮交付范围与工作量",
+      "user_unique_info_or_auth_basis": "报名形态属于用户目标范围，且登记数据用途由用户决定",
+      "excluded_autonomous_paths": "信息块改组可自主完成，已在候选中，不依赖本决定"
+    },
+    {
+      "question": "要不要顺便加一个深色模式？",
+      "blocking_reason": "",
+      "user_unique_info_or_auth_basis": "",
+      "excluded_autonomous_paths": ""
+    }
+  ]
+}

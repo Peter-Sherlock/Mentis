@@ -30,8 +30,9 @@ class EntryTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn(__version__, result.stdout)
-        self.assertIn("未接入真实模型", result.stdout)
+        self.assertIn("DEEPSEEK_API_KEY", result.stdout)
         self.assertIn("demo-contract", result.stdout)
+        self.assertIn("diagnose", result.stdout)
 
 
 if __name__ == "__main__":
