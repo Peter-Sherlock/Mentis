@@ -24,6 +24,8 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis demo-routing   首领域资源按需加载与缺口分流演示（确定性规则）
   python -m mentis diagnose       真实模型页面诊断（结构观察→候选→校验；--fixture 为 Mock 模式）
   python -m mentis observe-page   本地 HTML 双视口截图（P3.1，静态初始画面）
+  python -m mentis collab         默认自主委托的协作运行（真实执行器+截图；--design 为共同设计）
+  python -m mentis collab-resume  恢复运行：回答请求 / 反馈修订 / 改目标 / 撤回
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -43,6 +45,22 @@ def main(argv=None) -> int:
     observe = sub.add_parser("observe-page", help="本地 HTML 双视口截图；不执行点击或提交")
     observe.add_argument("--page", required=True, help="本地 HTML 文件路径")
     observe.add_argument("--out", default="", help="输出目录；默认 runtime/observations/<运行编号>")
+    col = sub.add_parser("collab", help="P2.3 协作运行：目标→自主委托→产物→观察（需 Codex 登录态）")
+    col.add_argument("--goal", required=True, help="本轮网页目标")
+    col.add_argument("--design", action="store_true", help="共同设计模式（先确认风格方向；默认自主）")
+    col.add_argument("--direction", default="", help="直接给出风格方向（跳过方向提问）")
+    col.add_argument("--non-interactive", action="store_true", help="不等待输入：待决事项保持未决")
+    col.add_argument("--max-repairs", type=int, default=1, help="自动修复轮数上限（默认 1）")
+    col.add_argument("--timeout", type=int, default=420, help="单次执行器超时秒数（1—600）")
+    res = sub.add_parser("collab-resume", help="恢复协作运行：回答/反馈/改目标/撤回")
+    res.add_argument("--state", required=True, help="runtime/collab/<run>/state.json")
+    res.add_argument("--answer", action="append", default=[], help="<请求ID>:<回答>，可多次")
+    res.add_argument("--feedback", default="", help="用户修正（进入新 brief 版本并续接修订）")
+    res.add_argument("--goal-new", default="", help="改变目标（旧版本结果不再适用）")
+    res.add_argument("--revoke", action="store_true", help="撤回授权（后续委托全部拒绝）")
+    res.add_argument("--confirm-outcome", default="", choices=["", "completed", "failed"],
+                     help="unknown 的人工核对确认（须先自行核对执行器与产物）")
+    res.add_argument("--non-interactive", action="store_true", help="不等待输入")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -75,6 +93,14 @@ def main(argv=None) -> int:
                   f"{view.screenshot_path or view.error}")
         print("[边界] " + "；".join(observation.limitations))
         return 0 if all(view.screenshot_path and not view.error for view in observation.views) else 1
+    if args.command == "collab":
+        from mentis.collab_cli import run_collab
+
+        return run_collab(args)
+    if args.command == "collab-resume":
+        from mentis.collab_cli import run_resume
+
+        return run_resume(args)
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())
     print(f"Python {platform.python_version()} on {platform.system()}")

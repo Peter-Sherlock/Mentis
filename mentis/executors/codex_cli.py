@@ -150,9 +150,15 @@ class CodexCliAdapter:
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
                     timeout=spec.timeout_s,
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                # 超时：状态 unknown、锁保留；但已捕获的事件要保留用于核对与续接
                 timed_out = True
                 result.error = "Codex turn 超时；执行器是否仍在写入未知，禁止自动重试"
+                partial = exc.stdout or ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", errors="replace")
+                if partial:
+                    self._parse_events(partial, result)
                 return result
             except OSError as exc:
                 result.status = AttemptStatus.FAILED
@@ -178,6 +184,14 @@ class CodexCliAdapter:
                 for e in result.events
             ):
                 result.status = AttemptStatus.COMPLETED
+            elif (completed.returncode == 0 and result.native_thread_id
+                  and result.final_response and not any(
+                      e.kind in ("turn.failed", "error", "invalid_jsonl")
+                      for e in result.events)):
+                # 干净退出、有最终文本，但缺少 turn.completed 终态事件：
+                # 结局不确定而非明确失败 → unknown，交由产物核对决定
+                result.status = AttemptStatus.UNKNOWN
+                result.error = "Codex 退出码 0 且有最终文本，但缺少 turn.completed；需产物核对"
             else:
                 result.status = AttemptStatus.FAILED
                 result.error = f"Codex 未报告成功终态（进程退出码 {completed.returncode}）"

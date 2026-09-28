@@ -1,10 +1,10 @@
 [project]
 name = "mentis"
-version = "0.5.0"
+version = "0.6.0"
 description = "Mentis：代表非专业用户与执行型 Agent 持续协作的代理（P3.1 执行器与产物观察）"
 requires-python = ">=3.10"
 
 [tool.mentis]
-stage = "P3.1"
+stage = "P2.3"
 model = "deepseek-flash（DeepSeek-V4.1-Flash，ADR-007）"
 notes = "DeepSeek 真实诊断已验证；Codex CLI Adapter 与双视口初始截图已验证，尚未连接自主委托闭环"

@@ -265,6 +265,13 @@ class TaskSession:
             attempt.artifact_id = artifact.artifact_id
         return attempt
 
+    def fail_attempt(self, attempt_id: str) -> ExecutionAttempt:
+        attempt = self._get_attempt(attempt_id)
+        if attempt.status not in (AttemptStatus.DISPATCHED, AttemptStatus.RUNNING):
+            raise InvalidState(f"{attempt.status} 不能转为 failed")
+        attempt.status = AttemptStatus.FAILED
+        return attempt
+
     def mark_unknown(self, attempt_id: str) -> ExecutionAttempt:
         """提交超时等场景：进入 unknown，不自动重发。"""
         attempt = self._get_attempt(attempt_id)
@@ -274,10 +281,14 @@ class TaskSession:
         return attempt
 
     def confirm_outcome(self, attempt_id: str, final_status: AttemptStatus) -> ExecutionAttempt:
-        """外部核对后显式确认结局；unknown 只能经此转换。"""
+        """外部核对后显式确认结局；unknown 只能经此转换。
+
+        FAILED 也允许经人工核对确认——用于"无终态事件被记为失败，但产物可独立
+        核对"的情形；调用者必须先核实产物与执行器状态并留痕。
+        """
         attempt = self._get_attempt(attempt_id)
-        if attempt.status is not AttemptStatus.UNKNOWN:
-            raise InvalidState("confirm_outcome 只适用于 unknown 状态")
+        if attempt.status not in (AttemptStatus.UNKNOWN, AttemptStatus.FAILED):
+            raise InvalidState("confirm_outcome 只适用于 unknown/failed 状态")
         if final_status not in (AttemptStatus.COMPLETED, AttemptStatus.FAILED, AttemptStatus.INTERRUPTED):
             raise InvalidState(f"非法的最终状态: {final_status}")
         attempt.status = final_status
