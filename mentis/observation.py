@@ -45,6 +45,7 @@ class _StructureParser(HTMLParser):
     _INTERACTIVE = {"button", "a"}
     _FORM = {"input", "textarea", "select"}
     _VOID = {"img", "input", "br", "hr", "meta", "link"}
+    _NON_BODY = {"head", "script", "style", "template", "noscript"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -54,12 +55,18 @@ class _StructureParser(HTMLParser):
         self._capture_tag = None
         self._capture_buf: list = []
         self._capture_extra: dict = {}
+        self._ignored_depth = 0
 
     def _next_id(self, prefix: str) -> str:
         self._counters[prefix] = self._counters.get(prefix, 0) + 1
         return f"{prefix}:{self._counters[prefix]}"
 
     def handle_starttag(self, tag, attrs):
+        if tag in self._NON_BODY:
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth:
+            return
         attrs_dict = {k: (v or "") for k, v in attrs}
         if tag in self._HEADINGS:
             self._begin_capture(self._next_id("h"), tag, {"level": tag})
@@ -92,12 +99,23 @@ class _StructureParser(HTMLParser):
             self.items.append(ObservationItem(self._next_id("form"), "form", "", {}))
 
     def handle_endtag(self, tag):
+        if tag in self._NON_BODY:
+            self._ignored_depth = max(0, self._ignored_depth - 1)
+            return
+        if self._ignored_depth:
+            return
         if self._capture_tag == tag:
             self._flush_capture()
 
     def handle_data(self, data):
+        if self._ignored_depth:
+            return
         if self._capture_tag is not None:
             self._capture_buf.append(data)
+        else:
+            text = " ".join(data.split())
+            if text:
+                self.items.append(ObservationItem(self._next_id("text"), "dom_text", text))
 
     def _begin_capture(self, item_id, kind, extra):
         self._flush_capture()
@@ -139,7 +157,7 @@ def observe_structure(path: str) -> ObservationRecord:
         sha256=sha,
         items=parser.items,
         limitations=[
-            "仅结构记录，无渲染截图：视觉呈现类结论（美观、氛围、布局效果）未验证",
+            "仅源代码 DOM 文本与结构，无渲染截图：CSS 可见性、动态内容及视觉效果未验证；观察记录未出现不等于实际页面缺失",
             "无交互执行记录：行为类结论（表单实际行为）未验证，仅能看到声明结构",
             "无法检测横向溢出：需要真实视口渲染（P3.1 观察链）",
         ],

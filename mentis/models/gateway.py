@@ -1,7 +1,8 @@
 """DeepSeek 官方 OpenAI 兼容网关（stdlib 实现，无第三方依赖）。
 
 - 模型 ID 依据 ADR-007：deepseek-flash（DeepSeek-V4.1-Flash）。
-- 凭据只从环境变量读取（DEEPSEEK_API_KEY），任何记录不得包含密钥。
+- 凭据优先读取环境变量 DEEPSEEK_API_KEY；未定义时读取项目根目录 .env。
+  任何记录不得包含密钥。
 - transport 可注入：测试用假传输，不触网。
 - 不做自动重发风暴：失败有界（本次调用内最多一次有界 JSON 修复由上层负责，
   网关本身不重试）。
@@ -9,17 +10,20 @@
 
 import hashlib
 import json
+import os
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEFAULT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 @dataclass
@@ -27,6 +31,7 @@ class ModelConfig:
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
     api_key_env: str = API_KEY_ENV
+    env_file: Path = DEFAULT_ENV_FILE
     timeout_s: int = 60
     max_tokens: int = 2000
     temperature: float = 0.2
@@ -62,9 +67,22 @@ class ModelGateway:
 
     @property
     def api_key(self) -> str:
-        import os
-
-        return os.environ.get(self.config.api_key_env, "")
+        # 已定义的环境变量始终优先，空值也能显式禁用本地 .env 回退。
+        from_environment = os.environ.get(self.config.api_key_env)
+        if from_environment is not None:
+            return from_environment.strip()
+        try:
+            with Path(self.config.env_file).open(encoding="utf-8-sig") as env_file:
+                for line in env_file:
+                    name, separator, value = line.partition("=")
+                    if separator and name.strip() == self.config.api_key_env:
+                        value = value.strip()
+                        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+                            value = value[1:-1]
+                        return value
+        except (OSError, UnicodeError):
+            pass
+        return ""
 
     def has_credentials(self) -> bool:
         return bool(self.api_key)
@@ -116,7 +134,7 @@ class ModelGateway:
         if not self.has_credentials():
             raise GatewayError(
                 f"缺少凭据：请设置环境变量 {self.config.api_key_env}"
-                "（DeepSeek API key），不入库、不写入日志"
+                "，或在项目根目录 .env 中设置同名键；不入库、不写入日志"
             )
         if len(system) + len(user_prompt) > self.config.max_input_chars:
             raise GatewayError(f"输入过长：超过本轮 {self.config.max_input_chars} 字符上限，未发送")

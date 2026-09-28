@@ -109,13 +109,25 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(record.__dict__))
 
     def test_missing_credentials_recorded_not_raised(self):
-        gw = ModelGateway(config=ModelConfig())
-        # 确保测试环境无该键（如本机有则跳过断言语义）
-        if gw.has_credentials():
-            self.skipTest("本机已配置 DEEPSEEK_API_KEY，跳过无凭据路径")
-        record = gw.complete("s", "u")
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}):
+            gw = ModelGateway(config=ModelConfig())
+            record = gw.complete("s", "u")
         self.assertFalse(record.ok)
         self.assertIn("缺少凭据", record.error)
+
+    def test_env_file_fallback_and_environment_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = os.path.join(tmp, ".env")
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write('# local secret\nDEEPSEEK_API_KEY="file-secret"\n')
+            gw = ModelGateway(config=ModelConfig(env_file=env_file))
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(gw.api_key, "file-secret")
+                self.assertTrue(gw.has_credentials())
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "environment-secret"}):
+                self.assertEqual(gw.api_key, "environment-secret")
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}):
+                self.assertFalse(gw.has_credentials())
 
     def test_fake_transport_success_and_no_secret_in_record(self):
         gw = fake_gateway([GOOD_JSON])
@@ -154,6 +166,21 @@ class ObserverTests(unittest.TestCase):
             obs = observe_structure(path)
             img = next(i for i in obs.items if i.kind == "img")
             self.assertEqual(img.extra["alt_present"], "no")
+
+    def test_body_text_is_observed_without_head_or_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "page.html")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('<html><head><title>不属于正文</title></head><body>'
+                        '<h1>手冲工作坊</h1><p>日期 11 月 14 日，价格 ¥99</p>'
+                        '<script>secret_in_script</script></body></html>')
+            obs = observe_structure(path)
+            rendered = obs.render_text()
+            self.assertIn("日期 11 月 14 日，价格 ¥99", rendered)
+            self.assertIn("text:1", obs.item_ids())
+            self.assertNotIn("secret_in_script", rendered)
+            self.assertNotIn("不属于正文", rendered)
+            self.assertTrue(any("观察记录未出现不等于实际页面缺失" in lim for lim in obs.limitations))
 
 
 class ValidationTests(unittest.TestCase):
@@ -269,7 +296,7 @@ class CliTests(unittest.TestCase):
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         if strip_key:
-            env.pop("DEEPSEEK_API_KEY", None)
+            env["DEEPSEEK_API_KEY"] = ""
         return subprocess.run(
             [sys.executable, "-m", "mentis", "diagnose", *args],
             capture_output=True,

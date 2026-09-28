@@ -1,23 +1,29 @@
 """Mentis 开发入口。
 
-P2.2 起含真实模型诊断命令（需 DEEPSEEK_API_KEY）；其余为离线演示与验证。
+P2.2 起含真实模型诊断命令（需 DEEPSEEK_API_KEY，可由环境或项目 .env 提供）；其余为离线演示与验证。
 """
 
 import argparse
+import json
 import platform
 import sys
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
 
 from mentis import STAGE, __version__
 
 BANNER = """\
 Mentis v{version} — 开发入口（当前：{stage}）
-真实模型命令需要 DEEPSEEK_API_KEY；演示与离线验证无需凭据。
+真实模型命令需要 DEEPSEEK_API_KEY（环境变量或项目 .env）；演示与离线验证无需凭据。
 命令：
   python -m mentis                本说明
   python -m mentis --version      版本号
   python -m mentis demo-contract  最小任务与反馈契约演示（脚本化数据，含拒绝路径）
   python -m mentis demo-routing   首领域资源按需加载与缺口分流演示（确定性规则）
   python -m mentis diagnose       真实模型页面诊断（结构观察→候选→校验；--fixture 为 Mock 模式）
+  python -m mentis observe-page   本地 HTML 双视口截图（P3.1，静态初始画面）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -34,6 +40,9 @@ def main(argv=None) -> int:
     diag.add_argument("--feedback", default="", help="用户反馈原话（可留空）")
     diag.add_argument("--fixture", default="", help="Mock 固定响应文件（离线验证模式）")
     diag.add_argument("--real", action="store_true", help="明确允许本次调用将页面结构、目标和反馈发送给 DeepSeek；最多两次请求")
+    observe = sub.add_parser("observe-page", help="本地 HTML 双视口截图；不执行点击或提交")
+    observe.add_argument("--page", required=True, help="本地 HTML 文件路径")
+    observe.add_argument("--out", default="", help="输出目录；默认 runtime/observations/<运行编号>")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -48,6 +57,24 @@ def main(argv=None) -> int:
         from mentis.diagnose_cli import run_diagnose
 
         return run_diagnose(args)
+    if args.command == "observe-page":
+        from mentis.browser_observation import capture_local_html
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = Path(args.out) if args.out else Path("runtime/observations") / f"{stamp}_{uuid4().hex[:6]}"
+        try:
+            observation = capture_local_html(args.page, out)
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"观察失败：{exc}", file=sys.stderr)
+            return 2
+        manifest = Path(out) / "observation.json"
+        manifest.write_text(json.dumps(asdict(observation), ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[观察记录] {manifest}")
+        for view in observation.views:
+            print(f"[{view.name}] {view.actual_width}×{view.actual_height} "
+                  f"{view.screenshot_path or view.error}")
+        print("[边界] " + "；".join(observation.limitations))
+        return 0 if all(view.screenshot_path and not view.error for view in observation.views) else 1
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())
     print(f"Python {platform.python_version()} on {platform.system()}")

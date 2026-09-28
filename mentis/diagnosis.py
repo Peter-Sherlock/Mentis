@@ -26,7 +26,7 @@ SYSTEM_PROMPT = (
     "decision_requests（数组）。diagnoses 元素字段：phenomenon、evidence_refs（数组）、"
     "severity（blocking/plan_changing/minor）、interpretation、modification_candidates（数组）。"
     "decision_requests 元素字段：question、blocking_reason、user_unique_info_or_auth_basis、"
-    "excluded_autonomous_paths。"
+    "excluded_autonomous_paths；这四个字段的值都必须是字符串。"
 )
 
 
@@ -264,7 +264,12 @@ def run_diagnosis(
 
 def render_bundle_markdown(bundle: DiagnosisBundle) -> str:
     lines = [f"# 诊断候选：{bundle.goal}", ""]
-    origin = "Mock 固定响应（离线验证，非真实模型）" if bundle.mock else f"真实模型调用（{bundle.model}）"
+    if bundle.mock:
+        origin = "Mock 固定响应（离线验证，非真实模型）"
+    elif any(error.startswith("调用失败:") for error in bundle.errors):
+        origin = f"真实请求尝试失败（{bundle.model}；未收到有效模型响应）"
+    else:
+        origin = f"真实模型响应（{bundle.model}）"
     lines.append(f"- 数据来源：**{origin}**；观察来源 {bundle.observation_source}；调用 {bundle.call_ids}")
     lines.append(f"- 用量：{bundle.usage or '（无）'}")
     if bundle.errors:

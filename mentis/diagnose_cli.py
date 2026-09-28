@@ -67,8 +67,8 @@ def run_diagnose(args) -> int:
         gateway.force_mock = True
     elif not gateway.has_credentials():
         print("【无法执行真实调用】")
-        print(f"缺少凭据：请设置环境变量 {API_KEY_ENV}（DeepSeek API key）。")
-        print("凭据只从环境变量读取，不入库、不写日志。")
+        print(f"缺少凭据：请设置环境变量 {API_KEY_ENV}，或在项目根目录 .env 中设置同名键。")
+        print("环境变量优先；.env 已被 Git 忽略。凭据不写日志。")
         print("真实调用还需显式加 --real；单次命令最多两次请求，每次输出上限 2000 token。")
         print("发送内容包含选定页面的结构文本、目标、反馈和领域规则，请先核对数据范围。")
         print("离线验证可使用：python -m mentis diagnose --page <页面> --fixture tests/fixtures/mock_diagnosis_response.json")
