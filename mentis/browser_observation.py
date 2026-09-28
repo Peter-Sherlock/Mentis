@@ -11,6 +11,15 @@ from uuid import uuid4
 
 
 VIEWPORTS = {"desktop": (1280, 800), "mobile": (390, 844)}
+# Windows 无界面 Chrome 有 500px 最小窗口宽度（实测 2026-09-28，Chrome 154）：
+# 直接 --screenshot --window-size=390 会把 500px 布局裁成 390 宽 PNG（P2.3 的"截断"假象）。
+# 移动视口改用 iframe 包装：外窗仍是 390 宽截图，iframe 内部获得真实 390 布局。
+_MOBILE_WRAPPER = """<!doctype html><html><head><meta charset="utf-8">
+<style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body style="margin:0;padding:0">
+<iframe src="capture-copy.html" width="390" height="844" frameborder="0" scrolling="no" style="border:0;display:block"></iframe>
+</body></html>
+"""
 _WINDOWS_BROWSERS = (
     Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
     Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
@@ -85,17 +94,26 @@ def capture_local_html(page: str | Path, output_dir: str | Path,
             "仅捕获两个视口的初始画面；未执行点击、输入、提交或键盘操作",
             "未自动测量横向溢出、对比度或可访问性；截图需人工复核",
             "本地 file:// 页面不证明部署环境行为",
+            "移动视口经 iframe 包装获得真实 390px 布局；2026-09-28 之前的移动截图受 Windows"
+            " 无头 500px 最小窗宽影响（500 布局被裁成 390 PNG），据此得出的'截断'结论作废（见 P3.2 更正）",
         ],
         created_at=datetime.now().isoformat(timespec="seconds"),
     )
+    capture_copy = destination / "capture-copy.html"
+    capture_copy.write_bytes(source.read_bytes())
     for name, (width, height) in VIEWPORTS.items():
         view = RenderedView(name=name, requested_width=width, requested_height=height)
         screenshot = destination / f"{name}.png"
         profile = destination / f"profile-{name}-{uuid4().hex[:8]}"
+        target_uri = source.as_uri()
+        if name == "mobile":
+            wrapper = destination / "viewport-wrapper-mobile.html"
+            wrapper.write_text(_MOBILE_WRAPPER, encoding="utf-8")
+            target_uri = wrapper.as_uri()
         command = [str(executable), "--headless=new", "--disable-gpu",
                    "--disable-features=Vulkan", "--disable-extensions", "--no-first-run",
                    f"--user-data-dir={profile}", f"--window-size={width},{height}",
-                   f"--screenshot={screenshot}", source.as_uri()]
+                   f"--screenshot={screenshot}", target_uri]
         try:
             completed = run(command, capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=timeout_s)
@@ -112,4 +130,5 @@ def capture_local_html(page: str | Path, output_dir: str | Path,
         except (OSError, ValueError) as exc:
             view.error = f"截图失败: {type(exc).__name__}"
         record.views.append(view)
+        shutil.rmtree(profile, ignore_errors=True)
     return record

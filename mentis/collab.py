@@ -32,7 +32,6 @@ from mentis.session import TaskSession
 
 COLLAB_DIR = Path("runtime") / "collab"
 STATE_VERSION = "p2.3"
-
 COPY_DECK = """# 拾光咖啡 · 周六手冲入门工作坊（合成素材，虚构品牌）
 
 - 活动名称：周六手冲入门工作坊
@@ -124,6 +123,7 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj._direction = ""
     obj._last_answer = ""
     obj.session = session
+    obj.base_dir = Path(meta["base_dir"]) if meta.get("base_dir") else COLLAB_DIR
     obj.workspace = Path(meta["workspace"])
     obj.obs_dir = COLLAB_DIR / obj.run_id / "observation"
     obj.adapter = adapter or CodexCliAdapter(executable=resolve_codex_executable())
@@ -144,7 +144,8 @@ class Collaboration:
     def __init__(self, goal: str, mode: str = "autonomous", direction: str = "",
                  interactive: bool = False, adapter=None, gateway=None,
                  browser_capture=None, max_repairs: int = 1, timeout_s: int = 420,
-                 use_model: bool = True, run_id: str = ""):
+                 use_model: bool = True, run_id: str = "", base_dir=None):
+        self.base_dir = Path(base_dir) if base_dir else COLLAB_DIR
         self.run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S") + "-" + os.urandom(2).hex()
         self.mode = mode
         self.interactive = interactive
@@ -155,8 +156,8 @@ class Collaboration:
         self._last_answer = ""
         self.session = TaskSession(goal=goal)
         self._setup_session()
-        self.workspace = COLLAB_DIR / self.run_id / "workspace"
-        self.obs_dir = COLLAB_DIR / self.run_id / "observation"
+        self.workspace = self.base_dir / self.run_id / "workspace"
+        self.obs_dir = self.base_dir / self.run_id / "observation"
         self.adapter = adapter or CodexCliAdapter(executable=resolve_codex_executable())
         self.gateway = gateway if gateway is not None else ModelGateway(config=ModelConfig())
         self.browser_capture = browser_capture
@@ -167,7 +168,7 @@ class Collaboration:
         self.applied_answers = False
         self.status = "created"
         self.last_diagnosis = None
-        self.run_dir = COLLAB_DIR / self.run_id
+        self.run_dir = self.base_dir / self.run_id
 
     # ---- 初始化 ----
 
@@ -752,6 +753,7 @@ class Collaboration:
             "state_version": STATE_VERSION,
             "run_id": self.run_id, "mode": self.mode, "status": self.status,
             "goal": self.session.goal, "workspace": str(self.workspace),
+            "base_dir": str(self.base_dir),
             "thread_id": self.thread_id, "repairs_used": self.repairs_used,
             "timeout_s": self.timeout_s, "max_repairs": self.max_repairs,
             "applied_answers": self.applied_answers,

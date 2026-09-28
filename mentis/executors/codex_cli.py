@@ -34,6 +34,7 @@ class CodexTaskSpec:
     sandbox: str = "read-only"
     timeout_s: int = 120
     model: str = ""  # 留空时使用 CLI 当前默认模型
+    extra_config: tuple = ()  # 追加 -c 覆盖（如 approval_policy="never"），默认不变
 
     def validate(self) -> Path:
         root = Path(self.workspace).resolve()
@@ -113,6 +114,8 @@ class CodexCliAdapter:
                    "-C", str(root)]
         if spec.model:
             command += ["--model", spec.model]
+        for override in spec.extra_config:
+            command += ["-c", override]
         command.append(spec.prompt)
         return self._invoke(command, spec, root, task_id)
 
@@ -127,6 +130,8 @@ class CodexCliAdapter:
                    f'sandbox_mode="{spec.sandbox}"']
         if spec.model:
             command += ["--model", spec.model]
+        for override in spec.extra_config:
+            command += ["-c", override]
         command += [native_thread_id, spec.prompt]
         return self._invoke(command, spec, root, task_id, expected_thread_id=native_thread_id)
 

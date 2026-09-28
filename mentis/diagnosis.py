@@ -220,11 +220,15 @@ def run_diagnosis(
     user_feedback: str,
     observation,
     context: CapabilityContext | None = None,
+    images: list | None = None,
+    system: str = SYSTEM_PROMPT,
 ) -> DiagnosisBundle:
-    """一次真实/Mock 调用 + 有界修复（最多一次）+ 校验。"""
-    system = SYSTEM_PROMPT
+    """一次真实/Mock 调用 + 有界修复（最多一次）+ 校验。
+
+    images 为 [(名称, PNG 字节)] 时作为多模态输入发送（仅默认 HTTP 传输支持）。
+    """
     user_prompt = build_user_prompt(goal, user_feedback, observation, context)
-    record = gateway.complete(system, user_prompt)
+    record = gateway.complete(system, user_prompt, images=images) if images else gateway.complete(system, user_prompt)
     call_ids = [record.request_id]
     usage = dict(record.usage)
     raw = record.response_text

@@ -1,6 +1,7 @@
 """P2.3 回归例：协作循环的状态、权限与隔离边界（假执行器，全部离线）。"""
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -92,9 +93,19 @@ def make_collab(**kw):
 
 
 class CollabFlowTests(unittest.TestCase):
+    def setUp(self):
+        # 运行产物隔离到临时目录，不污染项目 runtime/collab
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base_dir = Path(self._tmp.name)
+
+    def make(self, **kw):
+        kw.setdefault("base_dir", self.base_dir)
+        return make_collab(**kw)
+
     def test_autonomous_run_delivers_without_user(self):
         """退出条件：存在用户不再回复仍能完成的有界任务。"""
-        collab = make_collab()
+        collab = self.make()
         status = collab.run()
         self.assertEqual(status, "DELIVERED")
         self.assertTrue(collab.session.attempts[-1].accepted)
@@ -106,7 +117,7 @@ class CollabFlowTests(unittest.TestCase):
         self.assertTrue((collab.run_dir / "state.json").is_file())
 
     def test_workspace_isolation_no_secrets(self):
-        collab = make_collab()
+        collab = self.make()
         collab.run()
         ws = Path(collab.workspace)
         names = {p.name for p in ws.rglob("*") if p.is_file()}
@@ -119,7 +130,7 @@ class CollabFlowTests(unittest.TestCase):
 
     def test_design_pending_no_overreach(self):
         """退出条件：需要用户决定时不越权继续。"""
-        collab = make_collab(mode="design")
+        collab = self.make(mode="design")
         status = collab.run()
         self.assertEqual(status, "PENDING")
         self.assertEqual(collab.session.attempts, [])  # 未委托、未执行、未猜测
@@ -129,7 +140,7 @@ class CollabFlowTests(unittest.TestCase):
         self.assertEqual(pending[0].blocking_action, "build-page")
 
     def test_resume_answer_completes(self):
-        collab = make_collab(mode="design")
+        collab = self.make(mode="design")
         self.assertEqual(collab.run(), "PENDING")
         pending = next(ix for ix in collab.session.interactions if ix.kind.value == "request_decision")
         status = collab.resume(answers={pending.interaction_id: "暖棕纸质感大图"})
@@ -140,7 +151,7 @@ class CollabFlowTests(unittest.TestCase):
 
     def test_executor_questions_routed_and_user_blocked(self):
         """退出条件：执行器反问先由 Mentis 分流；保留决定转用户且阻塞。"""
-        collab = make_collab(adapter=FakeAdapter(behavior={"first": "questions"}))
+        collab = self.make(adapter=FakeAdapter(behavior={"first": "questions"}))
         status = collab.run()
         self.assertEqual(status, "PENDING")
         routes = {r["question"].split("？")[0]: r["route"] for r in collab.question_routes}
@@ -150,7 +161,7 @@ class CollabFlowTests(unittest.TestCase):
         self.assertFalse(collab.applied_answers)  # 但继续动作保持暂停
 
     def test_answerable_questions_auto_applied(self):
-        collab = make_collab(adapter=FakeAdapter(behavior={"first": "soft-question"}))
+        collab = self.make(adapter=FakeAdapter(behavior={"first": "soft-question"}))
         status = collab.run()
         self.assertEqual(status, "DELIVERED")
         self.assertTrue(collab.applied_answers)
@@ -158,7 +169,7 @@ class CollabFlowTests(unittest.TestCase):
         self.assertEqual(len(soft), 1)
 
     def test_feedback_creates_new_brief_and_revision(self):
-        collab = make_collab()
+        collab = self.make()
         self.assertEqual(collab.run(), "DELIVERED")
         v1 = collab.session.current_brief.version
         status = collab.resume(feedback="首图换成咖啡杯特写，保留暖色底")
@@ -168,7 +179,7 @@ class CollabFlowTests(unittest.TestCase):
         self.assertTrue(any(r.action_key.startswith("revision-b") for r in collab.codex_runs))
 
     def test_goal_change_invalidates_old_accept(self):
-        collab = make_collab()
+        collab = self.make()
         self.assertEqual(collab.run(), "DELIVERED")
         old_attempt = collab.session.attempts[-1]
         self.assertTrue(old_attempt.accepted)
@@ -179,7 +190,7 @@ class CollabFlowTests(unittest.TestCase):
             collab.session.accept(old_attempt.attempt_id)  # 旧版本不能再接受
 
     def test_revoke_blocks_all_dispatch(self):
-        collab = make_collab()
+        collab = self.make()
         collab.prepare_workspace()
         status = collab.resume(revoke=True)
         self.assertEqual(status, "WITHDRAWN")
@@ -188,7 +199,7 @@ class CollabFlowTests(unittest.TestCase):
 
     def test_repair_bounded_then_not_delivered(self):
         """预算内修不好 → 不交付、不接受，不无限循环。"""
-        collab = make_collab(adapter=FakeAdapter(behavior={"first": "bad", "second": "bad"}),
+        collab = self.make(adapter=FakeAdapter(behavior={"first": "bad", "second": "bad"}),
                              max_repairs=1)
         status = collab.run()
         self.assertEqual(status, "NOT_DELIVERED")
@@ -196,7 +207,7 @@ class CollabFlowTests(unittest.TestCase):
         self.assertFalse(collab.session.attempts[-1].accepted)
 
     def test_repair_success_delivers(self):
-        collab = make_collab(adapter=FakeAdapter(behavior={"first": "bad", "second": "good"}),
+        collab = self.make(adapter=FakeAdapter(behavior={"first": "bad", "second": "good"}),
                              max_repairs=1)
         status = collab.run()
         self.assertEqual(status, "DELIVERED")
@@ -212,13 +223,13 @@ class CollabFlowTests(unittest.TestCase):
                 native_thread_id="", usage={}, artifact_paths=[], cli_version="fake")
 
         adapter._run = unknown  # type: ignore[method-assign]
-        collab = make_collab(adapter=adapter)
+        collab = self.make(adapter=adapter)
         status = collab.run()
         self.assertEqual(status, "UNKNOWN")
         self.assertEqual(len(collab.session.attempts), 1)  # 不自动重发
 
     def test_state_roundtrip_resume_ready(self):
-        collab = make_collab()
+        collab = self.make()
         collab.run()
         restored = collaboration_from_state(collab.run_dir / "state.json")
         self.assertEqual(restored.session.goal, collab.session.goal)

@@ -26,6 +26,8 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis observe-page   本地 HTML 双视口截图（P3.1，静态初始画面）
   python -m mentis collab         默认自主委托的协作运行（真实执行器+截图；--design 为共同设计）
   python -m mentis collab-resume  恢复运行：回答请求 / 反馈修订 / 改目标 / 撤回
+  python -m mentis guide-revise   P3.2 指导修订循环：冻结首稿→观察测量→诊断→指令→修订→复检
+  python -m mentis guide-resume   回答诊断提出的用户决定后继续修订
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -61,6 +63,21 @@ def main(argv=None) -> int:
     res.add_argument("--confirm-outcome", default="", choices=["", "completed", "failed"],
                      help="unknown 的人工核对确认（须先自行核对执行器与产物）")
     res.add_argument("--non-interactive", action="store_true", help="不等待输入")
+    guide = sub.add_parser("guide-revise", help="P3.2 指导修订循环（真实运行需 --real）")
+    guide.add_argument("--baseline", required=True, help="P2.3 运行目录（含 workspace/index.html）")
+    guide.add_argument("--real", action="store_true",
+                       help="明确允许：发送结构/测量/截图至 DeepSeek，并调用本机 Codex 修订")
+    guide.add_argument("--max-rounds", type=int, default=2, help="自动修改轮数上限（默认 2）")
+    guide.add_argument("--timeout", type=int, default=600, help="单次执行器超时秒数（1—600）")
+    guide.add_argument("--no-images", action="store_true", help="诊断不发送截图（仅结构与测量）")
+    guide.add_argument("--run-id", default="", help="指定运行目录 ID（默认时间戳）")
+    gres = sub.add_parser("guide-resume", help="回答诊断请求的用户决定后续办，或核对后续办失败轮")
+    gres.add_argument("--state", required=True, help="runtime/guidance/<run>/state.json")
+    gres.add_argument("--answer", action="append", default=[], help="<请求ID>:<回答>，可多次")
+    gres.add_argument("--retry", action="store_true",
+                      help="核对后续办失败轮（确认无活跃写入者；计入修订预算）")
+    gres.add_argument("--reverify", action="store_true",
+                      help="用修正后的确定性工具对已有 v2 重新复检（透明更正，不重新委托）")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -101,6 +118,14 @@ def main(argv=None) -> int:
         from mentis.collab_cli import run_resume
 
         return run_resume(args)
+    if args.command == "guide-revise":
+        from mentis.guidance_cli import run_guide_revise
+
+        return run_guide_revise(args)
+    if args.command == "guide-resume":
+        from mentis.guidance_cli import run_guide_resume
+
+        return run_guide_resume(args)
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())
     print(f"Python {platform.python_version()} on {platform.system()}")

@@ -8,6 +8,7 @@
   网关本身不重试）。
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -51,6 +52,7 @@ class CallRecord:
     usage: dict = field(default_factory=dict)
     error: str = ""
     mock: bool = False        # Mock 调用必须显式标注
+    image_refs: list = field(default_factory=list)  # ["名称;sha256前12位"]，不含图像本体
 
 
 class GatewayError(RuntimeError):
@@ -87,9 +89,11 @@ class ModelGateway:
     def has_credentials(self) -> bool:
         return bool(self.api_key)
 
-    def complete(self, system: str, user_prompt: str, json_mode: bool = True, mock: bool = False) -> CallRecord:
+    def complete(self, system: str, user_prompt: str, json_mode: bool = True, mock: bool = False,
+                 images: list | None = None) -> CallRecord:
         """一次调用；返回 CallRecord（含 usage 与错误），失败不抛异常而是记录。
 
+        images 为 [(名称, PNG 字节)] 时走多模态消息；记录只存名称与指纹，不存图像本体。
         注入传输（测试替身）或 fixture 模式一律标注 Mock，防止混入真实成功数。
         """
         mock = mock or self.force_mock or self._injected_transport
@@ -103,9 +107,20 @@ class ModelGateway:
             prompt_sha256=hashlib.sha256((system + user_prompt).encode("utf-8")).hexdigest()[:16],
             mock=mock,
         )
+        if images:
+            record.image_refs = [
+                f"{name};{hashlib.sha256(blob).hexdigest()[:12]}" for name, blob in images]
+            if self._injected_transport:
+                record.error = "GatewayError: 注入传输不支持图像输入（仅默认 HTTP 传输）"
+                record.latency_ms = 0
+                self.calls.append(record)
+                return record
         started = time.monotonic()
         try:
-            result = self._transport(system, user_prompt, json_mode)
+            if images:
+                result = self._transport(system, user_prompt, json_mode, images)
+            else:
+                result = self._transport(system, user_prompt, json_mode)
             if isinstance(result, tuple) and len(result) == 2:
                 record.response_text, raw_usage = result
                 if isinstance(raw_usage, dict):
@@ -130,7 +145,17 @@ class ModelGateway:
 
     # ---- 默认 HTTP 传输 ----
 
-    def _http_transport(self, system: str, user_prompt: str, json_mode: bool) -> tuple[str, dict]:
+    @staticmethod
+    def build_content_parts(user_prompt: str, images: list) -> list:
+        """OpenAI 兼容多模态 content：文本在前，图像（data URL）在后。"""
+        parts = [{"type": "text", "text": user_prompt}]
+        for _name, blob in images:
+            parts.append({"type": "image_url",
+                          "image_url": {"url": "data:image/png;base64,"
+                                               + base64.b64encode(blob).decode("ascii")}})
+        return parts
+
+    def _http_transport(self, system: str, user_prompt: str, json_mode: bool, images: list | None = None) -> tuple[str, dict]:
         if not self.has_credentials():
             raise GatewayError(
                 f"缺少凭据：请设置环境变量 {self.config.api_key_env}"
@@ -138,11 +163,14 @@ class ModelGateway:
             )
         if len(system) + len(user_prompt) > self.config.max_input_chars:
             raise GatewayError(f"输入过长：超过本轮 {self.config.max_input_chars} 字符上限，未发送")
+        user_content: str | list = user_prompt
+        if images:
+            user_content = self.build_content_parts(user_prompt, images)
         payload = {
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
