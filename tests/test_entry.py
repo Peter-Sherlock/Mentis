@@ -1,5 +1,6 @@
 """入口检查：可导入、版本一致、子进程真实运行。"""
 
+import os
 import subprocess
 import sys
 import unittest
@@ -16,6 +17,8 @@ class EntryTests(unittest.TestCase):
             [sys.executable, "-m", "mentis", "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             timeout=30,
         )
         self.assertEqual(result.returncode, 0)
@@ -26,6 +29,8 @@ class EntryTests(unittest.TestCase):
             [sys.executable, "-m", "mentis"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             timeout=30,
         )
         self.assertEqual(result.returncode, 0)

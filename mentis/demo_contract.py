@@ -37,10 +37,10 @@ def run_demo() -> int:
     print("演示刻意包含两条拒绝路径（第 4、5 步）。")
     print("=" * 62)
 
-    session = TaskSession(goal="为拾光咖啡工作坊制作活动介绍页首稿（演示）")
+    session = TaskSession(goal="演示本地样例文件的委托、版本与交付契约")
 
     # 1. 目标与任务定义（含三种来源）
-    brief = session.init_brief("一个温暖、简洁的活动介绍页，本地单页，含报名方式")
+    brief = session.init_brief("写出一份本地 HTML 样例供后续诊断；本包只演示契约，不验收网页质量")
     brief.constraints.append(
         SourcedItem("单页、本地运行、不发送真实数据", Provenance.USER_SELECTED, "user-msg:1")
     )
@@ -87,15 +87,20 @@ def run_demo() -> int:
     session.complete_attempt(attempt1.attempt_id, artifact_path=page_path, artifact_producer="executor:simulated(演示)")
     print(f"[3b] attempt-1 执行完成，产物已真实写入 {page_path}（记录哈希）。")
 
+    file_check_passed = os.path.isfile(page_path) and os.path.getsize(page_path) > 0
     session.record_review(
         attempt1.attempt_id,
-        findings=["活动五要素齐全", "报名说明存在", "对比度抽检通过"],
-        passed=True,
+        findings=[
+            "本地 HTML 文件存在且非空" if file_check_passed else "本地 HTML 文件不存在或为空",
+            "未执行网页表单、视觉或对比度检查；此处仅演示文件交付契约",
+        ],
+        passed=file_check_passed,
         disposition=Disposition.ACCEPT,
     )
     session.accept(attempt1.attempt_id)
     session.record_user_feedback(attempt1.attempt_id, satisfied=True, note="演示：用户表示可以")
-    print("[3c] 独立检查通过 → accept；用户满意作为第三种状态单独记录（完成≠通过≠满意）。")
+    print("[3c] 样例文件存在性检查通过 → accept（仅契约演示，网页质量未验证）；")
+    print("     用户满意是脚本化反馈，单独记录（完成≠检查通过≠满意）。")
 
     # 4. 拒绝路径一：用户沉默不能批准
     session.request_decision("价格从 ¥99 调整为 ¥129，是否同意？", blocking_action="apply-price-change")

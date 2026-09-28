@@ -69,9 +69,13 @@ def run_diagnose(args) -> int:
         print("【无法执行真实调用】")
         print(f"缺少凭据：请设置环境变量 {API_KEY_ENV}（DeepSeek API key）。")
         print("凭据只从环境变量读取，不入库、不写日志。")
-        print("同时请确认本轮预算（建议 ≤30 次调用）与数据范围（将把合成页面的结构")
-        print("文本发送到 api.deepseek.com；样例内容为虚构品牌，无真实个人信息）。")
+        print("真实调用还需显式加 --real；单次命令最多两次请求，每次输出上限 2000 token。")
+        print("发送内容包含选定页面的结构文本、目标、反馈和领域规则，请先核对数据范围。")
         print("离线验证可使用：python -m mentis diagnose --page <页面> --fixture tests/fixtures/mock_diagnosis_response.json")
+        return 2
+    elif not args.real:
+        print("【未发送数据】真实调用需要显式加 --real。")
+        print("将发送页面结构、目标、反馈和领域规则至 api.deepseek.com；单次最多两次请求。")
         return 2
 
     bundle = run_diagnosis(

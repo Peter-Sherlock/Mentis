@@ -1,6 +1,6 @@
 """DeepSeek 官方 OpenAI 兼容网关（stdlib 实现，无第三方依赖）。
 
-- 模型 ID 依据 ADR-007：deepseek-v4.1-flash（2026-09-28 核对官方文档）。
+- 模型 ID 依据 ADR-007：deepseek-flash（DeepSeek-V4.1-Flash）。
 - 凭据只从环境变量读取（DEEPSEEK_API_KEY），任何记录不得包含密钥。
 - transport 可注入：测试用假传输，不触网。
 - 不做自动重发风暴：失败有界（本次调用内最多一次有界 JSON 修复由上层负责，
@@ -15,9 +15,10 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-v4.1-flash"
+DEFAULT_MODEL = "deepseek-flash"
 API_KEY_ENV = "DEEPSEEK_API_KEY"
 
 
@@ -29,6 +30,7 @@ class ModelConfig:
     timeout_s: int = 60
     max_tokens: int = 2000
     temperature: float = 0.2
+    max_input_chars: int = 25000
 
 
 @dataclass
@@ -53,10 +55,10 @@ class GatewayError(RuntimeError):
 class ModelGateway:
     def __init__(self, config: ModelConfig | None = None, transport=None):
         self.config = config or ModelConfig()
-        self._transport = transport or self._http_transport
+        self._injected_transport = transport is not None
+        self._transport = transport if transport is not None else self._http_transport
         self.force_mock = False  # fixture 模式下由调用方置 True，记录必须标注 Mock
         self.calls: list[CallRecord] = []
-        self._n = 0
 
     @property
     def api_key(self) -> str:
@@ -72,10 +74,9 @@ class ModelGateway:
 
         注入传输（测试替身）或 fixture 模式一律标注 Mock，防止混入真实成功数。
         """
-        self._n += 1
-        mock = mock or self.force_mock or (self._transport is not self._http_transport)
+        mock = mock or self.force_mock or self._injected_transport
         record = CallRecord(
-            request_id=f"call-{self._n:03d}",
+            request_id=f"call-{uuid4().hex[:16]}",
             model=self.config.model,
             host=urlsplit(self.config.base_url).netloc,
             ok=False,
@@ -86,24 +87,39 @@ class ModelGateway:
         )
         started = time.monotonic()
         try:
-            record.response_text = self._transport(system, user_prompt, json_mode)
+            result = self._transport(system, user_prompt, json_mode)
+            if isinstance(result, tuple) and len(result) == 2:
+                record.response_text, raw_usage = result
+                if isinstance(raw_usage, dict):
+                    record.usage = {
+                        key: value for key, value in raw_usage.items()
+                        if key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                                   "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
+                        and type(value) is int and value >= 0
+                    }
+            else:
+                record.response_text = result
+            if not isinstance(record.response_text, str):
+                raise GatewayError("响应 content 不是字符串")
             record.ok = True
         except GatewayError as exc:
             record.error = str(exc)
-        except Exception as exc:  # 网络/解析等异常统一记录，不外泄密钥
-            record.error = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # 异常消息可能含请求内容或凭据；只记录类型
+            record.error = type(exc).__name__
         record.latency_ms = int((time.monotonic() - started) * 1000)
         self.calls.append(record)
         return record
 
     # ---- 默认 HTTP 传输 ----
 
-    def _http_transport(self, system: str, user_prompt: str, json_mode: bool) -> str:
+    def _http_transport(self, system: str, user_prompt: str, json_mode: bool) -> tuple[str, dict]:
         if not self.has_credentials():
             raise GatewayError(
                 f"缺少凭据：请设置环境变量 {self.config.api_key_env}"
                 "（DeepSeek API key），不入库、不写入日志"
             )
+        if len(system) + len(user_prompt) > self.config.max_input_chars:
+            raise GatewayError(f"输入过长：超过本轮 {self.config.max_input_chars} 字符上限，未发送")
         payload = {
             "model": self.config.model,
             "messages": [
@@ -113,6 +129,7 @@ class ModelGateway:
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
             "stream": False,
+            "thinking": {"type": "disabled"},
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -130,26 +147,18 @@ class ModelGateway:
             with urllib.request.urlopen(req, timeout=self.config.timeout_s) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8")[:300]
-            except Exception:  # pragma: no cover
-                pass
-            raise GatewayError(f"HTTP {exc.code}: {detail}") from exc
+            raise GatewayError(f"HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
-            raise GatewayError(f"网络错误: {exc.reason}") from exc
+            raise GatewayError(f"网络错误: {type(exc.reason).__name__}") from exc
         try:
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"]
+            if content is None:
+                raise GatewayError("响应 content 为空")
+            return content, data.get("usage", {})
         except (KeyError, IndexError, TypeError) as exc:
-            raise GatewayError(f"响应结构不符合预期: {json.dumps(data)[:300]}") from exc
+            raise GatewayError("响应结构不符合预期") from exc
 
-    # ---- 用量解析 ----
-
-    @staticmethod
-    def extract_usage(record: CallRecord, raw_response: dict) -> None:
-        """从原始响应提取 usage（调用方持有原始响应时使用）。"""
-        record.usage = raw_response.get("usage", {}) or {}
-
+    # ---- 用量汇总 ----
     def usage_summary(self) -> dict:
         ok_calls = [c for c in self.calls if c.ok and not c.mock]
         return {

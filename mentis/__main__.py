@@ -33,6 +33,7 @@ def main(argv=None) -> int:
     diag.add_argument("--goal", default="", help="本轮目标（可留空）")
     diag.add_argument("--feedback", default="", help="用户反馈原话（可留空）")
     diag.add_argument("--fixture", default="", help="Mock 固定响应文件（离线验证模式）")
+    diag.add_argument("--real", action="store_true", help="明确允许本次调用将页面结构、目标和反馈发送给 DeepSeek；最多两次请求")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":

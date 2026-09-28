@@ -2,10 +2,14 @@
 
 import json
 import os
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from mentis.capabilities.registry import load_registry
 from mentis.capabilities.selection import select_for_task
@@ -61,6 +65,49 @@ def make_observation(tmpdir):
 
 
 class GatewayTests(unittest.TestCase):
+    def test_default_http_transport_records_real_usage_and_model(self):
+        payload = {
+            "choices": [{"message": {"content": GOOD_JSON}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 35, "total_tokens": 155},
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps(payload).encode("utf-8")
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-secret"}):
+            with patch("urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+                gw = ModelGateway(config=ModelConfig())
+                record = gw.complete("system", "prompt")
+        sent = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(sent["model"], "deepseek-flash")
+        self.assertEqual(sent["thinking"], {"type": "disabled"})
+        self.assertEqual(sent["response_format"], {"type": "json_object"})
+        self.assertTrue(record.ok)
+        self.assertFalse(record.mock)
+        self.assertEqual(gw.usage_summary()["real_calls"], 1)
+        self.assertEqual(gw.usage_summary()["prompt_tokens"], 120)
+        self.assertEqual(gw.usage_summary()["completion_tokens"], 35)
+
+    def test_http_error_does_not_record_server_body_or_key(self):
+        secret = "test-secret"
+        failure = urllib.error.HTTPError(
+            "https://api.deepseek.com/chat/completions", 401, "Bearer " + secret,
+            {}, io.BytesIO(("Bearer " + secret).encode("utf-8")),
+        )
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": secret}):
+            with patch("urllib.request.urlopen", side_effect=failure):
+                record = ModelGateway().complete("system", "prompt")
+        self.assertFalse(record.ok)
+        self.assertEqual(record.error, "HTTP 401")
+        self.assertNotIn(secret, json.dumps(record.__dict__))
+
     def test_missing_credentials_recorded_not_raised(self):
         gw = ModelGateway(config=ModelConfig())
         # 确保测试环境无该键（如本机有则跳过断言语义）
@@ -80,6 +127,11 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn("sk-", blob)
         self.assertEqual(gw.usage_summary()["mock_calls"], 1)
         self.assertEqual(gw.usage_summary()["real_calls"], 0)
+
+    def test_request_ids_are_unique_across_gateway_instances(self):
+        first = fake_gateway([GOOD_JSON]).complete("s", "u")
+        second = fake_gateway([GOOD_JSON]).complete("s", "u")
+        self.assertNotEqual(first.request_id, second.request_id)
 
 
 class ObserverTests(unittest.TestCase):
@@ -160,6 +212,29 @@ class ValidationTests(unittest.TestCase):
             self.assertIn("阻塞原因", reasons)
             self.assertIn("用户独有信息", reasons)
             self.assertIn("已排除的自主路径", reasons)
+            self.assertFalse(bundle.next_action_valid)
+
+    def test_missing_response_fields_are_not_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = make_observation(tmp)
+            bundle = parse_and_validate("{}", obs, "g", "test", ["c"], {}, True)
+            self.assertTrue(bundle.errors)
+            self.assertFalse(bundle.next_action_valid)
+
+    def test_unexpected_nested_evidence_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = make_observation(tmp)
+            raw = json.dumps({
+                "diagnoses": [{
+                    "phenomenon": "示例", "evidence_refs": [{"id": "link:1"}],
+                    "severity": "minor", "interpretation": "示例",
+                    "modification_candidates": ["修改链接"],
+                }],
+                "next_action": "agent_decide", "decision_requests": [],
+            }, ensure_ascii=False)
+            bundle = parse_and_validate(raw, obs, "g", "test", ["c"], {}, True)
+            self.assertEqual(len(bundle.invalid_diagnoses), 1)
+            self.assertIn("字符串数组", bundle.invalid_diagnoses[0]["reasons"][0])
 
     def test_illegal_json_reported_structure_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,12 +267,14 @@ class ValidationTests(unittest.TestCase):
 class CliTests(unittest.TestCase):
     def _run_cli(self, *args, strip_key=True):
         env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
         if strip_key:
             env.pop("DEEPSEEK_API_KEY", None)
         return subprocess.run(
             [sys.executable, "-m", "mentis", "diagnose", *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=60,
             env=env,
         )
@@ -221,6 +298,18 @@ class CliTests(unittest.TestCase):
             self.assertIn("虚构证据位置", out)  # 夹具中的坏示例被拒收
             self.assertIn("缺三要素", out)
             self.assertIn("[已保存]", out)
+
+    def test_credentials_alone_do_not_send_data(self):
+        from mentis.diagnose_cli import run_diagnose
+
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.html")
+            with open(page, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_PAGE)
+            args = SimpleNamespace(page=page, fixture="", real=False, goal="", feedback="")
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-secret"}):
+                with patch("mentis.diagnose_cli.run_diagnosis", side_effect=AssertionError("should not call")):
+                    self.assertEqual(run_diagnose(args), 2)
 
 
 if __name__ == "__main__":

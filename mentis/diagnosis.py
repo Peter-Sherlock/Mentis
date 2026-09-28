@@ -97,15 +97,19 @@ def _validate_diagnosis(item: dict, observation) -> tuple[DiagnosisItem | None, 
     reasons = []
     if not isinstance(item, dict):
         return None, ["不是对象"]
-    phenomenon = str(item.get("phenomenon", "")).strip()
+    raw_phenomenon = item.get("phenomenon")
+    phenomenon = raw_phenomenon.strip() if isinstance(raw_phenomenon, str) else ""
     refs = item.get("evidence_refs")
     severity = item.get("severity")
-    interpretation = str(item.get("interpretation", "")).strip()
+    raw_interpretation = item.get("interpretation")
+    interpretation = raw_interpretation.strip() if isinstance(raw_interpretation, str) else ""
     candidates = item.get("modification_candidates")
     if not phenomenon:
         reasons.append("缺少 phenomenon")
     if not isinstance(refs, list) or not refs:
         reasons.append("evidence_refs 为空或缺失")
+    elif not all(isinstance(r, str) and r.strip() for r in refs):
+        reasons.append("evidence_refs 必须是非空字符串数组")
     else:
         known = observation.item_ids()
         fabricated = [r for r in refs if r not in known]
@@ -115,8 +119,10 @@ def _validate_diagnosis(item: dict, observation) -> tuple[DiagnosisItem | None, 
         reasons.append(f"severity 非法: {severity}")
     if not interpretation:
         reasons.append("缺少 interpretation")
-    if not isinstance(candidates, list) or not candidates:
-        reasons.append("modification_candidates 为空或缺失")
+    if not isinstance(candidates, list) or not candidates or not all(
+        isinstance(c, str) and c.strip() for c in candidates
+    ):
+        reasons.append("modification_candidates 必须是非空字符串数组")
     if reasons:
         return None, reasons
     return (
@@ -129,10 +135,14 @@ def _validate_decision_request(item: dict) -> tuple[DecisionRequest | None, list
     reasons = []
     if not isinstance(item, dict):
         return None, ["不是对象"]
-    question = str(item.get("question", "")).strip()
-    blocking = str(item.get("blocking_reason", "")).strip()
-    unique = str(item.get("user_unique_info_or_auth_basis", "")).strip()
-    excluded = str(item.get("excluded_autonomous_paths", "")).strip()
+    def field_text(key):
+        value = item.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    question = field_text("question")
+    blocking = field_text("blocking_reason")
+    unique = field_text("user_unique_info_or_auth_basis")
+    excluded = field_text("excluded_autonomous_paths")
     if not question:
         reasons.append("缺少 question")
     if not blocking:
@@ -174,13 +184,20 @@ def parse_and_validate(
         bundle.errors.append("顶层不是 JSON 对象（结构不合法）")
         return bundle
 
-    for item in data.get("diagnoses", []) or []:
+    for key in ("diagnoses", "decision_requests"):
+        if not isinstance(data.get(key), list):
+            bundle.errors.append(f"{key} 缺失或不是数组")
+    if "next_action" not in data:
+        bundle.errors.append("next_action 缺失")
+    if bundle.errors:
+        return bundle
+    for item in data["diagnoses"]:
         valid, reasons = _validate_diagnosis(item, observation)
         if valid is None:
             bundle.invalid_diagnoses.append({"item": item, "reasons": reasons})
         else:
             bundle.valid_diagnoses.append(valid)
-    for item in data.get("decision_requests", []) or []:
+    for item in data["decision_requests"]:
         valid, reasons = _validate_decision_request(item)
         if valid is None:
             bundle.invalid_decision_requests.append({"item": item, "reasons": reasons})
@@ -191,6 +208,9 @@ def parse_and_validate(
     bundle.next_action_valid = action in NEXT_ACTIONS
     if action is not None and not bundle.next_action_valid:
         bundle.errors.append(f"next_action 非法: {action}")
+    if action == "request_user" and not bundle.valid_decision_requests:
+        bundle.next_action_valid = False
+        bundle.errors.append("request_user 没有字段完整的决策请求")
     return bundle
 
 
@@ -250,7 +270,7 @@ def render_bundle_markdown(bundle: DiagnosisBundle) -> str:
     if bundle.errors:
         lines.append(f"- **错误**：{'；'.join(bundle.errors)}")
     lines.append("")
-    lines.append(f"## 有效诊断（{len(bundle.valid_diagnoses)} 条）")
+    lines.append(f"## 结构与引用通过的诊断候选（{len(bundle.valid_diagnoses)} 条；语义未复核）")
     for d in bundle.valid_diagnoses:
         lines.append(f"- [{d.severity}] {d.phenomenon}（证据：{'，'.join(d.evidence_refs)}）")
         lines.append(f"  - 解释：{d.interpretation}")
@@ -260,7 +280,7 @@ def render_bundle_markdown(bundle: DiagnosisBundle) -> str:
     for bad in bundle.invalid_diagnoses:
         lines.append(f"- 拒收：{'；'.join(bad['reasons'])}")
         lines.append(f"  - 原始：{json.dumps(bad['item'], ensure_ascii=False)[:160]}")
-    lines.append(f"## 决策请求（有效 {len(bundle.valid_decision_requests)} / 被拒 {len(bundle.invalid_decision_requests)}）")
+    lines.append(f"## 决策请求（字段完整 {len(bundle.valid_decision_requests)} / 被拒 {len(bundle.invalid_decision_requests)}；必要性未复核）")
     for r in bundle.valid_decision_requests:
         lines.append(f"- {r.question}")
         lines.append(f"  - 阻塞原因：{r.blocking_reason}")
@@ -268,6 +288,9 @@ def render_bundle_markdown(bundle: DiagnosisBundle) -> str:
         lines.append(f"  - 已排除的自主路径：{r.excluded_autonomous_paths}")
     for bad in bundle.invalid_decision_requests:
         lines.append(f"- 拒收（缺三要素）：{'；'.join(bad['reasons'])}")
-    lines.append(f"## 下一动作：{bundle.next_action or '（未给出）'}" + ("（合法）" if bundle.next_action_valid else "（非法/缺失）"))
+    lines.append(
+        f"## 下一动作候选：{bundle.next_action or '（未给出）'}"
+        + ("（枚举合法；授权、能力和必要性未复核）" if bundle.next_action_valid else "（非法/缺失）")
+    )
     lines.append("")
     return "\n".join(lines)
