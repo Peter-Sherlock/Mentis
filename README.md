@@ -2,7 +2,7 @@
 
 代表非专业用户与执行型 Agent 持续协作的代理：帮助形成目标，决定下一步，委托工作，观察实际产物，诊断问题并给出有效修改指导。
 
-**当前状态：P1.2 轻量任务与反馈契约。** 数据对象、不变量与导出已实现并测试；未接入真实模型、执行器与持久化存储。开发位置与证据边界见 [docs/DEVELOPMENT_STATUS.md](docs/DEVELOPMENT_STATUS.md)；案例与评价材料为 AI 草案，未经独立人工复核。
+**当前状态：P2.1 首领域资源与行动依据。** 契约、不变量、领域资源与缺口分流已实现并测试；未接入真实模型、执行器与持久化存储。开发位置与证据边界见 [docs/DEVELOPMENT_STATUS.md](docs/DEVELOPMENT_STATUS.md)；案例与评价材料为 AI 草案，未经独立人工复核。
 
 ## 运行（无第三方依赖，无需安装）
 
@@ -12,9 +12,10 @@
 python -m mentis                # 入口说明：版本、当前阶段、可用命令
 python -m mentis --version      # 仅版本号
 python -m mentis demo-contract  # 最小任务与反馈契约演示（脚本化数据，含拒绝路径）
+python -m mentis demo-routing   # 首领域资源按需加载与缺口分流演示（确定性规则）
 ```
 
-`demo-contract` 会在 `runtime/demo/` 下真实生成样例页面与两份记录文件（`session_demo.json`、`session_demo.md`），并在控制台打印同样的可读导出；内容包括：来源标注的目标/偏好、从用户指令推导的委托策略、通知与请求决定的区别、两条拒绝路径（沉默不批准、旧授权不批新范围）、"完成 ≠ 检查通过 ≠ 用户满意"。
+`demo-routing` 展示：三份网页试点资源（信息组织/视觉表达/基础交互，规则分硬要求/建议/偏好/待验证假设四类）按任务需要加载；七类缺口分流到自决/工具查询/执行器咨询/小样实验/请求用户/受限未验证/升级，每条带理由；两条纪律自检（常规专业问题不转交用户、必要介入不省略）；未知领域与声明冲突的受限处理。
 
 ## 开发检查
 
@@ -22,16 +23,17 @@ python -m mentis demo-contract  # 最小任务与反馈契约演示（脚本化�
 python -m unittest discover -s tests -v
 ```
 
-16 项：入口 3 项 + 契约不变量 13 项（通知不阻塞、请求只阻塞依赖动作、缺授权拒绝、新范围需新授权、撤回后拒绝、沉默不构成批准、无检查不接受、接受与用户满意分离、过期版本拒收、未知状态不自动重发、修订链可回查、序列化往返）。
+31 项：入口 3 + 契约不变量 13 + 能力资源与分流 15。
 
 ## 目录
 
 ```
 AGENTS.md            Agent 协作约定（含每轮可观察交付要求，第 6 节）
 docs/                规划、开发计划、状态、决定记录、案例、阶段报告
-mentis/              contracts.py 对象与语义 / session.py 不变量操作 /
-                     persist.py 序列化 / export.py 可读导出 / demo_contract.py 演示
-tests/               入口与契约不变量检查
+mentis/              contracts / session / persist / export / demo_contract
+                     capabilities/：registry 资源加载、selection 按需选择、routing 缺口分流
+resources/           首领域资源（草案）：registry.json + web_pilot/ 三份
+tests/               入口、契约不变量、能力与分流检查
 runtime/             默认忽略；演示与会话数据
 ```
 
