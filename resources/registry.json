@@ -1,0 +1,46 @@
+{
+  "registry_version": "0.1-draft",
+  "provenance": "模型知识起草（draft）；全部资源 pending_human，未经人工专业复核",
+  "evidence_note": "资源加载不证明专业能力；证据与评测记录随案例运行补充（DOMAIN_STRATEGY §6 evidence_and_eval）",
+  "resources": [
+    {
+      "id": "web-information-hierarchy",
+      "version": "0.1-draft",
+      "provenance": "model_knowledge(draft)",
+      "domain": "web_pilot",
+      "applies_to": ["单页活动介绍页", "单页产品介绍页", "个人展示页"],
+      "excludes": ["仪表盘", "长文文档", "视频时间线"],
+      "decision_questions": ["关键信息位置", "信息密度", "首屏取舍", "主操作层级"],
+      "observation_requirements": ["双视口渲染截图", "DOM 结构清单"],
+      "file": "web_pilot/web_information_hierarchy.md"
+    },
+    {
+      "id": "web-visual-expression",
+      "version": "0.1-draft",
+      "provenance": "model_knowledge(draft)",
+      "domain": "web_pilot",
+      "applies_to": ["单页活动介绍页", "单页产品介绍页", "个人展示页"],
+      "excludes": ["图标设计", "印刷排版", "视频画面"],
+      "decision_questions": ["配色气质", "字体气质", "图片风格", "促销感来源"],
+      "observation_requirements": ["双视口渲染截图", "配色取样与对比度测量"],
+      "file": "web_pilot/web_visual_expression.md"
+    },
+    {
+      "id": "web-basic-interaction",
+      "version": "0.1-draft",
+      "provenance": "model_knowledge(draft)",
+      "domain": "web_pilot",
+      "applies_to": ["含表单的单页", "本地单页应用"],
+      "excludes": ["后端服务", "原生应用", "复杂多步向导"],
+      "decision_questions": ["表单校验行为", "确认反馈", "移动端交互可用性"],
+      "observation_requirements": ["交互记录（空提交/填写提交）", "双视口渲染截图"],
+      "file": "web_pilot/web_basic_interaction.md"
+    }
+  ],
+  "declared_conflicts": [
+    {
+      "between": ["IH-2", "VE-2"],
+      "note": "在“单屏无滚动”类约束下，五要素完整可见（硬要求）与留白优先、减少首屏元素（建议）可能冲突；遇实际冲突时呈现取舍交由用户选择，不静默取舍。"
+    }
+  ]
+}

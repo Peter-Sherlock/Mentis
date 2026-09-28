@@ -16,6 +16,7 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis                本说明
   python -m mentis --version      版本号
   python -m mentis demo-contract  最小任务与反馈契约演示（脚本化数据，含拒绝路径）
+  python -m mentis demo-routing   首领域资源按需加载与缺口分流演示（确定性规则）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -25,10 +26,15 @@ def main(argv=None) -> int:
     parser.add_argument("--version", action="version", version=f"mentis {__version__}")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("demo-contract", help="P1.2 契约演示（脚本化数据）")
+    sub.add_parser("demo-routing", help="P2.1 资源选择与缺口分流演示（确定性规则）")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
         from mentis.demo_contract import run_demo
+
+        return run_demo()
+    if args.command == "demo-routing":
+        from mentis.capabilities.demo_routing import run_demo
 
         return run_demo()
 
