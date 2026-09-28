@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时数据（P1.3 起使用）：项目状态、真实产物、临时工作区
+runtime/
+
+# 凭据与本地秘密（任何情况下不入库）
+.env
+*.key
+credentials*
+secrets*
+
+# 本地数据库与日志
+*.db
+*.sqlite3
+logs/
+
+# 系统与编辑器临时文件
+Thumbs.db
+.DS_Store
