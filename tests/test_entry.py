@@ -1,4 +1,4 @@
-"""P1.1 必要开发检查：入口可导入、版本一致、子进程真实运行。"""
+"""入口检查：可导入、版本一致、子进程真实运行。"""
 
 import subprocess
 import sys
@@ -30,8 +30,8 @@ class EntryTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn(__version__, result.stdout)
-        self.assertIn("P1.1", result.stdout)
-        self.assertIn("未接入模型", result.stdout)
+        self.assertIn("未接入真实模型", result.stdout)
+        self.assertIn("demo-contract", result.stdout)
 
 
 if __name__ == "__main__":

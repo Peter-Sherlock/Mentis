@@ -1,26 +1,38 @@
-"""Mentis P1.1 最小运行入口。
+"""Mentis 开发入口。
 
-只显示版本与启动信息，用于验证工程起点；不接模型、不假装完整系统。
+当前阶段不接真实模型、执行器与存储；命令用于工程验证与演示。
 """
 
 import argparse
 import platform
 import sys
 
-from mentis import __version__
+from mentis import STAGE, __version__
 
 BANNER = """\
-Mentis v{version} — P1.1 最小运行入口
-当前阶段：未接入模型、执行器与存储；本入口仅用于验证工程起点。
+Mentis v{version} — 开发入口（当前：{stage}）
+未接入真实模型、执行器与存储；本入口用于工程验证。
+命令：
+  python -m mentis                本说明
+  python -m mentis --version      版本号
+  python -m mentis demo-contract  最小任务与反馈契约演示（脚本化数据，含拒绝路径）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="mentis", description="Mentis 最小运行入口")
+    parser = argparse.ArgumentParser(prog="mentis", description="Mentis 开发入口")
     parser.add_argument("--version", action="version", version=f"mentis {__version__}")
-    parser.parse_args(argv)
-    print(BANNER.format(version=__version__).rstrip())
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("demo-contract", help="P1.2 契约演示（脚本化数据）")
+    args = parser.parse_args(argv)
+
+    if args.command == "demo-contract":
+        from mentis.demo_contract import run_demo
+
+        return run_demo()
+
+    print(BANNER.format(version=__version__, stage=STAGE).rstrip())
     print(f"Python {platform.python_version()} on {platform.system()}")
     return 0
 

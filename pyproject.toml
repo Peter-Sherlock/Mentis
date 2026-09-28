@@ -1,9 +1,9 @@
 [project]
 name = "mentis"
-version = "0.1.0"
-description = "Mentis：代表非专业用户与执行型 Agent 持续协作的代理（P1.1 最小入口，无第三方依赖）"
-requires-python = ">=3.9"
+version = "0.2.0"
+description = "Mentis：代表非专业用户与执行型 Agent 持续协作的代理（P1.2 轻量任务与反馈契约，无第三方依赖）"
+requires-python = ">=3.10"
 
 [tool.mentis]
-stage = "P1.1"
-notes = "入口未接入模型、执行器与存储；结构按需增长，不为后续阶段预生成模块"
+stage = "P1.2"
+notes = "contracts/session/persist/export/demo；未接模型、执行器与持久化存储"
