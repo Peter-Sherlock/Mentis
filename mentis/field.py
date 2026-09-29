@@ -253,6 +253,9 @@ def run_field_start(goal: str, design: bool = False, direction: str = "",
         interactive=interactive, max_repairs=max_repairs, timeout_s=timeout_s,
         base_dir=collab_base))
     collab = factory()
+    # T2：委托前先给出运行目录与旁观命令（用户可另开终端实时旁观）
+    print(f"[运行目录] {collab.run_dir.resolve()}")
+    print(f"[实时旁观] 另开终端运行：py -3.14 -m mentis trace --run \"{collab.run_dir.resolve()}\" --follow")
     status = collab.run()
     run_dir = collab.run_dir
     index = collab.workspace / "index.html"

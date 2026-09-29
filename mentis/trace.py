@@ -10,6 +10,7 @@
 import hashlib
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -456,3 +457,86 @@ def render_historical(run_dir) -> str:
         lines.append(f"- {gap}")
     lines.append("")
     return "\n".join(lines)
+
+
+# ---- T2 实时旁观 ----
+
+def format_event(e: dict) -> str:
+    """单行可读格式（与 render_timeline 的时间线一致）。"""
+    event_refs = e.get("refs") if isinstance(e.get("refs"), list) else []
+    refs = "；".join(
+        f"{r.get('role')}={Path(r['path']).name}:{str(r.get('sha256', ''))[:12]}"
+        for r in event_refs if isinstance(r, dict) and isinstance(r.get("path"), str))
+    return (f"[{e.get('seq')}] {e.get('time_utc', '?')} [{e.get('source')}/{e.get('kind')}] "
+            f"attempt={e.get('attempt_id') or '-'} brief=v{e.get('brief_version') or '-'} "
+            f"status={e.get('status')}｜{e.get('summary', '')}"
+            + (f"｜refs: {refs}" if refs else ""))
+
+
+def follow_timeline(run_dir, out=print, poll_s: float = 0.5, stop_check=None):
+    """T2 只读旁观：重放已有事件后跟随新增；Ctrl+C 只停止读取，不影响运行。
+
+    终止：看到 run.finalized 且 manifest 已落盘（正常收尾）、stop_check 返回 True、
+    或调用者 Ctrl+C。半行容错：只消费完整行，末尾半行留待下次。
+    """
+    run_dir = Path(run_dir)
+    path = run_dir / "trace" / "events.jsonl"
+    manifest_path = run_dir / "trace" / "manifest.json"
+    if not path.is_file():
+        out("该目录尚无 trace/ 事件流（可能为历史运行或运行未开始）；以下为现存材料视图：")
+        out(render_historical(run_dir))
+        return
+    out("[旁观中] 只读跟随 trace/events.jsonl；Ctrl+C 仅停止旁观，不影响运行（取消/续接走现有状态契约）。")
+    offset = 0
+    seen_finalized = False
+    quiet_polls = 0
+    last_size = -1
+    try:
+        while True:
+            data = path.read_bytes() if path.is_file() else b""
+            if len(data) > offset:
+                chunk = data[offset:]
+                cut = chunk.rfind(b"\n")
+                if cut >= 0:
+                    for line in chunk[:cut].decode("utf-8", errors="replace").splitlines():
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            out("（损坏行，跳过）")
+                            continue
+                        out(format_event(event))
+                        if event.get("kind") == "run.finalized":
+                            seen_finalized = True
+                    offset += cut + 1
+            if seen_finalized and manifest_path.is_file():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    integrity = manifest.get("integrity", {})
+                    out(f"[运行已收尾] outcome={manifest.get('outcome', '')}；"
+                        f"integrity events_complete={integrity.get('events_complete')}"
+                        f"（写失败 {integrity.get('write_failures')}）")
+                except (json.JSONDecodeError, OSError):
+                    out("[运行已收尾] manifest 不可解析")
+                return
+            # 兜底：运行收尾但无 run.finalized 事件（如探针/旧版写入器直接 finalize）——
+            # manifest 已存在且事件流连续数轮无增长 → 按收尾处理
+            if manifest_path.is_file():
+                if len(data) == last_size:
+                    quiet_polls += 1
+                    if quiet_polls >= 4:
+                        try:
+                            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                            outcome = manifest.get("outcome", "")
+                        except (json.JSONDecodeError, OSError):
+                            outcome = ""
+                        out(f"[运行已收尾（按 manifest，事件流静默）] outcome={outcome}")
+                        return
+                else:
+                    quiet_polls = 0
+            last_size = len(data)
+            if stop_check is not None and stop_check():
+                out("[旁观停止] 应调用方要求；运行不受影响。")
+                return
+            time.sleep(poll_s)
+    except KeyboardInterrupt:
+        out("\n[旁观已停止] 仅停止读取，不影响运行；取消/续接按现有状态契约处理。")

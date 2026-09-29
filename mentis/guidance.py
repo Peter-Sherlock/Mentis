@@ -584,12 +584,36 @@ class GuidanceCycle:
                         refs=[prompt_ref])
         self.trace.record_delegation(attempt.attempt_id, brief_version, prompt_ref,
                                      action=f"revise-{tag}")
+
+        def on_executor_event(event: dict, meta: dict):
+            # T2：逐行回调；异常不得中断执行（写失败由 manifest 完整性记录）
+            try:
+                kind = str(event.get("type", "?"))
+                item = event.get("item") if isinstance(event.get("item"), dict) else {}
+                itype = str(item.get("type", ""))
+                if itype == "command_execution":
+                    detail = f"命令 {str(item.get('command', ''))[:140]}（{item.get('status', '')}）"
+                elif kind == "item.completed" and itype == "agent_message":
+                    detail = f"最终消息：「{str(item.get('text', ''))[:160]}」"
+                elif itype == "reasoning":
+                    detail = "推理条目（内容不入默认层）"
+                else:
+                    detail = f"{kind} {itype}".strip() + (f"（{item.get('status', '')}）" if item.get("status") else "")
+                if meta.get("first"):
+                    detail = f"首事件延迟 {meta.get('first_event_latency_s', 0):.1f}s；" + detail
+                self.trace.emit("executor", "executor.started" if meta.get("first") else "executor.item",
+                                detail, attempt_id=attempt.attempt_id, brief_version=brief_version,
+                                native_thread_id=self.thread_id or None, status="pending")
+            except Exception:
+                pass
+
         self.session.mark_running(attempt.attempt_id)
         spec = CodexTaskSpec(
             workspace=self.workspace, prompt=record.instruction,
-            brief_version=self.session.current_brief.version,
+            brief_version=brief_version,
             sandbox="workspace-write", timeout_s=self.timeout_s,
             extra_config=('approval_policy="never"',),  # 升级请求按失败处理，不等待审批
+            on_event=on_executor_event,
         )
         import time
 

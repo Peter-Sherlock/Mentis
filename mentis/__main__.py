@@ -96,9 +96,11 @@ def main(argv=None) -> int:
     ffb.add_argument("--block", default="", help="被卡住/打断/不明白的地方（原话，可选）")
     ffb.add_argument("--operation", default="", help="你做了什么（可选，默认'查看作品与报告后提交'）")
     ffb.add_argument("--label", default="", help="会话标签（可选）")
-    tr = sub.add_parser("trace", help="P2.4-T1 事后回放：查看运行时间线（历史运行显示现存材料与未记录缺口）")
+    tr = sub.add_parser("trace", help="事后回放（默认）或 --follow 实时旁观（只读，Ctrl+C 不影响运行）")
     tr.add_argument("--run", required=True,
                     help="运行目录（runtime/collab/<ID> 或 runtime/guidance/<ID>）")
+    tr.add_argument("--follow", action="store_true",
+                    help="T2 实时旁观：重放已有事件后跟随新增；运行收尾后自动结束")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -168,13 +170,16 @@ def main(argv=None) -> int:
             return 2
         return 0
     if args.command == "trace":
-        from mentis.trace import render_timeline
+        from mentis.trace import follow_timeline, render_timeline
 
         run_dir = Path(args.run)
         if not run_dir.is_dir():
             print(f"运行目录不存在：{run_dir.resolve()}", file=sys.stderr)
             return 2
-        print(render_timeline(run_dir))
+        if args.follow:
+            follow_timeline(run_dir)
+        else:
+            print(render_timeline(run_dir))
         return 0
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())

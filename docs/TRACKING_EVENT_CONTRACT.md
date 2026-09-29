@@ -113,3 +113,9 @@ Mentis 自身延迟目标：收到一行完整 CLI 事件后 2 秒内落盘可�
 8. **恢复终态**：新 `executor.completed` 事件记录可选的 `executor_status`、结构化 `usage`；续接从事件重建。旧 T1 事件缺结构化用量时，仅在同 run_id、同契约、同 prompt 哈希下继承旧 manifest 台账；找不到来源则保持未知。
 9. **回放现核**：`mentis trace --run` 除显示落盘 manifest，还重算当前事件流和 `refs` 文件 SHA-256。引用缺失、内容变化或事件流异常会显示“当前核验：未通过”；历史无 trace 的运行继续只读列缺口，不回填。
 10. **指导决策链**：guide-revise 的用户请求、路由、自主决定、用户回答及 brief 更新写入对应 `decision.*` / `brief.updated` 事件。回答原文仍在会话记录，事件只记交互 ID 与版本。
+
+## 12. T2 实现附录（2026-09-29）
+
+1. **executor.started / executor.item**：T2 起逐行回调即时落盘（不再等终态）——`executor.started` 仅首事件（summary 含首事件延迟秒数），其后每条原生事件一条 `executor.item`（命令/最终消息有界摘要；推理条目只记类型）。`time_utc` 因此具有"到达/落盘时刻"含义。
+2. **首事件延迟**：进程启动→首个非空 stdout 行，存于 `CodexTaskResult.first_event_latency_s` 并随 `executor.started` 展示；真实流实测 2.393s（CLI 0.158.0，见 P2.4-T2 记录）。
+3. **follow 终止语义**：`run.finalized` 事件 + manifest 为正常收尾；manifest 存在但事件流连续静默（无 run.finalized 的写入器/旧探针）也按收尾结束——两者都以 manifest 为准，旁观器永不写事件。

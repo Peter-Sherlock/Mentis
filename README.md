@@ -2,7 +2,7 @@
 
 代表非专业用户与执行型 Agent 持续协作的代理：帮助形成目标，决定下一步，委托工作，观察实际产物，诊断问题并给出有效修改指导。
 
-**当前状态：P3.2 已完成；P5.2a 入口已交付（等待真实使用记录）；P2.4 进行中——T0 证据核对与契约冻结、T1 事后可审计回放已完成，T2 起为运行中旁观。** DeepSeek 真实诊断（含双视口截图图像输入）、渲染测量和 Codex CLI 隔离委托已接通；**单案例**的改善记录与验收修复见 [P3.2 记录](docs/progress/P3.2.md)（不构成普遍专业能力结论）。下一步的 Mentis × Codex 交互旁观/回放及强基线评测见 [交互可见性实施计划](docs/INTERACTION_VISIBILITY_PLAN.md)；当前证据状态见 [开发状态](docs/DEVELOPMENT_STATUS.md)。案例与评价材料仍为 AI 草案。
+**当前状态：P3.2 已完成；P5.2a 入口已交付（等待真实使用记录）；P2.4 进行中——T0/T1/T2 已完成：契约冻结、事后回放与 Codex 逐行实时旁观（真实流已验证）；T3 起为故障与隐私加固。** DeepSeek 真实诊断（含双视口截图图像输入）、渲染测量和 Codex CLI 隔离委托已接通；**单案例**的改善记录与验收修复见 [P3.2 记录](docs/progress/P3.2.md)（不构成普遍专业能力结论）。下一步的 Mentis × Codex 交互旁观/回放及强基线评测见 [交互可见性实施计划](docs/INTERACTION_VISIBILITY_PLAN.md)；当前证据状态见 [开发状态](docs/DEVELOPMENT_STATUS.md)。案例与评价材料仍为 AI 草案。
 
 ## 运行（核心 Python 无第三方包依赖）
 
@@ -66,6 +66,7 @@ py -3.14 -m mentis field-feedback --run runtime/guidance/20260928_092745-5465 --
 # 查看一次运行的追踪时间线（新运行=事件流回放；历史运行=现存材料清单+未记录缺口，不回填）
 py -3.14 -m mentis trace --run runtime/trace-demo/<演示ID>   # 机制演示（FakeAdapter，非真实委托）
 py -3.14 -m mentis trace --run runtime/guidance/20260928_092745-5465   # 真实历史运行
+py -3.14 -m mentis trace --run runtime/t2-real-stream --follow        # 实时旁观（运行中另开终端；本例已收尾会自动结束）
 ```
 
 `collab` / `guide-revise` 的每次委托**先归档确切指令**（`trace/prompts/<attempt>.md`，SHA-256 与实际发送文本一致）再调用执行器，并写 `trace/events.jsonl`（目标/授权/委托/执行器终态/复检/决策/收尾）与 `trace/manifest.json`（完整性）。事件丢失时运行不得称完整追踪；历史运行不补写伪事件。契约见 [docs/TRACKING_EVENT_CONTRACT.md](docs/TRACKING_EVENT_CONTRACT.md)。运行中逐条旁观（--follow）属 T2，尚未实现。
@@ -83,7 +84,7 @@ py -3.14 -m mentis trace --run runtime/guidance/20260928_092745-5465   # 真实�
 py -3.14 -m unittest discover -s tests -v
 ```
 
-当前 107 项：入口、契约不变量、能力资源与分流、P2.2 网关/观察/诊断、P3.1 Adapter 与截图边界、P2.3 协作循环、P3.2 指导修订循环（合格不改、回归拒收、决策分流/暂停、失败轮核对续办、unknown 产物核对、状态恢复；验收修复：测量不可信判未知、保留项逐段与表单逐字段核对、复查绑定当前产物——均先复现误判后验证修复）、P5.2a 现场会话与逐字反馈归档、P2.4-T1 追踪写入与事后回放（seq/哈希/不回填）。Mock HTTP 响应只验证请求格式、用量采集与记录边界；真实调用证据另见阶段报告。
+当前 118 项：入口、契约不变量、能力资源与分流、P2.2 网关/观察/诊断、P3.1 Adapter 与截图边界、P2.3 协作循环、P3.2 指导修订循环（合格不改、回归拒收、决策分流/暂停、失败轮核对续办、unknown 产物核对、状态恢复；验收修复：测量不可信判未知、保留项逐段与表单逐字段核对、复查绑定当前产物——均先复现误判后验证修复）、P5.2a 现场会话与逐字反馈归档、P2.4-T1 追踪写入与事后回放（seq/哈希/不回填）。Mock HTTP 响应只验证请求格式、用量采集与记录边界；真实调用证据另见阶段报告。
 
 ## 目录
 
