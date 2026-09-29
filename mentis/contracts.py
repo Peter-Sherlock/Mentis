@@ -1,7 +1,9 @@
 """P1.2 最小任务与反馈契约：数据对象与语义枚举。
 
 只实现当前闭环必需的对象；名称是逻辑职责，不要求独立数据库表
-（PROJECT_PLAN §12.1）。来源区分 user_selected / agent_selected / provisional。
+（PROJECT_PLAN §12.1）。来源区分 user_selected / system / agent_selected /
+provisional（T4：system 与 agent_selected 分列——用户原话、系统预置约束、
+Mentis 自主选择三类可区分）。
 """
 
 from dataclasses import dataclass, field
@@ -9,16 +11,18 @@ from enum import Enum
 
 
 class Provenance(str, Enum):
-    """信息来源：用户选定 / 系统从用户指令推导 / 暂定（未经确认）。"""
+    """信息来源：用户选定 / 系统预置约束 / Mentis 自主选择 / 暂定（未经确认）。"""
 
     USER_SELECTED = "user_selected"
+    SYSTEM = "system"
     AGENT_SELECTED = "agent_selected"
     PROVISIONAL = "provisional"
 
 
 PROVENANCE_LABEL = {
     Provenance.USER_SELECTED: "用户选定",
-    Provenance.AGENT_SELECTED: "系统推导",
+    Provenance.SYSTEM: "系统约束（程序预置）",
+    Provenance.AGENT_SELECTED: "Mentis 自主推导",
     Provenance.PROVISIONAL: "暂定",
 }
 

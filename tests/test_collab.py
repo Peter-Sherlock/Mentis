@@ -237,6 +237,110 @@ class CollabFlowTests(unittest.TestCase):
         self.assertEqual(str(restored.workspace), str(collab.workspace))
         self.assertEqual(len(restored.codex_runs), len(collab.codex_runs))
 
+    def test_revision_flow_preserves_goal_constraints_artifact_and_basis(self):
+        """T4 核验：v1 初稿 → 用户反馈 → 新版委托 → v2 产物与复检 的已有路径。
+
+        检查原目标、硬约束（含来源分列）、旧版产物快照、修改依据是否保留。
+        反馈文本为开发者编写的**样例**，标注「样例反馈」，不冒充项目负责人原话。
+        """
+        import hashlib
+        import json
+
+        from mentis.trace import load_events, render_timeline
+
+        goal = "为拾光咖啡工作坊制作活动介绍页"
+        feedback = "（样例反馈）首图放大，并在价格下方加一行退款说明"
+        v2_marker = "<!-- v2-revision-marker -->"
+
+        class TwoPageAdapter(FakeAdapter):
+            """第二次委托写不同内容（v1/v2 哈希可区分），并发出脚本化子项事件供回放小结。"""
+
+            @staticmethod
+            def _emit_probe_events(spec, pattern):
+                if not spec.on_event:
+                    return
+                for i, st in enumerate(pattern):
+                    spec.on_event(
+                        {"type": "item.completed",
+                         "item": {"type": "command_execution", "status": st,
+                                  "command": f"probe-{st}"}},
+                        {"first": i == 0, "first_event_latency_s": 0.1})
+
+            def _run(self, spec, status_override=None):
+                if len(self.calls) >= 1:  # 第二次（修订）委托
+                    self._emit_probe_events(
+                        spec, ("in_progress", "failed", "in_progress", "completed"))
+                    result = super()._run(spec, status_override)
+                    (Path(spec.workspace) / "index.html").write_text(
+                        GOOD_PAGE + v2_marker, encoding="utf-8")
+                    result.artifact_paths = ["index.html"]
+                    return result
+                self._emit_probe_events(spec, ("in_progress", "completed"))
+                return super()._run(spec, status_override)
+
+        collab = self.make(adapter=TwoPageAdapter(behavior={"first": "good"}), goal=goal)
+        self.assertEqual(collab.run(), "DELIVERED")
+        v1_artifact = next(a for a in collab.session.artifacts
+                           if a.attempt_id == collab.session.attempts[0].attempt_id)
+        v1_sha = v1_artifact.sha256
+
+        self.assertEqual(collab.resume(feedback=feedback), "DELIVERED")
+
+        # 1) 原目标保留：v1 brief 仍在（带替代标记），v2 沿用同一目标
+        briefs = collab.session.briefs
+        self.assertEqual(briefs[0].objective, goal)
+        self.assertIsNotNone(briefs[0].superseded_by)
+        self.assertEqual(briefs[-1].objective, goal)
+        self.assertEqual(briefs[-1].version, briefs[0].version + 1)
+        # 2) 硬约束保留且来源分列：程序预置约束标 system，不冒充用户原话
+        preset = [i for b in briefs for i in b.constraints
+                  if "无网络" in i.text]
+        self.assertTrue(preset)
+        self.assertEqual(preset[0].provenance.value, "system")
+        self.assertTrue(all(i.provenance.value == "system" for i in preset))
+        self.assertIn("无网络", briefs[-1].constraints[0].text)  # v2 仍携带
+        # 3) 旧版产物保留：修订前快照文件本体 + 哈希与 v1 产物记录一致；v2 内容不同
+        snapshot = collab.run_dir / "versions" / f"index-{collab.session.attempts[0].attempt_id}.html"
+        self.assertTrue(snapshot.is_file())
+        snap_sha = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        self.assertEqual(snap_sha, v1_sha)
+        v2_sha = hashlib.sha256((Path(collab.workspace) / "index.html").read_bytes()).hexdigest()
+        self.assertNotEqual(v1_sha, v2_sha)
+        self.assertIn(v2_marker, (Path(collab.workspace) / "index.html").read_text(encoding="utf-8"))
+        v2_artifact = next(a for a in collab.session.artifacts
+                           if a.attempt_id == collab.session.attempts[-1].attempt_id)
+        self.assertEqual(v2_artifact.sha256, v2_sha)
+        # 4) 修改依据保留：revision 记录 反馈交互→旧尝试→新尝试，指令=反馈原样
+        revision = collab.session.revisions[-1]
+        self.assertEqual(revision.instruction, feedback)
+        self.assertEqual(revision.from_attempt_id, collab.session.attempts[0].attempt_id)
+        self.assertEqual(revision.to_attempt_id, collab.session.attempts[-1].attempt_id)
+        feedback_ix = next(ix for ix in collab.session.interactions
+                           if ix.interaction_id == revision.feedback_interaction_id)
+        self.assertIn("样例反馈", feedback_ix.message)
+        # 5) v2 复检：新尝试有 review 且通过；trace 有对应事件与含反馈的确切指令
+        review = next(r for r in collab.session.reviews
+                      if r.attempt_id == collab.session.attempts[-1].attempt_id)
+        self.assertTrue(review.passed)
+        events = load_events(collab.run_dir)
+        kinds = [e["kind"] for e in events]
+        self.assertEqual(kinds.count("review.recorded"), 2)
+        self.assertIn("brief.updated", kinds)
+        prompt_v2 = (collab.run_dir / "trace" / "prompts" /
+                     f"{collab.session.attempts[-1].attempt_id}.md").read_text(encoding="utf-8")
+        self.assertIn("样例反馈", prompt_v2)  # 确切指令携带反馈
+        # 6) 面向用户记录：报告含阶段语义/快照；回放含子项成败小结
+        report = (collab.run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn("阶段性交付语义", report)
+        self.assertIn("修订前快照", report)
+        self.assertIn("未反馈", report)  # 满意度如实=未反馈
+        timeline = render_timeline(collab.run_dir)
+        self.assertIn("执行器子项小结", timeline)
+        self.assertIn("失败 1", timeline)  # 修订轮的脚本化失败子项如实统计
+        self.assertIn("仅开始未到终态 0", timeline)
+        state = json.loads((collab.run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "DELIVERED")
+
 
 if __name__ == "__main__":
     unittest.main()

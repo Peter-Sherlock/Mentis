@@ -19,6 +19,10 @@ def run_collab(args) -> int:
     )
     status = _guarded_run(collab, collab.run)
     print(f"\n[运行结束] 状态 {status}")
+    if status == "DELIVERED":
+        print("[含义] DELIVERED = 本轮初稿可查看、结构检查通过；≠最终任务完成或用户满意；"
+              "视觉与表单交互未验证。你的反馈可形成下一轮委托：python -m mentis collab-resume "
+              f"--state \"{(collab.run_dir / 'state.json').resolve()}\" --feedback \"你的意见\"")
     print(f"[报告（看结果/看变化/看依据）] {(collab.run_dir / 'report.md').resolve()}")
     print(f"[作品] {(collab.workspace / 'index.html').resolve()}")
     if status == "PENDING":

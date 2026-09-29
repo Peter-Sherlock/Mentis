@@ -200,9 +200,10 @@ class Collaboration:
         s = self.session
         s.init_brief(s.goal)
         brief = s.current_brief
+        # T4 来源修正：此约束为程序预置（用户命令只给了目标），不得标 user_selected
         brief.constraints.append(SourcedItem(
             "本地单页、无网络、不发送真实数据；改动限于隔离工作区",
-            Provenance.USER_SELECTED, "user-command"))
+            Provenance.SYSTEM, "system-preset:isolation-no-network"))
         if self.mode == "design" and self._direction:
             brief.preferences.append(SourcedItem(
                 f"风格方向（用户选定）：{self._direction}",
@@ -576,7 +577,8 @@ class Collaboration:
         try:
             self.session.accept(attempt.attempt_id)
             delivered = True
-            self.notify("独立结构检查通过 → 已接受（用户满意与否单独记录）")
+            self.notify("结构检查通过 → 初稿已交付（可查看）；最终完成与满意度由你判断，"
+                        "反馈可形成下一轮委托（PROJECT_PLAN §7 阶段性交付）")
         except Exception as exc:
             self.notify(f"接受被拒绝：{exc}")
         self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
@@ -781,6 +783,7 @@ class Collaboration:
                             brief_version=self.session.current_brief.version)
             self.notify(f"目标已改为：{goal_new}（brief v{self.session.current_brief.version}）；"
                         "旧版本尝试不能被接受（版本门禁），将按新目标重新委托")
+            self._snapshot_current_artifact()
             attempt, result = self._dispatch_codex(
                 "rebuild-new-goal",
                 build_delegation_prompt(self._brief_text(), self._direction_text()))
@@ -866,6 +869,7 @@ class Collaboration:
             )
             self.notify(f"反馈已进入 brief v{self.session.current_brief.version}（{revision.revision_id}）；"
                         "旧版本结果不再适用，按新版本修订")
+            self._snapshot_current_artifact()
             attempt, result = self._dispatch_codex(
                 f"revision-b{self.session.current_brief.version}",
                 build_delegation_prompt(
@@ -892,6 +896,23 @@ class Collaboration:
         return self.status
 
     # ---- 记录 ----
+
+    def _snapshot_current_artifact(self) -> Path | None:
+        """T4：修订/重建委托前快照当前 index.html（"看变化"需要前后可对照）。
+
+        修订会覆盖工作区内同名产物；快照保留旧版文件本体，其内容哈希与
+        session.artifacts 中旧尝试的记录一致。幂等：同名字快照不覆盖。
+        """
+        index = self.workspace / "index.html"
+        if not index.is_file() or not self.session.attempts:
+            return None
+        versions = self.run_dir / "versions"
+        versions.mkdir(parents=True, exist_ok=True)
+        snapshot = versions / f"index-{self.session.attempts[-1].attempt_id}.html"
+        if not snapshot.exists():
+            shutil.copyfile(index, snapshot)
+            self.notify(f"旧版产物已快照：{snapshot.name}（修订委托将覆盖工作区版本）")
+        return snapshot
 
     def _brief_text(self):
         b = self.session.current_brief
@@ -945,6 +966,20 @@ class Collaboration:
             lines.append(f"- 截图：`{Path(shot).resolve()}`")
         if browser_obs:
             lines.append(f"- 浏览器：{browser_obs.browser} {browser_obs.browser_version}")
+        lines.append("- 阶段性交付语义（PROJECT_PLAN §7）：**DELIVERED = 本轮初稿已产出、"
+                     "结构层硬要求检查通过、可查看**；不表示最终任务完成或用户满意，"
+                     "你的意见将形成下一轮任务并继续委托修改")
+        feedback = self.session.user_feedback
+        if feedback:
+            latest = sorted(feedback.items(), key=lambda kv: kv[1].get("at", ""))[-1]
+            lines.append(f"- 用户是否满意：已记录 {len(feedback)} 条（最新 "
+                         f"{'满意' if latest[1].get('satisfied') else '不满意'}，"
+                         f"逐字原话见 session.json user_feedback）")
+        else:
+            lines.append("- 用户是否满意：**未反馈**（沉默≠满意；可稍后用 "
+                         "`field-feedback` 或 `collab-resume --feedback` 提交原话）")
+        lines.append("- 视觉与表单交互：**未验证**（截图为初始画面；未执行点击/提交；"
+                     "本循环未运行渲染溢出测量——溢出声明来自执行器自查）")
         lines.append("")
         lines.append("## 看变化")
         for b in self.session.briefs:
@@ -955,6 +990,10 @@ class Collaboration:
         for r in self.codex_runs:
             lines.append(f"- 委托 {r.action_key}（{r.attempt_id}，{r.status}，{r.duration_s}s，"
                          f"用量 {r.usage}）：产物 {r.artifacts or '（无新增文件）'}")
+        versions = self.run_dir / "versions"
+        if versions.is_dir():
+            for snap in sorted(versions.glob("index-*.html")):
+                lines.append(f"- 修订前快照：`{snap.resolve()}`（旧版产物本体，可与当前版本对照）")
         lines.append("")
         lines.append("## 看依据")
         lines.append("- 授权：exec-workspace（user-cli-invocation）；策略代决范围："

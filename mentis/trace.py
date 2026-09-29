@@ -403,16 +403,32 @@ def render_timeline(run_dir) -> str:
                     if stream_audit["problems"] or ref_problems else ""))
     # T3：委托台账（超时/恢复/多 attempt 的连续时间线）——来自 manifest，缺失时如实省略
     delegations = manifest.get("delegations") if isinstance(manifest, dict) else None
+    session_attempts = _load_session_attempts(run_dir)
     if isinstance(delegations, list) and delegations:
         lines.append("- 委托台账（attempt → 终态；续接共用同一原生 thread，原判定不覆盖）：")
         for d in delegations:
             if not isinstance(d, dict):
                 continue
-            lines.append(
-                f"  - {d.get('attempt_id') or '?'}（brief v{d.get('brief_version') or '?'}）"
-                f"→ 终态 {d.get('terminal_status') or '（未取得）'}"
-                f"｜thread {str(d.get('native_thread_id') or '未关联')[:24]}"
-                f"｜prompt {str(d.get('prompt_sha256') or '')[:12]}")
+            line = (f"  - {d.get('attempt_id') or '?'}（brief v{d.get('brief_version') or '?'}）"
+                    f"→ 终态 {d.get('terminal_status') or '（未取得）'}"
+                    f"｜thread {str(d.get('native_thread_id') or '未关联')[:24]}"
+                    f"｜prompt {str(d.get('prompt_sha256') or '')[:12]}")
+            # T4：终态未入事件流时交叉引用同目录 session.json（只读展示，不回填事件）——
+            # 人工核对确认（executor.confirmed 之前的运行）的依据在该文件
+            attempt_id = d.get("attempt_id")
+            recorded = session_attempts.get(attempt_id) if attempt_id else None
+            if recorded is not None and not d.get("terminal_status"):
+                line += (f"｜session.json 记该尝试 status={recorded.get('status', '?')}"
+                         f"{('、accepted=' + ('是' if recorded.get('accepted') else '否')) if recorded.get('status') == 'completed' else ''}"
+                         "（确认通知见该文件 interactions；不回填为事件）")
+            lines.append(line)
+        tally = _executor_item_tally(events)
+        if tally:
+            lines.append("- 执行器子项小结（自既有事件摘要后缀统计，非新增事件）：")
+            for attempt_id, counts in tally.items():
+                lines.append(f"  - {attempt_id or '（无 attempt）'}：完成 {counts['completed']}、"
+                             f"失败 {counts['failed']}、仅开始未到终态 {counts['started_only']}"
+                             "（开始数含已完成动作的开始事件；子命令成败以终态计）")
     lines.append("")
     prev_time = None
     for e in events:
@@ -444,6 +460,52 @@ def _gap_seconds(start: str | None, end: str | None) -> float | None:
         return max(0.0, delta.total_seconds())
     except (TypeError, ValueError):
         return None
+
+
+def _load_session_attempts(run_dir: Path) -> dict:
+    """读取同目录 session.json 的尝试状态（只读；不存在或不可解析时返回空）。
+
+    用途：终态未入事件流的委托（如 executor.confirmed 之前的人工核对确认），
+    回放交叉引用会话记录中的尝试状态与确认通知位置，不回填事件。
+    """
+    path = Path(run_dir) / "session.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        attempts = data.get("attempts", [])
+        if not isinstance(attempts, list):
+            return {}
+        return {a.get("attempt_id"): a for a in attempts
+                if isinstance(a, dict) and a.get("attempt_id")}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def _executor_item_tally(events: list) -> dict:
+    """按 attempt 统计执行器子项成败（自事件 summary 的状态后缀解析，只读）。
+
+    summary 由写入方按「…（completed/failed/in_progress）」格式记录；此处不改写、
+    不新增事件，仅聚合展示。"仅开始未到终态" = in_progress 数 − 已到终态数（下限 0），
+    对成对流是准确值；异常流如实显示估算基数。
+    """
+    tally: dict = {}
+    for e in events:
+        if e.get("source") != "executor" or e.get("kind") != "executor.item":
+            continue
+        summary = str(e.get("summary", ""))
+        if summary.endswith("（completed）"):
+            bucket = "completed"
+        elif summary.endswith("（failed）"):
+            bucket = "failed"
+        elif summary.endswith("（in_progress）"):
+            bucket = "in_progress"
+        else:
+            continue
+        counts = tally.setdefault(e.get("attempt_id"),
+                                  {"completed": 0, "failed": 0, "in_progress": 0})
+        counts[bucket] += 1
+    for counts in tally.values():
+        counts["started_only"] = max(0, counts["in_progress"] - counts["completed"] - counts["failed"])
+    return tally
 
 
 def render_historical(run_dir) -> str:

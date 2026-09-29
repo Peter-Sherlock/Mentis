@@ -270,6 +270,27 @@ class MultiAttemptTimelineTests(unittest.TestCase):
         self.assertEqual(confirmed["status"], "ok")
         self.assertIn("无活跃写入者", confirmed["summary"])
 
+    def test_replay_cross_references_session_for_unrecorded_terminal(self):
+        """终态未入事件流的委托（如 executor.confirmed 之前的 T4 真实运行）：
+        回放交叉引用 session.json 的尝试状态，只读展示，不回填事件。"""
+        run_dir = self.root / "cross-run"
+        w = TraceWriter(run_dir, "cross-run")
+        ref = w.archive_prompt("attempt-1", "指令")
+        w.emit("mentis", "delegation.prepared", "委托", attempt_id="attempt-1",
+               brief_version=1, refs=[ref])
+        w.record_delegation("attempt-1", 1, ref, action="build-page")
+        w.finalize(outcome="ERROR（delivered=False）")
+        # 人工核对确认只落在 session.json（确认通知在 interactions），事件流无终态
+        (run_dir / "session.json").write_text(json.dumps({
+            "attempts": [{"attempt_id": "attempt-1", "status": "completed", "accepted": True}],
+        }, ensure_ascii=False), encoding="utf-8")
+        timeline = render_timeline(run_dir)
+        self.assertIn("终态 （未取得）", timeline)
+        self.assertIn("session.json 记该尝试 status=completed", timeline)
+        self.assertIn("accepted=是", timeline)
+        self.assertIn("不回填为事件", timeline)
+        self.assertEqual(len(load_events(run_dir)), 1)  # 事件流未被回填
+
     def test_revoke_is_traced_and_persists(self):
         from mentis.collab import collaboration_from_state
 

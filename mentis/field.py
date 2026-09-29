@@ -271,6 +271,9 @@ def run_field_start(goal: str, design: bool = False, direction: str = "",
         print("\n[三个入口]")
         print(f"- 看结果：{index.resolve()}（{'存在' if index.is_file() else '未生成'}，"
               f"可直接用浏览器打开）")
+        if status == "DELIVERED":
+            print("- [初稿说明] DELIVERED = 结构检查通过、初稿可查看；≠最终完成或满意；"
+                  "视觉与表单交互未验证；有意见直接说，会形成下一轮修改")
         print(f"- 看变化/看依据：{(run_dir / 'report.md').resolve()}")
         if status == "PENDING":
             state = (run_dir / "state.json").resolve()
