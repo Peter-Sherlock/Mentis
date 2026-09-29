@@ -30,6 +30,7 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis guide-resume   回答诊断提出的用户决定后继续修订
   python -m mentis field-start    P5.2a 真实使用会话：自然语言目标→委托→三入口→使用记录
   python -m mentis field-feedback 查看作品后补记逐字反馈（绑定该运行的会话记录）
+  python -m mentis trace           P2.4-T1 事后回放：查看运行时间线（历史运行显示现存材料与缺口）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -95,6 +96,9 @@ def main(argv=None) -> int:
     ffb.add_argument("--block", default="", help="被卡住/打断/不明白的地方（原话，可选）")
     ffb.add_argument("--operation", default="", help="你做了什么（可选，默认'查看作品与报告后提交'）")
     ffb.add_argument("--label", default="", help="会话标签（可选）")
+    tr = sub.add_parser("trace", help="P2.4-T1 事后回放：查看运行时间线（历史运行显示现存材料与未记录缺口）")
+    tr.add_argument("--run", required=True,
+                    help="运行目录（runtime/collab/<ID> 或 runtime/guidance/<ID>）")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -162,6 +166,15 @@ def main(argv=None) -> int:
         except ValueError as exc:
             print(f"反馈未记录：{exc}", file=sys.stderr)
             return 2
+        return 0
+    if args.command == "trace":
+        from mentis.trace import render_timeline
+
+        run_dir = Path(args.run)
+        if not run_dir.is_dir():
+            print(f"运行目录不存在：{run_dir.resolve()}", file=sys.stderr)
+            return 2
+        print(render_timeline(run_dir))
         return 0
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())

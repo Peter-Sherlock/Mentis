@@ -35,9 +35,13 @@ from mentis.observation import ObservationRecord, observe_structure
 from mentis.persist import save_session
 from mentis.render_measurement import measure_page
 from mentis.session import TaskSession
+from mentis.trace import TraceArchiveError, TraceWriter
 
 GUIDANCE_DIR = Path("runtime") / "guidance"
 STATE_VERSION = "p3.2"
+# trace 契约 §7 状态映射：执行器终态 → 事件 status
+STATUS_VALUE = {"completed": "ok", "failed": "failed", "unknown": "unknown",
+                "dispatched": "pending", "running": "pending"}
 
 GUIDANCE_SYSTEM_ADDENDUM = (
     "你将收到双视口（1280×800 与 390×844）真实截图作为图像输入：视觉判断依据截图，"
@@ -262,6 +266,9 @@ class GuidanceCycle:
         self._constraints: list[str] = []
         self._goal = ""
         self._workspace_ready = False
+        self._finalized_emitted = False
+        self.trace = TraceWriter(self.run_dir, self.run_id,
+                                 executor_version=self.adapter.cli_version)
 
     # ---- 流程 ----
 
@@ -381,6 +388,14 @@ class GuidanceCycle:
             source_ref="derived:frozen-brief + ADR-002",
         ))
         s.authorize("exec-workspace", granted_by="user-cli-invocation(p3.2)")
+        self.trace.emit("mentis", "goal.recorded", f"{goal}｜约束来自冻结基线 {self.baseline_dir.name}",
+                        brief_version=self.session.current_brief.version)
+        self.trace.emit("mentis", "policy.set",
+                        "代决范围：" + "；".join(s.current_policy.decided_scope)
+                        + "；保留决定：" + "；".join(s.current_policy.reserved_decisions),
+                        brief_version=self.session.current_brief.version)
+        self.trace.emit("mentis", "authorization.granted", "exec-workspace（user-cli-invocation）",
+                        brief_version=self.session.current_brief.version)
         self._notify(f"已冻结 v1（sha256 前 12 位 {freeze_baseline_sha(self._v1_dir)}）；"
                      f"保留项 {len(self._preserved)} 项：{', '.join(l for l, _ in self._preserved)}")
 
@@ -448,6 +463,14 @@ class GuidanceCycle:
             encoding="utf-8")
         pack = ObservationPack(structure=structure, measurement=measurement,
                                image_names=image_names)
+        self.trace.emit("observer", "observation.structure",
+                        f"结构观察 {len(structure.items)} 条目（sha256 前 12 位 {structure.sha256[:12]}）",
+                        refs=[{"path": str(page), "sha256": structure.sha256, "role": "observation"}])
+        self.trace.emit("observer", "observation.render",
+                        f"渲染测量：{'; '.join(f'{v.name} 溢出 {v.overflow_px}px/异常 {len(v.errors)}' for v in measurement.viewports)}",
+                        refs=[{"path": str(out / "measurement.json"),
+                               "sha256": _sha256_file(out / "measurement.json"),
+                               "role": "observation"}])
         return pack, images
 
     def _diagnose(self, pack: ObservationPack, images: list, tag: str,
@@ -475,6 +498,15 @@ class GuidanceCycle:
         record.diagnosis_path = str(self.run_dir / f"diagnosis-{tag}.md")
         (self.run_dir / f"diagnosis-{tag}.md").write_text(
             render_bundle_markdown(bundle) + image_note, encoding="utf-8")
+        self.trace.emit("mentis", "observation.diagnosis",
+                        f"诊断（{'Mock' if bundle.mock else '真实模型'}）：有效 "
+                        f"{len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}、"
+                        f"决策请求 {len(bundle.valid_decision_requests)}",
+                        brief_version=self.session.current_brief.version,
+                        status="ok" if bundle.valid_diagnoses else "unknown",
+                        refs=[{"path": record.diagnosis_path,
+                               "sha256": _sha256_file(record.diagnosis_path),
+                               "role": "diagnosis"}])
         self._notify(f"诊断（{origin}）：有效 {len(bundle.valid_diagnoses)} 条、"
                      f"拒收 {len(bundle.invalid_diagnoses)} 条、决策请求 "
                      f"{len(bundle.valid_decision_requests)} 条")
@@ -525,6 +557,24 @@ class GuidanceCycle:
             round_no=record.round_no,
         )
         revision.to_attempt_id = attempt.attempt_id
+        brief_version = self.session.current_brief.version
+        # 契约 §1：确切指令在实际调用前落盘；失败则不发起该次委托
+        try:
+            prompt_ref = self.trace.archive_prompt(attempt.attempt_id, record.instruction)
+        except TraceArchiveError as exc:
+            self.session.fail_attempt(attempt.attempt_id)
+            self.trace.emit("mentis", "delegation.prepared",
+                            f"prompt 落盘失败，本次委托不发起：{exc}",
+                            attempt_id=attempt.attempt_id, brief_version=brief_version,
+                            status="failed")
+            self.notify(f"{tag} 未委托：{exc}")
+            return "failed"
+        self.trace.emit("mentis", "delegation.prepared",
+                        f"已归档确切指令并委托修订 {tag}（文本见 refs；与实际发送同一对象）",
+                        attempt_id=attempt.attempt_id, brief_version=brief_version,
+                        refs=[prompt_ref])
+        self.trace.record_delegation(attempt.attempt_id, brief_version, prompt_ref,
+                                     action=f"revise-{tag}")
         self.session.mark_running(attempt.attempt_id)
         spec = CodexTaskSpec(
             workspace=self.workspace, prompt=record.instruction,
@@ -545,6 +595,16 @@ class GuidanceCycle:
         record.codex_usage = dict(result.usage)
         record.codex_thread_id = result.native_thread_id
         record.codex_error = result.error
+        self.trace.emit("executor", "executor.completed",
+                        f"修订 {tag} 终态 {result.status.value}；时长 {record.codex_duration_s}s；"
+                        f"用量 {record.codex_usage or '未取得'}"
+                        + (f"；错误 {result.error[:120]}" if result.error else ""),
+                        attempt_id=attempt.attempt_id, brief_version=brief_version,
+                        native_thread_id=result.native_thread_id or None,
+                        status=STATUS_VALUE[result.status.value])
+        self.trace.record_executor_result(attempt.attempt_id, result.status,
+                                          native_thread_id=result.native_thread_id,
+                                          usage=dict(result.usage), error=result.error)
         events_path = self.run_dir / f"codex-{tag}-events.json"
         events_path.write_text(json.dumps(
             [{"seq": e.sequence, "kind": e.kind, "item_type": e.item_type,
@@ -630,6 +690,16 @@ class GuidanceCycle:
             disposition=Disposition.ACCEPT if review_passed else Disposition.REVISE)
         (self.run_dir / f"review-{tag}.md").write_text(
             json.dumps(verification, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.trace.emit("mentis", "review.recorded",
+                        f"复检：保留项回归 {regression or '无'}；测量未知 {unknown or '无'}；"
+                        f"模型复查已解决 {resolved or '无'}/未解决 {unresolved or '无'}/"
+                        f"新问题 {new_issues or '无'}；结论 {'通过' if review_passed else '不通过'}",
+                        attempt_id=self.session.attempts[-1].attempt_id,
+                        brief_version=self.session.current_brief.version,
+                        status="ok" if review_passed else "failed",
+                        refs=[{"path": str(self.run_dir / f"review-{tag}.md"),
+                               "sha256": _sha256_file(self.run_dir / f"review-{tag}.md"),
+                               "role": "review"}])
         record.review_path = str(self.run_dir / f"review-{tag}.md")
         if regression:
             return "regression"
@@ -1045,6 +1115,14 @@ class GuidanceCycle:
         review_path.write_text(json.dumps(verification, ensure_ascii=False, indent=2),
                                encoding="utf-8")
         last.review_path = str(review_path)
+        self.trace.emit("mentis", "review.recorded",
+                        f"复核重检：保留项回归 {regression or '无'}；测量未知 {unknown or '无'}；"
+                        f"绑定：{bind_note[:100]}；结论 {'通过' if review_passed else '不通过'}",
+                        attempt_id=self.session.attempts[-1].attempt_id,
+                        brief_version=self.session.current_brief.version,
+                        status="ok" if review_passed else "failed",
+                        refs=[{"path": str(review_path),
+                               "sha256": _sha256_file(review_path), "role": "review"}])
         if verdict == "improved":
             self.status = "IMPROVED"
             try:
@@ -1122,6 +1200,13 @@ class GuidanceCycle:
         return usage
 
     def _persist(self):
+        if not self._finalized_emitted:
+            self.trace.emit("mentis", "run.finalized",
+                            f"运行收尾：状态 {self.status}；判定 {self.verdict or '（未定）'}",
+                            brief_version=self.session.current_brief.version,
+                            status="ok" if self.status == "IMPROVED" else "unknown")
+            self._finalized_emitted = True
+        self.trace.finalize(outcome=f"{self.status}（verdict={self.verdict or '未定'}）")
         save_session(self.session, str(self.run_dir / "session.json"))
         meta = {
             "state_version": STATE_VERSION,
@@ -1359,4 +1444,9 @@ def guidance_from_state(state_path: str | Path, adapter=None, gateway=None,
     obj._v1_dir = obj.run_dir / "v1"
     obj._workspace_ready = obj.workspace.is_dir()
     obj._ensure_v1_reference()  # 从冻结 v1 重建逐段保留项与逐字段必填基准
+    obj._finalized_emitted = False
+    obj.trace = TraceWriter(obj.run_dir, obj.run_id, executor_version=obj.adapter.cli_version)
+    obj.trace.emit("mentis", "run.resumed",
+                   f"从落盘状态恢复（进入时状态 {obj.status}）；既有事件续排，不重放历史委托",
+                   brief_version=obj.session.current_brief.version)
     return obj

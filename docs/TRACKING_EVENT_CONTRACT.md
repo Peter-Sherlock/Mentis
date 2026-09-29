@@ -93,3 +93,14 @@ Codex 另自留 rollout 会话文件（顶层 `session_meta`/`event_msg`/`respon
 ## 10. 性能与有界性（首版）
 
 Mentis 自身延迟目标：收到一行完整 CLI 事件后 2 秒内落盘可读（正常本地磁盘）；不计执行器首事件等待。摘要与命令输出有界截断并标注；事件流内存占用常数级。观察到的"用户目标与实际委托不一致"登记为产品缺陷，不在评测中偷偷改 prompt 或评分标准。
+
+## 11. T1 实现附录（2026-09-29，按约说明增改）
+
+实现于 P2.4-T1（`mentis/trace.py`），对本草案的增改与解释：
+
+1. **新增 kind**：`run.resumed`（mentis；恢复续接，事件 seq 从已有流续排）与 `observation.diagnosis`（mentis；模型诊断候选落盘引用）——原 §3 枚举未列，属实现期补充。
+2. **`executor.completed` 语义**：指"执行器调用结束"，`status` 字段携带 ok/failed/unknown——未知终态不是 `executor.failed`。
+3. **`delegation.prepared` 的 `status=failed`**：表示 prompt 落盘失败、**该次委托未发起**（调用方已把尝试记为 failed，执行器未被调用）。
+4. **prompt 归档字节一致性**：`trace/prompts/<attempt_id>.md` 以字节写入（不经 newline 转换），使文件 SHA-256 与实际发送文本逐字节一致（Windows 下 `write_text` 的 \n→\r\n 转换会破坏一致性，已被测试捕获并修复）。
+5. **半行容错**：读端跳过损坏行并原样标记 `corrupt_line`；写入器续排 seq 时对半行用正则提取已写出的 seq，不复用该号。
+6. **manifest 从事件重建**：恢复场景下新写入器从既有 `delegation.prepared` 事件重建委托台账，保证 manifest 覆盖全运行的委托。

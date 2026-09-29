@@ -24,14 +24,18 @@ from mentis.capabilities.routing import Gap, route_gap
 from mentis.capabilities.selection import select_for_task
 from mentis.contracts import AttemptStatus, DelegationPolicy, Disposition, Provenance, SourcedItem
 from mentis.diagnosis import render_bundle_markdown, run_diagnosis
-from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskSpec
+from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskResult, CodexTaskSpec
 from mentis.models.gateway import ModelConfig, ModelGateway
 from mentis.observation import observe_structure
 from mentis.persist import save_session, session_from_dict
 from mentis.session import TaskSession
+from mentis.trace import TraceArchiveError, TraceWriter
 
 COLLAB_DIR = Path("runtime") / "collab"
 STATE_VERSION = "p2.3"
+# trace 契约 §7 状态映射：执行器终态 → 事件 status
+STATUS_VALUE = {"completed": "ok", "failed": "failed", "unknown": "unknown",
+                "dispatched": "pending", "running": "pending"}
 COPY_DECK = """# 拾光咖啡 · 周六手冲入门工作坊（合成素材，虚构品牌）
 
 - 活动名称：周六手冲入门工作坊
@@ -137,6 +141,10 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.status = meta.get("status", "created")
     obj.last_diagnosis = None
     obj.run_dir = state_path.parent if isinstance(state_path, Path) else Path(state_path).parent
+    obj.trace = TraceWriter(obj.run_dir, obj.run_id, executor_version=obj.adapter.cli_version)
+    obj.trace.emit("mentis", "run.resumed",
+                   f"从落盘状态恢复（进入时状态 {obj.status}）；既有事件续排，不重放历史委托",
+                   brief_version=obj.session.current_brief.version)
     return obj
 
 
@@ -169,6 +177,19 @@ class Collaboration:
         self.status = "created"
         self.last_diagnosis = None
         self.run_dir = self.base_dir / self.run_id
+        self._finalized_emitted = False
+        # P2.4-T1：追踪写入器（契约 mentis-trace/1）；委托/复检/收尾点写入
+        self.trace = TraceWriter(self.run_dir, self.run_id,
+                                 executor_version=self.adapter.cli_version)
+        self.trace.emit("mentis", "goal.recorded", self.session.goal,
+                        brief_version=self.session.current_brief.version)
+        self.trace.emit("mentis", "policy.set",
+                        "代决范围：" + "；".join(self.session.current_policy.decided_scope)
+                        + "；保留决定：" + "；".join(self.session.current_policy.reserved_decisions),
+                        brief_version=self.session.current_brief.version)
+        self.trace.emit("mentis", "authorization.granted",
+                        "exec-workspace（来源 user-cli-invocation）",
+                        brief_version=self.session.current_brief.version)
 
     # ---- 初始化 ----
 
@@ -209,6 +230,10 @@ class Collaboration:
                  unique: str, excluded: str) -> bool:
         """请求用户决定；交互模式当场等待回答，否则保持未决（沉默≠批准）。"""
         ix = self.session.request_decision(question, blocking_action=blocking_action)
+        self.trace.emit("mentis", "decision.requested",
+                        f"请求决定 {ix.interaction_id}（阻塞 {blocking_action}）：{question}｜"
+                        f"阻塞原因：{blocking_reason}",
+                        brief_version=self.session.current_brief.version, status="pending")
         if self.interactive:
             print(f"\n[需要你决定] {question}")
             print(f"  为什么现在问：{blocking_reason}")
@@ -218,6 +243,9 @@ class Collaboration:
             if answer:
                 self.session.answer_interaction(ix.interaction_id, answer, source="user")
                 self._last_answer = answer
+                self.trace.emit("user", "decision.answered",
+                                f"回答 {ix.interaction_id}：「{answer[:120]}」",
+                                brief_version=self.session.current_brief.version)
                 return True
         self.notify(f"请求已记录（{ix.interaction_id}），依赖动作 {blocking_action} 暂停；"
                     "其余独立工作继续，不越权。")
@@ -257,6 +285,26 @@ class Collaboration:
     def _dispatch_codex(self, action_key: str, prompt: str, resume: bool = False,
                         revision_id: str | None = None):
         attempt = self.session.dispatch(action_key, "exec-workspace", revision_id=revision_id)
+        brief_version = self.session.current_brief.version
+        # 契约 §1：确切委托文本在实际调用前落盘；失败则不发起该次委托
+        try:
+            prompt_ref = self.trace.archive_prompt(attempt.attempt_id, prompt)
+        except TraceArchiveError as exc:
+            self.session.fail_attempt(attempt.attempt_id)
+            self.trace.emit("mentis", "delegation.prepared",
+                            f"prompt 落盘失败，本次委托不发起：{exc}", attempt_id=attempt.attempt_id,
+                            brief_version=brief_version, status="failed")
+            self.notify(f"{action_key} 未委托：{exc}")
+            blocked = CodexTaskResult(
+                task_id="", attempt_id=attempt.attempt_id, brief_version=brief_version,
+                workspace=str(self.workspace), status=AttemptStatus.FAILED,
+                error="追踪 prompt 落盘失败，未发起委托")
+            return attempt, blocked
+        self.trace.emit("mentis", "delegation.prepared",
+                        f"已归档确切指令并委托 {action_key}（文本见 refs；与实际发送同一对象）",
+                        attempt_id=attempt.attempt_id, brief_version=brief_version,
+                        refs=[prompt_ref])
+        self.trace.record_delegation(attempt.attempt_id, brief_version, prompt_ref, action=action_key)
         self.session.mark_running(attempt.attempt_id)
         spec = CodexTaskSpec(
             workspace=self.workspace, prompt=prompt,
@@ -272,6 +320,15 @@ class Collaboration:
             result = self.adapter.start_task(spec)
         duration = round(time.monotonic() - started, 1)
         self.thread_id = result.native_thread_id or self.thread_id
+        self.trace.emit("executor", "executor.completed",
+                        f"{action_key} 终态 {result.status.value}；时长 {duration}s；"
+                        f"用量 {result.usage or '未取得'}" + (f"；错误 {result.error[:120]}" if result.error else ""),
+                        attempt_id=attempt.attempt_id, brief_version=brief_version,
+                        native_thread_id=result.native_thread_id or None,
+                        status=STATUS_VALUE[result.status.value])
+        self.trace.record_executor_result(attempt.attempt_id, result.status,
+                                          native_thread_id=result.native_thread_id,
+                                          usage=dict(result.usage), error=result.error)
         self.codex_runs.append(CodexRunSummary(
             action_key=action_key, attempt_id=attempt.attempt_id, task_id=result.task_id,
             thread_id=result.native_thread_id, status=result.status.value,
@@ -325,6 +382,11 @@ class Collaboration:
                 "question": q, "route": route.action, "rationale": route.rationale,
                 "answered_autonomously": route.action != "request_user",
             })
+            self.trace.emit("mentis", "decision.routed",
+                            f"执行器反问「{q[:80]}」→ {route.action}；理由：{route.rationale[:120]}",
+                            attempt_id=build_attempt.attempt_id if build_attempt else None,
+                            brief_version=self.session.current_brief.version,
+                            status="pending" if route.action == "request_user" else "ok")
         if user_questions:
             for q, route in user_questions:
                 if self.ask_user(
@@ -438,6 +500,12 @@ class Collaboration:
         self.session.record_review(
             attempt.attempt_id, findings=findings, passed=not blocking,
             disposition=Disposition.REVISE if blocking else Disposition.ACCEPT)
+        self.trace.emit("mentis", "review.recorded",
+                        "结构硬要求检查：" + ("；".join(findings)[:300] if blocking else "通过")
+                        + f"（视觉/交互未验证；结论 {'不通过' if blocking else '通过'}）",
+                        attempt_id=attempt.attempt_id,
+                        brief_version=self.session.current_brief.version,
+                        status="failed" if blocking else "ok")
         self.notify("硬要求检查：" + ("未通过（" + "、".join(blocking) + "）" if blocking else "结构层通过"))
         while blocking and self.repairs_used < self.max_repairs:
             self.repairs_used += 1
@@ -456,6 +524,11 @@ class Collaboration:
             self.session.record_review(
                 repair_attempt.attempt_id, findings=findings, passed=not blocking,
                 disposition=Disposition.REVISE if blocking else Disposition.ACCEPT)
+            self.trace.emit("mentis", "review.recorded",
+                            "修复轮结构检查：" + ("；".join(findings)[:300] if blocking else "通过"),
+                            attempt_id=repair_attempt.attempt_id,
+                            brief_version=self.session.current_brief.version,
+                            status="failed" if blocking else "ok")
             attempt = repair_attempt
         if blocking:
             self.notify("硬要求仍未满足：不交付、不接受（completed ≠ accepted）")
@@ -621,12 +694,17 @@ class Collaboration:
             for auth in self.session.authorizations:
                 if auth.status.value == "active":
                     self.session.revoke_authorization(auth.auth_id)
+            self.trace.emit("user", "authorization.revoked", "用户撤回授权；后续委托全部拒绝",
+                            brief_version=self.session.current_brief.version, status="failed")
             self.status = "WITHDRAWN"
             self.notify("授权已撤回：后续任何委托都会被拒绝；已产出文件保留待核对")
             self._persist(None, None, delivered=False)
             return self.status
         if goal_new:
             self.session.update_brief(objective=goal_new)
+            self.trace.emit("user", "brief.updated",
+                            f"目标改为：「{goal_new[:120]}」（旧版本结果不再适用）",
+                            brief_version=self.session.current_brief.version)
             self.notify(f"目标已改为：{goal_new}（brief v{self.session.current_brief.version}）；"
                         "旧版本尝试不能被接受（版本门禁），将按新目标重新委托")
             attempt, result = self._dispatch_codex(
@@ -703,6 +781,9 @@ class Collaboration:
                 return self.status
             self.session.update_brief(add_preferences=[SourcedItem(
                 f"用户修正：{feedback}", Provenance.USER_SELECTED, "user-feedback")])
+            self.trace.emit("user", "brief.updated",
+                            f"用户修正进入 brief v{self.session.current_brief.version}：「{feedback[:120]}」",
+                            brief_version=self.session.current_brief.version)
             trace = self.session.notify_progress(f"用户明确修正：{feedback}")
             revision = self.session.record_revision(
                 feedback_interaction_id=trace.interaction_id,
@@ -748,6 +829,13 @@ class Collaboration:
 
     def _persist(self, structure, browser_obs, delivered: bool):
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        if not self._finalized_emitted:
+            self.trace.emit("mentis", "run.finalized",
+                            f"运行收尾：状态 {self.status}；交付 {'是' if delivered else '否'}",
+                            brief_version=self.session.current_brief.version,
+                            status="ok" if delivered else "unknown")
+            self._finalized_emitted = True
+        self.trace.finalize(outcome=f"{self.status}（delivered={delivered}）")
         save_session(self.session, str(self.run_dir / "session.json"))
         meta = {
             "state_version": STATE_VERSION,
