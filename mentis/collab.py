@@ -325,7 +325,8 @@ class Collaboration:
                         f"用量 {result.usage or '未取得'}" + (f"；错误 {result.error[:120]}" if result.error else ""),
                         attempt_id=attempt.attempt_id, brief_version=brief_version,
                         native_thread_id=result.native_thread_id or None,
-                        status=STATUS_VALUE[result.status.value])
+                        status=STATUS_VALUE[result.status.value],
+                        executor_status=result.status.value, usage=dict(result.usage))
         self.trace.record_executor_result(attempt.attempt_id, result.status,
                                           native_thread_id=result.native_thread_id,
                                           usage=dict(result.usage), error=result.error)

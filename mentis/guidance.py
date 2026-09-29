@@ -529,6 +529,12 @@ class GuidanceCycle:
                     "question": q, "route": "request_user", "interaction_id": ix.interaction_id,
                     "rationale": "触及保留决定或需要用户独有事实；依赖动作暂停（沉默≠批准）",
                 })
+                self.trace.emit("mentis", "decision.requested",
+                                f"请求 {ix.interaction_id}：{q}；依赖修订暂停（沉默≠批准）",
+                                brief_version=self.session.current_brief.version, status="pending")
+                self.trace.emit("mentis", "decision.routed",
+                                f"{ix.interaction_id} → request_user；触及保留决定或需要用户独有事实",
+                                brief_version=self.session.current_brief.version, status="pending")
                 self._notify(f"决策请求转用户（{ix.interaction_id}）：{q}")
                 pause = True
             else:
@@ -538,6 +544,9 @@ class GuidanceCycle:
                     "rationale": f"可逆的专业取舍，未触及保留决定；{route.rationale}",
                     "decision": AUTONOMOUS_DECISION_TEXT,
                 })
+                self.trace.emit("mentis", "decision.routed",
+                                f"agent_decide：{q}；可逆专业取舍；{route.rationale}；决定 {AUTONOMOUS_DECISION_TEXT}",
+                                brief_version=self.session.current_brief.version)
                 decisions.append(f"问：{q}\n  Mentis 自主决定：{AUTONOMOUS_DECISION_TEXT}")
                 self._notify(f"决策请求分流为自主决定（不转问用户）：{q[:50]}…")
         return pause, decisions
@@ -601,7 +610,8 @@ class GuidanceCycle:
                         + (f"；错误 {result.error[:120]}" if result.error else ""),
                         attempt_id=attempt.attempt_id, brief_version=brief_version,
                         native_thread_id=result.native_thread_id or None,
-                        status=STATUS_VALUE[result.status.value])
+                        status=STATUS_VALUE[result.status.value],
+                        executor_status=result.status.value, usage=dict(result.usage))
         self.trace.record_executor_result(attempt.attempt_id, result.status,
                                           native_thread_id=result.native_thread_id,
                                           usage=dict(result.usage), error=result.error)
@@ -961,6 +971,9 @@ class GuidanceCycle:
         answers = answers or {}
         for ix_id, text in answers.items():
             self.session.answer_interaction(ix_id, text, source="user")
+            self.trace.emit("user", "decision.answered",
+                            f"用户回答 {ix_id}；原文保存在会话记录",
+                            brief_version=self.session.current_brief.version)
         pending = [ix for ix in self.session.interactions
                    if ix.kind.value == "request_decision" and ix.answer_source is None]
         if pending:
@@ -977,6 +990,9 @@ class GuidanceCycle:
         answer_text = "；".join(f"{k}:{v}" for k, v in answers.items())
         self.session.update_brief(add_preferences=[SourcedItem(
             f"用户决定（诊断请求）：{answer_text}", Provenance.USER_SELECTED, "user-decision")])
+        self.trace.emit("mentis", "brief.updated",
+                        f"诊断请求的用户决定已写入 brief v{self.session.current_brief.version}",
+                        brief_version=self.session.current_brief.version)
         if not last_round.instruction:
             # NEEDS_DECISION 暂停发生在指令组装前：依据落盘诊断与重新观察组装
             page = self._v1_dir / "index.html" if last_round.round_no == 1 else self._current_html()

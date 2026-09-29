@@ -17,11 +17,11 @@ from mentis.trace import (TraceArchiveError, TraceWriter, load_events, render_ti
 
 try:
     from tests.test_collab import FakeAdapter, make_collab, stub_capture
-    from tests.test_guidance import (DIAGNOSIS_OVERFLOW, FakeGateway, REVIEW_RESOLVED,
+    from tests.test_guidance import (DIAGNOSIS_OVERFLOW, DIAGNOSIS_NEEDS_USER, FakeGateway, REVIEW_RESOLVED,
                                      file_aware_measure, make_baseline)
 except ImportError:
     from test_collab import FakeAdapter, make_collab, stub_capture
-    from test_guidance import (DIAGNOSIS_OVERFLOW, FakeGateway, REVIEW_RESOLVED,
+    from test_guidance import (DIAGNOSIS_OVERFLOW, DIAGNOSIS_NEEDS_USER, FakeGateway, REVIEW_RESOLVED,
                                file_aware_measure, make_baseline)
 
 
@@ -86,6 +86,10 @@ class TraceWriterTests(unittest.TestCase):
             out.write('{"seq": 99, "kind": "trunc')  # 半行
         w3 = TraceWriter(run_dir, "run-x")
         self.assertEqual(w3.emit("mentis", "goal.recorded", "三"), 100)
+        events = load_events(run_dir)
+        self.assertEqual(events[-1]["seq"], 100)  # 半行不能吞掉后续有效事件
+        self.assertIn("corrupt_line", [e["kind"] for e in events])
+        self.assertFalse(w3.finalize()["integrity"]["events_complete"])
 
     def test_prompt_hash_matches_content(self):
         run_dir = self.root / "run"
@@ -114,7 +118,35 @@ class TraceWriterTests(unittest.TestCase):
         self.assertEqual(d["terminal_status"], "completed")
         # 从事件重建（恢复场景）：新写入器读到同一委托
         w2 = TraceWriter(run_dir, "run-x")
-        self.assertEqual(w2._rebuild_delegations()[0]["prompt_sha256"], ref["sha256"])
+        rebuilt = w2.finalize()["delegations"][0]
+        self.assertEqual(rebuilt["prompt_sha256"], ref["sha256"])
+        self.assertEqual(rebuilt["terminal_status"], "completed")
+        self.assertEqual(rebuilt["native_thread_id"], "t-9")
+        self.assertEqual(rebuilt["usage"], {"input_tokens": 10})
+
+    def test_terminal_event_restores_usage_even_without_manifest(self):
+        run_dir = self.root / "run"
+        w = TraceWriter(run_dir, "run-x")
+        ref = w.archive_prompt("attempt-1", "指令")
+        w.emit("mentis", "delegation.prepared", "委托", attempt_id="attempt-1", refs=[ref])
+        w.emit("executor", "executor.completed", "完成", attempt_id="attempt-1",
+               native_thread_id="thread-1", executor_status="completed",
+               usage={"input_tokens": 9})
+        restored = TraceWriter(run_dir, "run-x").finalize()["delegations"][0]
+        self.assertEqual(restored["usage"], {"input_tokens": 9})
+        self.assertEqual(restored["terminal_status"], "completed")
+        self.assertEqual(restored["native_thread_id"], "thread-1")
+
+    def test_replay_detects_mutated_reference(self):
+        run_dir = self.root / "run"
+        w = TraceWriter(run_dir, "run-x")
+        ref = w.archive_prompt("attempt-1", "最初指令")
+        w.emit("mentis", "delegation.prepared", "委托", attempt_id="attempt-1", refs=[ref])
+        w.finalize()
+        Path(ref["path"]).write_bytes("改动后的指令".encode("utf-8"))
+        timeline = render_timeline(run_dir)
+        self.assertIn("当前核验：**未通过**", timeline)
+        self.assertIn("哈希不匹配", timeline)
 
 
 class TraceIntegrationTests(unittest.TestCase):
@@ -148,6 +180,7 @@ class TraceIntegrationTests(unittest.TestCase):
         # 回放可读
         timeline = render_timeline(collab.run_dir)
         self.assertIn("事后回放（T1）", timeline)
+        self.assertIn("当前核验：**通过**", timeline)
         self.assertIn("delegation.prepared", timeline)
 
     def test_prompt_archive_failure_blocks_delegation(self):
@@ -191,6 +224,31 @@ class TraceIntegrationTests(unittest.TestCase):
         sent = cycle.adapter.prompts[0]
         self.assertEqual(manifest["delegations"][0]["prompt_sha256"],
                          hashlib.sha256(sent.encode("utf-8")).hexdigest())
+
+    def test_guidance_decision_pause_and_answer_are_traced(self):
+        from mentis.guidance import GuidanceCycle
+        try:
+            from tests.test_guidance import stub_capture as g_capture
+        except ImportError:
+            from test_guidance import stub_capture as g_capture
+        cycle = GuidanceCycle(
+            baseline_dir=make_baseline(self.root), run_dir=self.root / "decision-run",
+            adapter=RecordingGuidanceAdapter(behavior={"first": "fixed"}),
+            gateway=FakeGateway([DIAGNOSIS_NEEDS_USER, REVIEW_RESOLVED]),
+            browser_capture=g_capture, measure=file_aware_measure,
+            use_model=True, include_images=True, timeout_s=60, max_rounds=1)
+        self.assertEqual(cycle.run(), "NEEDS_DECISION")
+        kinds = [e["kind"] for e in load_events(cycle.run_dir)]
+        self.assertIn("decision.requested", kinds)
+        self.assertIn("decision.routed", kinds)
+        self.assertNotIn("delegation.prepared", kinds)
+        pending = [i for i in cycle.session.interactions
+                   if i.kind.value == "request_decision" and i.answer_source is None]
+        self.assertEqual(len(pending), 1)
+        cycle.resume(answers={pending[0].interaction_id: "需要，纳入直播信息"})
+        kinds = [e["kind"] for e in load_events(cycle.run_dir)]
+        self.assertIn("decision.answered", kinds)
+        self.assertIn("brief.updated", kinds)
 
     def test_historical_replay_lists_gaps_without_backfill(self):
         """历史运行：列现存材料与未记录缺口；不生成 trace/（契约 §9 不回填）。"""

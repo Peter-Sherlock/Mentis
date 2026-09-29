@@ -588,6 +588,12 @@ class GuidanceLoopTests(GuidanceTestBase):
         status = cycle.run()
         self.assertEqual(status, "IMPROVED")  # 不因偏好请求暂停
         self.assertEqual([r["route"] for r in cycle.decision_routes], ["agent_decide"])
+        from mentis.trace import load_events
+        route_events = [e for e in load_events(cycle.run_dir) if e["kind"] == "decision.routed"]
+        self.assertEqual(len(route_events), 1)
+        self.assertIn("agent_decide", route_events[0]["summary"])
+        self.assertFalse(any(e["kind"] == "decision.requested"
+                             for e in load_events(cycle.run_dir)))
         instruction = (cycle.run_dir / "instruction-round1.md").read_text(encoding="utf-8")
         self.assertIn("Mentis 对诊断请求的自主分流", instruction)
         self.assertIn("保持当前内容与顺序", instruction)

@@ -1,6 +1,6 @@
 # Mentis 统一追踪事件契约（T0 冻结草案）
 
-版本：**v1.0-draft**（2026-09-29，P2.4-T0 冻结；T1 实现时按此执行，修改须在进度记录中说明理由）｜性质：**契约设计，本轮未实现**｜上游计划：[交互可见性与 P2.4 递进计划](INTERACTION_VISIBILITY_PLAN.md) §3.1。
+版本：**v1.0-draft**（2026-09-29，P2.4-T0 冻结；T1 实现及验收修复见 §11；修改须在进度记录中说明理由）｜性质：**已接入 T1 事后追踪，T2 实时流未实现**｜上游计划：[交互可见性与 P2.4 递进计划](INTERACTION_VISIBILITY_PLAN.md) §3.1。
 
 本契约基于本机实测材料制定：Codex CLI `0.158.0`（`codex --version` 实测）、既有真实 rollout 文件（`~/.codex/sessions/2026/09/28/rollout-2026-09-28T09-28-26-01a0e833-….jsonl`，29 行，字段逐一枚举）、既有真实运行目录（[P2.4-T0 记录](progress/P2.4-T0.md) §3 的工作样例）。
 
@@ -31,6 +31,8 @@
 | `status` | enum | `ok` / `failed` / `unknown` / `pending` / `unexplained`（未知原生事件类型专用） |
 | `summary` | string | 有界可读摘要（≤500 字符；截断必须以「…（已截断）」结尾） |
 | `refs` | array | `[{path, sha256, role}]`；role ∈ `prompt` / `artifact` / `observation` / `review` / `diagnosis` / `native_log`。**哈希是关联主键，时间先后不是因果证明** |
+| `executor_status` | string（可选） | `executor.completed` 的原始终态值（例如 completed/failed/unknown），供续接重建委托台账 |
+| `usage` | object（可选） | `executor.completed` 的结构化用量；无终态时保持未知，不从摘要猜测 |
 
 ## 3. 事件类别（kind 枚举，首版冻结）
 
@@ -104,3 +106,10 @@ Mentis 自身延迟目标：收到一行完整 CLI 事件后 2 秒内落盘可�
 4. **prompt 归档字节一致性**：`trace/prompts/<attempt_id>.md` 以字节写入（不经 newline 转换），使文件 SHA-256 与实际发送文本逐字节一致（Windows 下 `write_text` 的 \n→\r\n 转换会破坏一致性，已被测试捕获并修复）。
 5. **半行容错**：读端跳过损坏行并原样标记 `corrupt_line`；写入器续排 seq 时对半行用正则提取已写出的 seq，不复用该号。
 6. **manifest 从事件重建**：恢复场景下新写入器从既有 `delegation.prepared` 事件重建委托台账，保证 manifest 覆盖全运行的委托。
+
+### T1 验收修复（2026-09-29）
+
+7. **半行隔离与完整性重算**：续写前若文件末尾不是换行，先补换行隔离坏行；新事件保持可读。`finalize` 从磁盘重扫坏行、seq 连续性、契约与 run_id；存在异常或历史写失败时 `events_complete=false`。`events_written` 是可解析事件数，`seq_max` 是已占用最大序号，两者不再混用。
+8. **恢复终态**：新 `executor.completed` 事件记录可选的 `executor_status`、结构化 `usage`；续接从事件重建。旧 T1 事件缺结构化用量时，仅在同 run_id、同契约、同 prompt 哈希下继承旧 manifest 台账；找不到来源则保持未知。
+9. **回放现核**：`mentis trace --run` 除显示落盘 manifest，还重算当前事件流和 `refs` 文件 SHA-256。引用缺失、内容变化或事件流异常会显示“当前核验：未通过”；历史无 trace 的运行继续只读列缺口，不回填。
+10. **指导决策链**：guide-revise 的用户请求、路由、自主决定、用户回答及 brief 更新写入对应 `decision.*` / `brief.updated` 事件。回答原文仍在会话记录，事件只记交互 ID 与版本。
