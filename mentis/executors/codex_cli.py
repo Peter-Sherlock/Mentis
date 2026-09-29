@@ -231,8 +231,9 @@ class CodexCliAdapter:
             # timeout 的子进程/文件状态可能尚未可判定，故意保留锁。
             if lock_path is not None and not timed_out:
                 lock_path.unlink(missing_ok=True)
-        if result.status is AttemptStatus.UNKNOWN:
-            self._classify(result, spec, expected_thread_id, root)
+        # 两条执行路径（流式/注入 runner）在非超时时都已完成分类（含 returncode）；
+        # 此处不再重复分类——T4 真实运行发现：冗余重分类缺 returncode 参数，
+        # 任何 unknown 结果都会 TypeError 崩溃（异常收尾兜底，但执行器终态丢失）。
         return result
 
     def _run_via_runner(self, command, spec, root, result, child_env,
@@ -304,10 +305,14 @@ class CodexCliAdapter:
               and result.final_response and not any(
                   e.kind in ("turn.failed", "error", "invalid_jsonl")
                   for e in result.events)):
-            # 干净退出、有最终文本，但缺少 turn.completed 终态事件：
+            # 干净退出、有最终文本，但 COMPLETED 条件未满足（终态缺失或存在失败子项）：
             # 结局不确定而非明确失败 → unknown，交由产物核对决定
             result.status = AttemptStatus.UNKNOWN
-            result.error = "Codex 退出码 0 且有最终文本，但缺少 turn.completed；需产物核对"
+            if any(e.kind == "turn.completed" for e in result.events):
+                result.error = ("Codex 已报告 turn.completed，但存在失败子项或异常事件；"
+                                "需产物核对")
+            else:
+                result.error = "Codex 退出码 0 且有最终文本，但缺少 turn.completed；需产物核对"
         else:
             result.status = AttemptStatus.FAILED
             result.error = f"Codex 未报告成功终态（进程退出码 {returncode}）"

@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from mentis.contracts import AttemptStatus
-from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskSpec, ExecutorBusy
+from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskSpec, CodexTaskResult, ExecutorBusy
 from mentis.trace import TraceWriter, load_events, redact_text, render_timeline
 from mentis.trace_export import export_timeline
 
@@ -158,6 +158,35 @@ class ExecutorFaultFixtureTests(unittest.TestCase):
         self.assertEqual(result.status, AttemptStatus.FAILED)
         self.assertIn("invalid_jsonl", [e.kind for e in result.events])
 
+    def test_unknown_without_timeout_returns_normally(self):
+        """T4 真实运行发现的 T2 遗留缺陷回归：流式路径判 unknown 后不得因冗余重分类崩溃。"""
+        tid = "33333333-3333-3333-3333-333333333333"
+        stream = ScriptedStream(
+            [json.dumps({"type": "thread.started", "thread_id": tid}),
+             json.dumps({"type": "turn.started"}),
+             json.dumps({"type": "item.completed",
+                         "item": {"type": "agent_message", "text": "做完了"}})],
+            returncode=0)  # 干净退出但无 turn.completed → unknown（原代码此处 TypeError）
+        result = self._adapter(stream).start_task(self._spec())
+        self.assertEqual(result.status, AttemptStatus.UNKNOWN)
+        self.assertIn("缺少 turn.completed", result.error)
+
+    def test_turn_completed_with_failed_subitem_is_unknown(self):
+        """终态在场但有失败子项：不判完成（P3.1 纪律），错误消息如实指向失败子项。"""
+        tid = "44444444-4444-4444-4444-444444444444"
+        stream = ScriptedStream(
+            [json.dumps({"type": "thread.started", "thread_id": tid}),
+             json.dumps({"type": "item.completed",
+                         "item": {"type": "command_execution", "status": "failed",
+                                  "command": "probe"}}),
+             json.dumps({"type": "item.completed",
+                         "item": {"type": "agent_message", "text": "完成（含一次失败探测）"}}),
+             json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5}})],
+            returncode=0)
+        result = self._adapter(stream).start_task(self._spec())
+        self.assertEqual(result.status, AttemptStatus.UNKNOWN)
+        self.assertIn("失败子项", result.error)
+
     def test_quota_error_maps_to_failed_and_keeps_message(self):
         """限额：error/turn.failed → FAILED；错误原文（有界）入 result.error 并可入 trace summary。"""
         stream = ScriptedStream(
@@ -214,6 +243,32 @@ class MultiAttemptTimelineTests(unittest.TestCase):
         self.assertIn("委托台账", timeline)
         self.assertIn("中断区间", timeline)  # 恢复前的无记录区间如实标注
         self.assertIn("当前核验：**通过**", timeline)  # seq 连续、事件完整
+
+    def test_confirm_outcome_writes_executor_confirmed_event(self):
+        """T4：核对确认路径（问题 5）在事件流中可回放——ERROR/unknown → 确认 → 交付。"""
+        from mentis.collab import collaboration_from_state
+
+        class UnknownAdapter(FakeAdapter):
+            def _run(self, spec, status_override=None):
+                if not self.calls:
+                    self.calls.append(spec.prompt[:30])
+                    return CodexTaskResult(
+                        task_id="t", attempt_id="attempt-unknown", brief_version=spec.brief_version,
+                        workspace=str(spec.workspace), status=AttemptStatus.UNKNOWN,
+                        native_thread_id="", usage={}, artifact_paths=[], cli_version="fake")
+                return super()._run(spec, status_override)
+
+        collab = make_collab(adapter=UnknownAdapter(), base_dir=self.root / "collab")
+        self.assertEqual(collab.run(), "UNKNOWN")
+        restored = collaboration_from_state(collab.run_dir / "state.json",
+                                            adapter=collab.adapter,
+                                            browser_capture=stub_capture)
+        self.assertEqual(restored.resume(confirm_outcome=AttemptStatus.COMPLETED), "DELIVERED")
+        kinds = [e["kind"] for e in load_events(collab.run_dir)]
+        self.assertIn("executor.confirmed", kinds)
+        confirmed = [e for e in load_events(collab.run_dir) if e["kind"] == "executor.confirmed"][0]
+        self.assertEqual(confirmed["status"], "ok")
+        self.assertIn("无活跃写入者", confirmed["summary"])
 
     def test_revoke_is_traced_and_persists(self):
         from mentis.collab import collaboration_from_state

@@ -729,6 +729,14 @@ class Collaboration:
             artifact = self.session.add_artifact(attempt.attempt_id, str(index),
                                                  "codex-cli(核对后补记)")
             attempt.artifact_id = artifact.artifact_id
+        # T4：核对确认本身入事件流（问题 5 的依据——否则 ERROR→确认→交付的过程只存在于终端输出）
+        self.trace.emit("mentis", "executor.confirmed",
+                        f"人工核对后确认 {attempt.attempt_id} 结局 {final_status.value}"
+                        "（依据：产物存在且可解析、无活跃写入者；不声称执行器完成其全部计划步骤）",
+                        attempt_id=attempt.attempt_id,
+                        brief_version=self.session.current_brief.version,
+                        status=STATUS_VALUE[final_status.value],
+                        executor_status=final_status.value)
         self.notify(f"执行器结局已确认为 {final_status.value}（依据：产物存在且可解析、"
                     "无活跃写入者；不声称执行器完成了其全部计划步骤）")
         if final_status is AttemptStatus.COMPLETED:

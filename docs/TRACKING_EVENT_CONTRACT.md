@@ -1,6 +1,6 @@
 # Mentis 统一追踪事件契约（T0 冻结草案）
 
-版本：**v1.0-draft**（2026-09-29，P2.4-T0 冻结；T1 实现及验收修复见 §11，T2 见 §12，T3 见 §13；修改须在进度记录中说明理由）｜性质：**已接入事后回放、实时旁观（--follow）与白名单导出（--export）**｜上游计划：[交互可见性与 P2.4 递进计划](INTERACTION_VISIBILITY_PLAN.md) §3.1。
+版本：**v1.0-draft**（2026-09-29，P2.4-T0 冻结；T1 实现及验收修复见 §11，T2 见 §12，T3 见 §13，T4 见 §14；修改须在进度记录中说明理由）｜性质：**已接入事后回放、实时旁观（--follow）与白名单导出（--export），经真实运行核验**｜上游计划：[交互可见性与 P2.4 递进计划](INTERACTION_VISIBILITY_PLAN.md) §3.1。
 
 本契约基于本机实测材料制定：Codex CLI `0.158.0`（`codex --version` 实测）、既有真实 rollout 文件（`~/.codex/sessions/2026/09/28/rollout-2026-09-28T09-28-26-01a0e833-….jsonl`，29 行，字段逐一枚举）、既有真实运行目录（[P2.4-T0 记录](progress/P2.4-T0.md) §3 的工作样例）。
 
@@ -129,3 +129,8 @@ Mentis 自身延迟目标：收到一行完整 CLI 事件后 2 秒内落盘可�
 5. **现场会话异常**（field-start/field-feedback）：会话按 `SESSION_ERROR` 收尾，usage-record 明确标注"记录不完整（半份日志如实保留，不补写未发生事件）"，并保留 session-log.txt 日志入口；关联运行目录的 ERROR 落盘不受影响。
 6. **多 attempt 连续时间线**：回放新增**委托台账**（每次委托的 attempt→终态、thread、prompt 哈希，来自 manifest）；`run.resumed` 事件标注**中断区间**（与上一事件的间隔秒数，"期间无记录，不回填"）。续接新 attempt 段与同一原生 thread 关联、原判定不覆盖的语义不变（§4/§7），现在在回放中显式可见。
 7. **执行器原生错误保留**：`error`/`turn.failed` 的原生 message 有界存入 `CodexTaskResult.native_error` 并拼入 FAILED 判定文本——配额类错误的原文可进入 `executor.completed` summary（§7 的"错误原文入 summary"由此落实），供事后回放核对。
+
+## 14. T4 实现附录（2026-09-29，真实使用核验段）
+
+1. **新增 kind：`executor.confirmed`**（mentis）：人工核对后确认 unknown 尝试的结局时写入（summary 含核对依据"产物存在且可解析、无活跃写入者"，不声称执行器完成其全部计划步骤；`executor_status` 携带确认值）。理由：核对确认是计划 §2 问题 5 的关键依据，此前只存在于终端输出，事件流中缺失则"ERROR→确认→交付"过程无法从 trace 审计。
+2. **真实运行验证记录**：运行 `20260929_084347-5f82`（详见 [P2.4-T4 记录](progress/P2.4-T4.md)）——运行中旁观 9 分 43 秒、36 事件先于终态逐条落盘、`run.resumed` 中断区间 425s 在真实数据生效；`executor.completed` 因 T2 遗留崩溃缺陷未发出（已修），台账如实显示"终态未取得"，完成由 `executor.confirmed` 建立。
