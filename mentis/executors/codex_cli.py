@@ -79,6 +79,7 @@ class CodexTaskResult:
     created_at: str = ""
     first_event_latency_s: float = 0.0  # 进程启动 → 首个可解析事件（T2 实测记录用）
     stderr_tail: str = ""               # 独立收集的 stderr 尾部（诊断用，有界）
+    native_error: str = ""              # 执行器原生 error/turn.failed 消息（T3：原文有界保留）
 
 
 class _PopenStream:
@@ -310,6 +311,8 @@ class CodexCliAdapter:
         else:
             result.status = AttemptStatus.FAILED
             result.error = f"Codex 未报告成功终态（进程退出码 {returncode}）"
+            if result.native_error:
+                result.error += f"；执行器报错：{result.native_error[:200]}"
 
     def _default_stream(self, command, cwd, env, timeout_s):
         return _PopenStream(command, cwd, env, timeout_s)
@@ -344,6 +347,10 @@ class CodexCliAdapter:
                             if type(value) is int and value >= 0}
         elif kind == "item.completed" and item.get("type") == "agent_message":
             result.final_response = str(item.get("text", ""))
+        elif kind in ("error", "turn.failed"):
+            message = str(event.get("message", "")).strip()
+            if message and not result.native_error:
+                result.native_error = message[:500]  # 契约 §7：配额等错误原文有界保留
         if on_event:
             try:
                 on_event(event, {"first": first,

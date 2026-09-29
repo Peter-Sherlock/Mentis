@@ -95,6 +95,9 @@ class FieldSession:
         lines.append(f"- 研究者提示（开发者提供的固定入口，非系统自主行为）：`{self.command}`")
         lines.append(f"- 会话时间：{self.started_at.isoformat(timespec='seconds')} → "
                      f"{ended.isoformat(timespec='seconds')}（总耗时 {elapsed:.1f} 秒）；结束状态 **{status}**")
+        if status == "SESSION_ERROR":
+            lines.append("- **本会话因异常提前结束：记录不完整**（半份日志如实保留，"
+                         "不补写未发生事件；系统已执行部分见下方日志入口）")
         lines.append("")
         lines.append("## 实际操作（自动采集）")
         lines.append(f"- `{self.command}` @ {self.started_at.isoformat(timespec='seconds')}")
@@ -110,6 +113,8 @@ class FieldSession:
         lines.append("- （尚未提交；可稍后用 `field-feedback` 补记，逐字入档）")
         lines.append("")
         lines.append("## 证据入口（真实产物，本轮未修改）")
+        lines.append(f"- 本会话日志：`{(self.dir / 'session-log.txt').resolve()}`"
+                     "（异常收尾后仍可查看系统已产生的输出）")
         if run_dir is not None and Path(run_dir).is_dir():
             lines.append(f"- 运行目录：`{Path(run_dir).resolve()}`"
                          "（report.md 含 看结果/看变化/看依据）")
@@ -247,32 +252,46 @@ def run_field_start(goal: str, design: bool = False, direction: str = "",
                   else f"field-start --goal \"{goal}\"") + (" --design" if design else "")
     fs.event("研究者提示", "入口命令与说明由开发 Agent 提供；系统行为见下方输出")
     fs.begin_capture()
-    collab_base = Path(collab_base_dir) if collab_base_dir else COLLAB_DIR
-    factory = collab_factory or (lambda: Collaboration(
-        goal=goal, mode="design" if design else "autonomous", direction=direction,
-        interactive=interactive, max_repairs=max_repairs, timeout_s=timeout_s,
-        base_dir=collab_base))
-    collab = factory()
-    # T2：委托前先给出运行目录与旁观命令（用户可另开终端实时旁观）
-    print(f"[运行目录] {collab.run_dir.resolve()}")
-    print(f"[实时旁观] 另开终端运行：py -3.14 -m mentis trace --run \"{collab.run_dir.resolve()}\" --follow")
-    status = collab.run()
-    run_dir = collab.run_dir
-    index = collab.workspace / "index.html"
-    print("\n[三个入口]")
-    print(f"- 看结果：{index.resolve()}（{'存在' if index.is_file() else '未生成'}，"
-          f"可直接用浏览器打开）")
-    print(f"- 看变化/看依据：{(run_dir / 'report.md').resolve()}")
-    if status == "PENDING":
-        state = (run_dir / "state.json").resolve()
-        pending = [ix for ix in collab.session.interactions
-                   if ix.kind.value == "request_decision" and not ix.answer_source]
-        for ix in pending:
-            print(f"- [需要你决定] {ix.interaction_id}：{ix.message}")
-        print(f"- [继续] py -3.14 -m mentis collab-resume --state \"{state}\" "
-              "--answer \"<请求ID>:<你的回答>\"")
-    if interactive:
-        prompt_feedback(run_dir)
+    collab = None
+    run_dir = None
+    status = "SESSION_ERROR"
+    try:
+        collab_base = Path(collab_base_dir) if collab_base_dir else COLLAB_DIR
+        factory = collab_factory or (lambda: Collaboration(
+            goal=goal, mode="design" if design else "autonomous", direction=direction,
+            interactive=interactive, max_repairs=max_repairs, timeout_s=timeout_s,
+            base_dir=collab_base))
+        collab = factory()
+        # T2：委托前先给出运行目录与旁观命令（用户可另开终端实时旁观）
+        print(f"[运行目录] {collab.run_dir.resolve()}")
+        print(f"[实时旁观] 另开终端运行：py -3.14 -m mentis trace --run \"{collab.run_dir.resolve()}\" --follow")
+        status = collab.run()
+        run_dir = collab.run_dir
+        index = collab.workspace / "index.html"
+        print("\n[三个入口]")
+        print(f"- 看结果：{index.resolve()}（{'存在' if index.is_file() else '未生成'}，"
+              f"可直接用浏览器打开）")
+        print(f"- 看变化/看依据：{(run_dir / 'report.md').resolve()}")
+        if status == "PENDING":
+            state = (run_dir / "state.json").resolve()
+            pending = [ix for ix in collab.session.interactions
+                       if ix.kind.value == "request_decision" and not ix.answer_source]
+            for ix in pending:
+                print(f"- [需要你决定] {ix.interaction_id}：{ix.message}")
+            print(f"- [继续] py -3.14 -m mentis collab-resume --state \"{state}\" "
+                  "--answer \"<请求ID>:<你的回答>\"")
+        if interactive:
+            prompt_feedback(run_dir)
+    except KeyboardInterrupt:
+        fs.event("会话中断", "用户中断（Ctrl+C）；会话按异常收尾：记录不完整，不补写未发生事件")
+        run_dir = getattr(collab, "run_dir", run_dir)
+        status = "SESSION_ERROR"
+    except Exception as exc:
+        # T3：现场会话异常也收尾——半份日志标不完整并保留日志入口；不补写未发生事件
+        fs.event("会话异常", f"{type(exc).__name__}：{str(exc)[:200]}；"
+                 "会话按异常收尾：记录不完整（系统已执行部分见 session-log.txt）")
+        run_dir = getattr(collab, "run_dir", run_dir)
+        status = "SESSION_ERROR"
     fs.finish(run_dir, status, "design" if design else "autonomous")
     return status, fs.dir, run_dir
 
@@ -283,13 +302,17 @@ def run_field_feedback(run_dir: Path, satisfied: bool, quote: str, blocks: str =
     fs = FieldSession(label=label or "feedback", base_dir=base_dir)
     fs.command = f"field-feedback --run {Path(run_dir).name} --satisfied {'yes' if satisfied else 'no'}"
     fs.event("操作", fs.command)
-    if not quote.strip():
-        fs.end_capture()
-        fs._log.close()
-        raise ValueError("反馈原话不能为空（P5.2a 只收逐字原话，不用代述填充）")
-    entry = record_feedback(run_dir, satisfied=satisfied, quote=quote.strip(),
-                            blocks=blocks.strip(),
-                            operation=operation.strip() or "查看作品与报告后提交")
-    fs.event("用户原话", f"满意={'是' if satisfied else '否'}；「{quote.strip()[:120]}」")
+    try:
+        if not quote.strip():
+            raise ValueError("反馈原话不能为空（P5.2a 只收逐字原话，不用代述填充）")
+        entry = record_feedback(run_dir, satisfied=satisfied, quote=quote.strip(),
+                                blocks=blocks.strip(),
+                                operation=operation.strip() or "查看作品与报告后提交")
+        fs.event("用户原话", f"满意={'是' if satisfied else '否'}；「{quote.strip()[:120]}」")
+    except Exception as exc:
+        # T3：反馈会话异常同样收尾落盘，不留未收尾的半份会话
+        fs.event("会话异常", f"{type(exc).__name__}：{str(exc)[:160]}；反馈未记录，会话按异常收尾")
+        fs.finish(Path(run_dir), "SESSION_ERROR", "feedback")
+        raise
     fs.finish(Path(run_dir), "FEEDBACK_RECORDED", "feedback")
     return entry

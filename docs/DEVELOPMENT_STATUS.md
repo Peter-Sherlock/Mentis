@@ -4,16 +4,16 @@
 
 | 字段 | 当前值 |
 | --- | --- |
-| 最近更新 | 2026-09-29（P2.4-T2 完成） |
-| 当前里程碑 | P3.2 已完成；P5.2a partial（T0 核对无真实使用材料）；P2.4 in_progress——T0/T1（含验收修复）/T2 完成，下一段 T3 故障与隐私加固 |
-| 当前工作 | P2.4-T2 Codex 逐行流 + `trace --follow` 实时旁观 + 受限真实流验证（[T2 记录](progress/P2.4-T2.md)）；T1 验收修复由另一会话完成（[修复记录](progress/P2.4-T1-fix.md)） |
-| 当前状态 | **P2.4-T2 = completed**：真实 Codex 流验证通过（CLI 0.158.0、首事件延迟 2.393s、9 事件先于终态逐条落盘）；延迟夹具/超时保锁/旁观退出不影响执行均有离线测试；118 项检查通过。运行中旁观：`trace --run <目录> --follow`；`field-start` 委托前打印旁观命令。P5.2a 维持 partial |
-| 下一执行工作包 | **P2.4-T3 故障与隐私加固**：field-start 异常收尾/敏感字段规则/导出白名单/多 attempt 连续时间线；详见 [T2 记录 §T3 起点](progress/P2.4-T2.md) |
-| 当前请求范围 | 用户指令开始 T2 开发；不进入 T3 与强基线实验 |
+| 最近更新 | 2026-09-29（P2.4-T3 完成） |
+| 当前里程碑 | P3.2 已完成；P5.2a partial（T0 核对无真实使用材料）；P2.4 in_progress——T0—T3 完成，下一段 T4 真实使用核验 |
+| 当前工作 | P2.4-T3 故障与隐私加固：异常收尾（collab/guidance/field→ERROR/unknown 落盘+日志入口）、敏感字段规则（已知字段名确定性隐去）、`trace --export` 导出白名单与旧记录兼容、多 attempt 连续时间线台账（[T3 记录](progress/P2.4-T3.md)） |
+| 当前状态 | **P2.4-T3 = completed**：计划 §4/T3 夹具矩阵全覆盖（敏感输出/写失败/截断/限额/续接/撤回/现场会话异常等 13 项新增），全量 133 项通过；真实 T2 探针运行回放台账/导出白名单/历史运行兼容导出三项真实冒烟通过；顺带修复 collab 恢复对象缺 `_finalized_emitted` 的收尾崩溃缺陷。P5.2a 维持 partial |
+| 下一执行工作包 | **P2.4-T4 真实使用核验**：一次真实小任务的运行中旁观+事后回放+三入口，**项目负责人本人**反馈原话与缺口报告，能独立回答计划 §2 五个问题；需负责人真实参与（可与 P5.2a 真实使用合并）；详见 [T3 记录 §T4 起点](progress/P2.4-T3.md) |
+| 当前请求范围 | 用户指令开始 T3 开发；不进入 T4 与强基线实验 |
 | 默认交互决定 | 自主委托、重要节点介入；共同设计可选（ADR-002 selected） |
 | 首产品试点 | 小型网页界面与交互，ADR-006 **proposed**；不与默认交互决定混淆 |
 | 原任务族 | 文档问答保留为工程回归草案 |
-| Git / 业务代码 | 本地无远程；P2.3 `3cc7d14`/`25a8dcd` 之上新增 P3.2 提交 |
+| Git / 业务代码 | 本地无远程；P2.4-T2 `33a680e` 之上新增 P2.4-T3 提交 |
 | 主模型 | DeepSeek V4.1 Flash（ADR-007）；**deepseek-flash 已实测接受图像输入**（双视口截图作为诊断证据） |
 | 真实模型 / 执行器 | 指导修订闭环已接通（guide-revise/guide-resume）；Codex 中断恢复依赖账号配额，Adapter 无中途恢复 |
 
@@ -49,14 +49,14 @@
 | P2.3 | **completed** | 协作循环 + 三次真实端到端（自主交付 / 待决不越权+撤回 / 反馈→v2 真实修订→产物核验）；70 项检查通过；同步 600 秒窗口为架构性限制（超时走 unknown→核对路径）。其记录中"Run A v1 移动端截断"已被 P3.2 更正为截图采集假象 |
 | P3.2 | **completed（含 2026-09-29 验收修复）** | 真实指导链**单案例**改善成立（价格/人数进移动首屏，模型带图复查+截图+diff 三证）；渲染测量（真实 390/1280 溢出/裁剪/表单声明）与图像诊断接入；**更正：P2.3/P3.1"移动端截断"是无头 Chrome 500px 最小窗宽造成的截图裁剪假象**（真实 390 布局无溢出，采集已修复）；验收修复：测量不可信→未知不判通过、保留项逐段与表单逐字段核对、复查结论绑定当前产物版本（均配先复现后通过的测试），保存产物复核维持 improved；待决路径仅证明暂停未委托（请求必要性未证明）；一次执行器中断如实 FAILED 后核对续办；一次复检误判透明更正；改善为单案例，效果结论属 P2.4 |
 | P5.2a | **partial（2026-09-29 T0 核对后维持）** | 入口与记录机制就绪（99 项检查）；T0 核对范围=runtime/field 全部 10 目录、45 个 20260929 collab 目录、四个真实运行 user_feedback、Codex 本机会话日志——均为冒烟残留或非 Mentis 活动，无真实使用材料；用户报告与本工作区证据不符，不排除材料在本工作区之外；不补造 |
-| P2.4 | **in_progress（T0/T1/T2 completed，2026-09-29）** | T0：证据核对 + 契约冻结（[T0 记录](progress/P2.4-T0.md)）；T1：追踪写入与事后回放（[原记录](progress/P2.4-T1.md)、[验收修复](progress/P2.4-T1-fix.md)）；T2：逐行流 + 实时旁观，真实 Codex 流验证通过（[T2 记录](progress/P2.4-T2.md)）；T3—T4 与强基线比较未开始 |
+| P2.4 | **in_progress（T0—T3 completed，2026-09-29）** | T0：证据核对 + 契约冻结（[T0 记录](progress/P2.4-T0.md)）；T1：追踪写入与事后回放（[原记录](progress/P2.4-T1.md)、[验收修复](progress/P2.4-T1-fix.md)）；T2：逐行流 + 实时旁观，真实 Codex 流验证通过（[T2 记录](progress/P2.4-T2.md)）；T3：异常收尾/敏感字段规则/导出白名单/多 attempt 时间线（[T3 记录](progress/P2.4-T3.md)）；T4 与强基线比较未开始 |
 | P1.3 / P1.4 / P3.3—P3.4 / P4 / P5 | not_started | 无持久化存储或第二执行器证据 |
 
 文档设计完成、用户授权实施、人工专业复核、实际运行及效果成立分别记录。前轮“待用户再次批准”的状态不成为每次文档修改的固定门槛；本轮不把用户授权调整规划当成案例人工专业复核。
 
 ## 3. 下一步与体验主线
 
-当前体验入口（P5.2a）：**`py -3.14 -m mentis field-start --label <标签> --goal "<你的原话目标>"`** —— 自然语言目标 → 自主委托 → 三入口 → 当场逐字反馈，自动采集 Mentis 终端输出/耗时/阻塞（[使用指南](field-session-guide.md)）；`collab` / `guide-revise` / `guide-resume` 继续可用。**事后可审计回放已实现；Codex 运行中逐条可见尚未实现**，下一段为 T2 实时流；不把现有摘要称为完整交互。
+当前体验入口（P5.2a）：**`py -3.14 -m mentis field-start --label <标签> --goal "<你的原话目标>"`** —— 自然语言目标 → 自主委托 → 三入口 → 当场逐字反馈，自动采集 Mentis 终端输出/耗时/阻塞（[使用指南](field-session-guide.md)）；`collab` / `guide-revise` / `guide-resume` 继续可用。**运行中旁观（`trace --run <目录> --follow`）、事后回放（含委托台账与中断区间）与白名单导出（`--export`）均已实现**；异常也会收尾落盘（ERROR/unknown + 日志入口）。剩余为 T4：负责人本人在真实任务中核验五个问题能否独立回答；不把现有摘要称为完整交互。
 
 体验主线当前位置：**给出目标 → 自主产出首稿 → 自行检查修订 → 查看结果与依据** 已由系统真实走通（P2.3/P3.2 各有真实运行）；P5.2a 检查的是**项目负责人本人**能否走通这条路并低负担表达反馈——入口已交到负责人手里，等待真实操作记录。
 
@@ -73,7 +73,7 @@
 - 决策分流为确定性关键词规则（变更动词+保留名词/新事实提示），有误判风险；模型复查与诊断同源（deepseek-flash），独立性未建立——两者都需在 P2.4 多案例上检验。
 - **P3.2 验收后边界**：待决路径只证明"暂停且未委托、沉默≠批准"，不证明该请求"确实必须由用户决定"；真实改善是单案例，不外推为指导能力普遍成立；测量未知（报错/视口不符/缺截图）与复查无法绑定当前产物时判定为 unverified，不判通过——该判定路径有离线测试，未经真实触发。
 - **P5.2a 证据核对结论（2026-09-29 T0）**：本工作区未找到真实使用/反馈材料（核对范围见 [T0 记录](progress/P2.4-T0.md) §2）；用户报告与仓库证据不符，不由此断言用户未操作——材料可能在本工作区之外，如后续提供按证据更新。P2.4 真人反馈结论留空。附带修复：test_field 工厂未传 base_dir 导致 99 项测试每次向 runtime/collab 泄漏目录（45 个）与 runtime/field 未收尾会话（10 个）；已修隔离并清理，回归零泄漏。
-- **交互可见性（T0 契约、T1 事后回放（含验收修复）、T2 运行中旁观已完成；T3 故障/隐私、T4 真实使用核验未做）**：`collab`/`guide-revise` 委托前归档确切指令（哈希=发送文本）并**逐事件**写 `trace/events.jsonl`；`mentis trace --run [--follow]` 可回放或旁观（真实流验证：CLI 0.158.0、首事件延迟 2.393s、9 事件先于终态逐条可见）；历史运行如实列 unrecorded 缺口。仍缺：敏感字段规则与导出白名单、field-start 异常收尾、多 attempt 连续时间线（T3）；真实用户核验（T4）。统一契约见 [TRACKING_EVENT_CONTRACT.md](TRACKING_EVENT_CONTRACT.md)。
+- **交互可见性（T0 契约、T1 事后回放（含验收修复）、T2 运行中旁观、T3 故障/隐私加固已完成；T4 真实使用核验未做）**：`collab`/`guide-revise` 委托前归档确切指令（哈希=发送文本）并**逐事件**写 `trace/events.jsonl`；`mentis trace --run [--follow | --export <路径>]` 可回放（含委托台账/中断区间）、旁观或导出白名单时间线（真实流验证：CLI 0.158.0、首事件延迟 2.393s、9 事件先于终态逐条可见；真实探针运行台账/导出冒烟通过）。T3 起：意外异常收尾为 ERROR/unknown 并落盘（恢复路径崩溃缺陷已修）、已知密钥字段名确定性隐去（`input_tokens` 用量不隐去）、损坏 JSONL/截断/限额/续接/撤回/写失败/现场会话异常/旁观退出均有夹具。仍缺：真实用户核验（T4）。统一契约见 [TRACKING_EVENT_CONTRACT.md](TRACKING_EVENT_CONTRACT.md)（§13 T3 附录）。
 - 模型诊断候选只记录不自动执行；持久化存储未接（P1.3）。P1.2 契约为演示级实现（授权按 scope 精确匹配等）；远程仓库未创建；提交身份为仓库本地占位，待用户偏好后可改。
 - 领域资源为模型知识草案（pending_human），未经人工专业复核；执行与静态截图接口尚未进入缺口分流闭环；声明冲突检测依赖注册表声明，动态冲突检测未实现。
 - **P2.2 专业判断仍待验证**：真实模型的字段完整请求仍可能是不必要提问，部分层级判断缺视觉依据；需要 P3.2/P2.4 的独立评价，不因本轮技术接通而宣称“专家 Agent”成立。
@@ -112,3 +112,5 @@ P2.4-T0 轮检查（2026-09-29）：按 [交互可见性计划](INTERACTION_VISI
 P2.4-T1 轮检查（2026-09-29）：按 [T0 记录 §8](progress/P2.4-T0.md) 起点实现事后回放。`mentis/trace.py` 按契约 v1.0-draft 提供写入器（seq 续排/UTC 时间/attempt-brief-thread 关联/refs 哈希/manifest integrity）与两式回放（新运行事件流；历史运行材料清单+unrecorded 缺口，不回填）。collab 与 guide-revise 的每次委托**先归档确切指令再调用执行器**（落盘失败→尝试记 failed、执行器零调用，有测试），执行器终态/复检/决策分流/撤回/收尾均有事件。107 项检查通过（新增 8 项）；测试捕获并修复两个真实缺陷：Windows `write_text` 的 \r\n 转换破坏 prompt 哈希一致性（改字节写入），以及测试误用 collab 版 FakeAdapter 跑 guidance 流（页面映射不同）。真实历史运行回放冒烟：guidance 主运行列出全部现存材料与 5 项缺口、collab Run A 如实标注"prompt 未落盘/事件未落盘"，回放后未生成 trace/（不回填验证）。机制演示运行（FakeAdapter，独立目录 runtime/trace-demo/，目标文本标注非真实委托）提供完整时间线样例。本轮零模型/执行器调用；写入器对真实 Codex 的行为留待 T2 真实流冒烟核验。
 
 P2.4-T2 轮检查（2026-09-29）：按 [T1 记录 §T2 起点](progress/P2.4-T1.md) 实现 Codex 逐行流与实时旁观。Adapter 默认走 Popen 逐行流（stdout 队列线程 + stderr 独立线程 + 截止期轮询），注入 runner 走兼容路径（既有 FakeRunner 测试零改动通过）；`CodexTaskSpec.on_event` 即时回调首事件（含延迟）与每条进展（命令/消息有界摘要，推理只记类型）；collab/guidance 将其即时写入 trace。`mentis trace --run --follow` 只读旁观（收尾自动结束；实测发现并补上"manifest 存在但无 run.finalized 事件"的静默兜底——探针场景会死等，已修）；`field-start` 委托前打印运行目录与旁观命令。**受限真实 Codex 流验证通过**：隔离只读小任务，CLI 0.158.0、首事件延迟 2.393s（总时长 25.3s）、9 条执行器事件（含真实命令与最终消息）先于终态逐条落盘、用量 69,259/198 tokens、integrity 完整——证据在 `runtime/t2-real-stream/`（probe-result.json + trace/）与 [T2 记录](progress/P2.4-T2.md)。新增 8 项流式回归（延迟夹具/超时保锁/损坏行/turn.failed/兼容回调/旁观两态），全量 **118 项通过**。本轮真实调用仅此一次探针级任务；另发现并发会话提交 d435ff2（T1 验收修复），本轮工作已叠加其上、无覆盖。
+
+P2.4-T3 轮检查（2026-09-29）：按 [T2 记录 §T3 起点](progress/P2.4-T2.md) 完成故障与隐私加固，**零模型/执行器调用**（真实冒烟仅读本机既有运行目录）。①异常收尾：collab/guidance 的 run/resume/reverify 意外异常时无终态尝试改记 unknown、写 run.finalized（含异常原文）、状态落盘 ERROR 后重抛；CLI 层不再抛裸 traceback；field-start/field-feedback 异常按 SESSION_ERROR 收尾，usage-record 标注"记录不完整"并保留 session-log 日志入口；**顺带发现并修复 collab 恢复对象缺 `_finalized_emitted` 的缺陷**（T1 起任何从 state.json 恢复的 collab 运行收尾必 AttributeError，既有测试未覆盖该路径，修复配回归）。②敏感字段规则：`redact_text` 对已知字段名赋值与 Bearer 令牌确定性隐去后入事件；`input_tokens` 等用量计数明确豁免（真实探针运行 summary 中 69,259 原样保留）；prompt 归档不脱敏（哈希=发送文本）；不做广泛秘密识别承诺。③导出白名单：`mentis trace --run <目录> --export [路径]`（mentis-trace-export/1）仅契约 §2 字段+哈希，无 prompt 原文/本地路径/用户逐字反馈；历史运行导出 historical 模式（材料视图+unrecorded 缺口），真实历史运行冒烟确认导出后无 trace/ 生成。④多 attempt 连续时间线：回放新增委托台账（attempt→终态/thread/prompt 哈希）与 `run.resumed` 中断区间标注。⑤原生错误保留：error/turn.failed 原文有界入 result.error（此前配额原文丢失）。新增 13 项夹具（敏感输出×3/写失败×2/截断/限额/续接时间线/撤回/异常收尾×4），全量 **133 项通过**；runtime 零泄漏（collab 6 目录、field 0 目录）。真实冒烟三项：T2 探针运行回放台账、trace-export.json 字段白名单核验、历史运行兼容导出——证据在 `runtime/t2-real-stream/trace-export.json`、`runtime/trace-export-historical-demo.json` 与 [T3 记录](progress/P2.4-T3.md)。

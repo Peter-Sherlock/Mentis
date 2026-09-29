@@ -24,7 +24,7 @@ def run_guide_revise(args) -> int:
         include_images=not args.no_images,
         run_id=args.run_id or "",
     )
-    status = cycle.run()
+    status = _guarded_run(cycle, lambda: cycle.run())
     print(f"\n[运行结束] 状态 {status}")
     print(f"[报告（看结果/看变化/看依据）] {(cycle.run_dir / 'report.md').resolve()}")
     if status == "NEEDS_DECISION":
@@ -43,12 +43,22 @@ def run_guide_resume(args) -> int:
 
     cycle = guidance_from_state(args.state)
     if args.reverify:
-        status = cycle.reverify()
+        status = _guarded_run(cycle, cycle.reverify)
     else:
-        status = cycle.resume(_parse_answers(args.answer), retry=args.retry)
+        status = _guarded_run(cycle, lambda: cycle.resume(_parse_answers(args.answer), retry=args.retry))
     print(f"\n[恢复结束] 状态 {status}")
     print(f"[报告] {(cycle.run_dir / 'report.md').resolve()}")
     return 0 if status in ("IMPROVED", "QUALIFIED_NO_CHANGE") else 1
+
+
+def _guarded_run(cycle, action) -> str:
+    """T3：异常已在 GuidanceCycle 内收尾落盘（ERROR）；这里不再向用户抛裸 traceback。"""
+    try:
+        return action()
+    except Exception as exc:
+        print(f"[运行异常] 已按异常收尾并落盘（状态 ERROR）；报告与追踪见 "
+              f"{cycle.run_dir.resolve()}｜{type(exc).__name__}：{str(exc)[:200]}")
+        return "ERROR"
 
 
 def _parse_answers(pairs: list) -> dict:

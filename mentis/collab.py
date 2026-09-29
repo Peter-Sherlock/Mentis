@@ -141,6 +141,7 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.status = meta.get("status", "created")
     obj.last_diagnosis = None
     obj.run_dir = state_path.parent if isinstance(state_path, Path) else Path(state_path).parent
+    obj._finalized_emitted = False
     obj.trace = TraceWriter(obj.run_dir, obj.run_id, executor_version=obj.adapter.cli_version)
     obj.trace.emit("mentis", "run.resumed",
                    f"从落盘状态恢复（进入时状态 {obj.status}）；既有事件续排，不重放历史委托",
@@ -606,27 +607,54 @@ class Collaboration:
         return self.status
 
     def run(self) -> str:
-        self.notify(f"开始协作：{self.session.goal}（模式 {self.mode}，"
-                    f"{'交互' if self.interactive else '非交互'}）")
-        self.prepare_workspace()
-        if self.mode == "design":
-            answered = self.ask_user(
-                "首版风格方向：A 暖棕纸质感大图 / B 白底几何简约 / 或直接描述你的想法",
-                blocking_action="build-page",
-                blocking_reason="风格方向影响整版实现，返工成本高",
-                unique="审美偏好只有你能表达",
-                excluded="常规布局与信息组织已可自主决定；已有默认暖色方向可作暂定",
-            )
-            if answered:
-                self.session.update_brief(add_preferences=[SourcedItem(
-                    f"风格方向（用户选定）：{self._last_answer}",
-                    Provenance.USER_SELECTED, "user-choice:direction")])
-            else:
-                self.status = "PENDING"
-                self.notify("方向未定：不委托、不猜测；等待你在 resume 中回答")
-                self._persist(None, None, delivered=False)
-                return self.status
-        return self._build_phase()
+        try:
+            self.notify(f"开始协作：{self.session.goal}（模式 {self.mode}，"
+                        f"{'交互' if self.interactive else '非交互'}）")
+            self.prepare_workspace()
+            if self.mode == "design":
+                answered = self.ask_user(
+                    "首版风格方向：A 暖棕纸质感大图 / B 白底几何简约 / 或直接描述你的想法",
+                    blocking_action="build-page",
+                    blocking_reason="风格方向影响整版实现，返工成本高",
+                    unique="审美偏好只有你能表达",
+                    excluded="常规布局与信息组织已可自主决定；已有默认暖色方向可作暂定",
+                )
+                if answered:
+                    self.session.update_brief(add_preferences=[SourcedItem(
+                        f"风格方向（用户选定）：{self._last_answer}",
+                        Provenance.USER_SELECTED, "user-choice:direction")])
+                else:
+                    self.status = "PENDING"
+                    self.notify("方向未定：不委托、不猜测；等待你在 resume 中回答")
+                    self._persist(None, None, delivered=False)
+                    return self.status
+            return self._build_phase()
+        except Exception as exc:
+            self._finalize_on_error(exc)
+            raise
+
+    def _finalize_on_error(self, exc: Exception) -> None:
+        """T3：意外异常也如实收尾——无终态尝试改记 unknown（需核对，不判失败），
+        run.finalized 记异常原文，状态落盘为 ERROR；既有执行器终态与事件不覆盖、
+        不重复判定。收尾自身失败不掩盖原始异常（随后向调用方重抛）。"""
+        try:
+            for attempt in self.session.attempts:
+                if attempt.status.value in ("dispatched", "running"):
+                    self.session.mark_unknown(attempt.attempt_id)
+                    self.notify(f"异常收尾：尝试 {attempt.attempt_id} 无执行器终态，"
+                                "改记 unknown（需核对；不判失败、不自动重发）")
+            self.notify(f"运行异常终止：{type(exc).__name__}：{str(exc)[:160]}；"
+                        "已按 ERROR 收尾落盘，可从 state.json 恢复")
+            self.status = "ERROR"
+            self._finalized_emitted = True
+            self.trace.emit("mentis", "run.finalized",
+                            f"运行异常终止：{type(exc).__name__}：{str(exc)[:200]}"
+                            "（无终态尝试已记 unknown；已记录的执行器终态与事件不变）",
+                            brief_version=self.session.current_brief.version,
+                            status="failed")
+            self._persist(None, None, delivered=False)
+        except Exception:
+            pass
 
     def _codex_processes_since(self, since_iso: str) -> list:
         """列出晚于 since 启动的 codex 进程（判断是否仍有执行器在写入）。"""
@@ -712,6 +740,17 @@ class Collaboration:
     def resume(self, answers: dict | None = None, feedback: str = "",
                goal_new: str = "", revoke: bool = False,
                confirm_outcome: AttemptStatus | None = None) -> str:
+        """恢复一次运行（异常同样收尾落盘，见 _finalize_on_error）。"""
+        try:
+            return self._resume_impl(answers=answers, feedback=feedback, goal_new=goal_new,
+                                     revoke=revoke, confirm_outcome=confirm_outcome)
+        except Exception as exc:
+            self._finalize_on_error(exc)
+            raise
+
+    def _resume_impl(self, answers: dict | None = None, feedback: str = "",
+                     goal_new: str = "", revoke: bool = False,
+                     confirm_outcome: AttemptStatus | None = None) -> str:
         """恢复一次运行：回答未决请求 / 反馈修订 / 改目标 / 撤回 / 核对确认。"""
         if confirm_outcome is not None:
             return self.confirm_outcome_after_review(confirm_outcome)

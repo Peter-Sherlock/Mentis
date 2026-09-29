@@ -26,6 +26,29 @@ STATUS_MAP = {
 }
 SUMMARY_LIMIT = 500
 
+# T3 敏感字段规则：只对**已知字段名**的赋值做确定性隐去；不承诺识别任意秘密
+# （契约 §6：不宣称简单正则可完全脱敏）。prompt 归档不经此函数——哈希须等于发送文本。
+# T3 敏感字段规则：只对**已知字段名**的赋值做确定性隐去；不承诺识别任意秘密
+# （契约 §6：不宣称简单正则可完全脱敏）。prompt 归档不经此函数——哈希须等于发送文本。
+_SENSITIVE_BEARER = re.compile(r"(?i)\b(bearer)\s+([A-Za-z0-9._~+/=-]{8,})")
+_SENSITIVE_KV = re.compile(
+    r"""(?i)(["']?[\w.-]*(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|secret|password|passwd|credential|authorization|密码|密钥|令牌|凭证)[\w.-]*["']?\s*[=:：]\s*)(["']?)([^\s"',；;，」”]+)(["']?)""")
+
+
+def redact_text(text: str) -> str:
+    """已知密钥字段名（api_key/token/secret/password/credential/authorization/密码/密钥 等）
+    的 key=value / key: value / "key": "value" 赋值与 Bearer 令牌 → 值隐去，字段名保留。
+    用量计数字段（input_tokens 等）不是密钥，明确不隐去；值恰为 Bearer 一词时不动。"""
+
+    def _sub_kv(m: "re.Match") -> str:
+        name = m.group(1).strip("\"' :：=").lower()
+        if name.endswith("tokens") or name.endswith("_count") or m.group(3).lower() == "bearer":
+            return m.group(0)
+        return m.group(1) + "⟨已隐去⟩"
+
+    out = _SENSITIVE_BEARER.sub(r"\1 ⟨已隐去⟩", text)
+    return _SENSITIVE_KV.sub(_sub_kv, out)
+
 
 class TraceArchiveError(RuntimeError):
     """委托 prompt 落盘失败：调用方必须停止本次委托（契约 §1）。"""
@@ -83,7 +106,7 @@ class TraceWriter:
             "brief_version": brief_version,
             "native_thread_id": native_thread_id,
             "status": status,
-            "summary": _bound(summary),
+            "summary": _bound(redact_text(summary)),
             "refs": refs or [],
         }
         if executor_status is not None:
@@ -378,8 +401,26 @@ def render_timeline(run_dir) -> str:
                  f"{stream_audit['valid_count']}；引用异常 {len(ref_problems)}"
                  + ("；" + "；".join((stream_audit["problems"] + ref_problems)[:5])
                     if stream_audit["problems"] or ref_problems else ""))
+    # T3：委托台账（超时/恢复/多 attempt 的连续时间线）——来自 manifest，缺失时如实省略
+    delegations = manifest.get("delegations") if isinstance(manifest, dict) else None
+    if isinstance(delegations, list) and delegations:
+        lines.append("- 委托台账（attempt → 终态；续接共用同一原生 thread，原判定不覆盖）：")
+        for d in delegations:
+            if not isinstance(d, dict):
+                continue
+            lines.append(
+                f"  - {d.get('attempt_id') or '?'}（brief v{d.get('brief_version') or '?'}）"
+                f"→ 终态 {d.get('terminal_status') or '（未取得）'}"
+                f"｜thread {str(d.get('native_thread_id') or '未关联')[:24]}"
+                f"｜prompt {str(d.get('prompt_sha256') or '')[:12]}")
     lines.append("")
+    prev_time = None
     for e in events:
+        resumed_note = ""
+        if e.get("kind") == "run.resumed":
+            gap_s = _gap_seconds(prev_time, e.get("time_utc"))
+            if gap_s is not None:
+                resumed_note = f"｜中断区间 {gap_s:.0f}s（期间无记录，不回填）"
         event_refs = e.get("refs") if isinstance(e.get("refs"), list) else []
         refs = "；".join(
             f"{r.get('role')}={Path(r['path']).name}:{str(r.get('sha256', ''))[:12]}"
@@ -388,9 +429,21 @@ def render_timeline(run_dir) -> str:
             f"[{e.get('seq')}] {e.get('time_utc', '?')} [{e.get('source')}/{e.get('kind')}] "
             f"attempt={e.get('attempt_id') or '-'} brief=v{e.get('brief_version') or '-'} "
             f"status={e.get('status')}｜{e.get('summary', '')}"
-            + (f"｜refs: {refs}" if refs else ""))
+            + (f"｜refs: {refs}" if refs else "") + resumed_note)
+        if isinstance(e.get("time_utc"), str):
+            prev_time = e.get("time_utc")
     lines.append("")
     return "\n".join(lines)
+
+
+def _gap_seconds(start: str | None, end: str | None) -> float | None:
+    try:
+        if not start or not end:
+            return None
+        delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+        return max(0.0, delta.total_seconds())
+    except (TypeError, ValueError):
+        return None
 
 
 def render_historical(run_dir) -> str:

@@ -30,7 +30,7 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis guide-resume   回答诊断提出的用户决定后继续修订
   python -m mentis field-start    P5.2a 真实使用会话：自然语言目标→委托→三入口→使用记录
   python -m mentis field-feedback 查看作品后补记逐字反馈（绑定该运行的会话记录）
-  python -m mentis trace           P2.4-T1 事后回放：查看运行时间线（历史运行显示现存材料与缺口）
+  python -m mentis trace           P2.4 事后回放 / --follow 实时旁观（只读）/ --export 导出白名单时间线
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -96,11 +96,14 @@ def main(argv=None) -> int:
     ffb.add_argument("--block", default="", help="被卡住/打断/不明白的地方（原话，可选）")
     ffb.add_argument("--operation", default="", help="你做了什么（可选，默认'查看作品与报告后提交'）")
     ffb.add_argument("--label", default="", help="会话标签（可选）")
-    tr = sub.add_parser("trace", help="事后回放（默认）或 --follow 实时旁观（只读，Ctrl+C 不影响运行）")
+    tr = sub.add_parser("trace", help="事后回放（默认）/ --follow 实时旁观 / --export 导出白名单时间线")
     tr.add_argument("--run", required=True,
                     help="运行目录（runtime/collab/<ID> 或 runtime/guidance/<ID>）")
     tr.add_argument("--follow", action="store_true",
                     help="T2 实时旁观：重放已有事件后跟随新增；运行收尾后自动结束")
+    tr.add_argument("--export", nargs="?", const="trace-export.json", default="", metavar="路径",
+                    help="T3 导出白名单时间线 JSON（默认 trace-export.json；不含 prompt 原文/"
+                         "用户逐字反馈/密钥字段；历史运行导出材料清单+缺口，不回填）")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -176,6 +179,18 @@ def main(argv=None) -> int:
         if not run_dir.is_dir():
             print(f"运行目录不存在：{run_dir.resolve()}", file=sys.stderr)
             return 2
+        if args.export:
+            from mentis.trace_export import EXPORT_NOTE, export_timeline
+
+            try:
+                summary = export_timeline(run_dir, args.export)
+            except (OSError, ValueError) as exc:
+                print(f"导出失败：{type(exc).__name__}：{exc}", file=sys.stderr)
+                return 2
+            print(f"[导出完成] {summary['path'].resolve()}（模式 {summary['mode']}；"
+                  f"事件 {summary['events']} 条）")
+            print(f"[边界] {EXPORT_NOTE}")
+            return 0
         if args.follow:
             follow_timeline(run_dir)
         else:

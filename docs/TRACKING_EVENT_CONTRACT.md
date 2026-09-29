@@ -1,6 +1,6 @@
 # Mentis 统一追踪事件契约（T0 冻结草案）
 
-版本：**v1.0-draft**（2026-09-29，P2.4-T0 冻结；T1 实现及验收修复见 §11；修改须在进度记录中说明理由）｜性质：**已接入 T1 事后追踪，T2 实时流未实现**｜上游计划：[交互可见性与 P2.4 递进计划](INTERACTION_VISIBILITY_PLAN.md) §3.1。
+版本：**v1.0-draft**（2026-09-29，P2.4-T0 冻结；T1 实现及验收修复见 §11，T2 见 §12，T3 见 §13；修改须在进度记录中说明理由）｜性质：**已接入事后回放、实时旁观（--follow）与白名单导出（--export）**｜上游计划：[交互可见性与 P2.4 递进计划](INTERACTION_VISIBILITY_PLAN.md) §3.1。
 
 本契约基于本机实测材料制定：Codex CLI `0.158.0`（`codex --version` 实测）、既有真实 rollout 文件（`~/.codex/sessions/2026/09/28/rollout-2026-09-28T09-28-26-01a0e833-….jsonl`，29 行，字段逐一枚举）、既有真实运行目录（[P2.4-T0 记录](progress/P2.4-T0.md) §3 的工作样例）。
 
@@ -119,3 +119,13 @@ Mentis 自身延迟目标：收到一行完整 CLI 事件后 2 秒内落盘可�
 1. **executor.started / executor.item**：T2 起逐行回调即时落盘（不再等终态）——`executor.started` 仅首事件（summary 含首事件延迟秒数），其后每条原生事件一条 `executor.item`（命令/最终消息有界摘要；推理条目只记类型）。`time_utc` 因此具有"到达/落盘时刻"含义。
 2. **首事件延迟**：进程启动→首个非空 stdout 行，存于 `CodexTaskResult.first_event_latency_s` 并随 `executor.started` 展示；真实流实测 2.393s（CLI 0.158.0，见 P2.4-T2 记录）。
 3. **follow 终止语义**：`run.finalized` 事件 + manifest 为正常收尾；manifest 存在但事件流连续静默（无 run.finalized 的写入器/旧探针）也按收尾结束——两者都以 manifest 为准，旁观器永不写事件。
+
+## 13. T3 实现附录（2026-09-29，故障与隐私加固）
+
+1. **敏感字段规则**（`mentis.trace.redact_text`，写入 `emit` 时对 summary 生效）：已知字段名（`api_key`/`token`/`secret`/`password`/`credential`/`authorization`/密码/密钥/令牌/凭证等）的 `key=value`、`key: value`、`"key": "value"` 赋值与 `Bearer <令牌>` → 值替换为 `⟨已隐去⟩`，字段名保留。**明确不隐去**：用量计数字段（`input_tokens` 等以 `tokens`/`_count` 结尾）——用量是契约要求的数据。**边界如实**：只对已知字段名做确定性匹配，不承诺识别任意秘密；prompt 归档（`trace/prompts/`）**不经此函数**——哈希必须等于实际发送文本，prompt 文件本就在本地私有层。
+2. **导出白名单**（`mentis trace --run <目录> --export [路径]`，`mentis/trace_export.py`，格式 `mentis-trace-export/1`）：事件仅保留 §2 字段（附加字段防御性剔除）；manifest 仅保留版本/执行器/委托台账（只含 `prompt_sha256` 不含本地路径）/integrity/outcome；refs 只留 `role`+文件名+哈希。排除：用户逐字反馈、工作区全文、prompt 原文、执行器原生原始行、密钥值。导出只读运行目录，不产生事件。
+3. **旧记录兼容（导出）**：无 `trace/` 的历史运行导出 `mode=historical`——兼容说明 + 现存材料视图（`render_historical`）+ unrecorded 缺口；不回填、不生成 trace/。
+4. **异常收尾语义**（collab / guidance 的 `run`/`resume`/`reverify`，T3 起）：意外异常时——①仍处于 `dispatched`/`running` 的尝试改记 **unknown**（无执行器终态，不判失败、不假完成、不自动重发）；②写 `run.finalized`（status=`failed`，summary 含异常类型与原文有界）；③状态落盘为 **ERROR** 并正常 finalize manifest；④既有执行器终态与事件不覆盖、不重复判定；⑤收尾完成后向调用方重抛（CLI 层打印短消息而非裸 traceback）。**含恢复路径**：从 state.json 恢复的对象同样适用（并修复 collab 恢复对象缺 `_finalized_emitted` 导致恢复后收尾崩溃的缺陷）。
+5. **现场会话异常**（field-start/field-feedback）：会话按 `SESSION_ERROR` 收尾，usage-record 明确标注"记录不完整（半份日志如实保留，不补写未发生事件）"，并保留 session-log.txt 日志入口；关联运行目录的 ERROR 落盘不受影响。
+6. **多 attempt 连续时间线**：回放新增**委托台账**（每次委托的 attempt→终态、thread、prompt 哈希，来自 manifest）；`run.resumed` 事件标注**中断区间**（与上一事件的间隔秒数，"期间无记录，不回填"）。续接新 attempt 段与同一原生 thread 关联、原判定不覆盖的语义不变（§4/§7），现在在回放中显式可见。
+7. **执行器原生错误保留**：`error`/`turn.failed` 的原生 message 有界存入 `CodexTaskResult.native_error` 并拼入 FAILED 判定文本——配额类错误的原文可进入 `executor.completed` summary（§7 的"错误原文入 summary"由此落实），供事后回放核对。

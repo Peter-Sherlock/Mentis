@@ -273,6 +273,37 @@ class GuidanceCycle:
     # ---- 流程 ----
 
     def run(self) -> str:
+        """指导修订循环（意外异常同样收尾落盘，见 _finalize_on_error）。"""
+        try:
+            return self._run_impl()
+        except Exception as exc:
+            self._finalize_on_error(exc)
+            raise
+
+    def _finalize_on_error(self, exc: Exception) -> None:
+        """T3：意外异常也如实收尾——无终态尝试改记 unknown（需核对，不判失败），
+        run.finalized 记异常原文，状态落盘为 ERROR；既有执行器终态与事件不覆盖、
+        不重复判定。收尾自身失败不掩盖原始异常（随后向调用方重抛）。"""
+        try:
+            for attempt in self.session.attempts:
+                if attempt.status.value in ("dispatched", "running"):
+                    self.session.mark_unknown(attempt.attempt_id)
+                    self._notify(f"异常收尾：尝试 {attempt.attempt_id} 无执行器终态，"
+                                 "改记 unknown（需核对；不判失败、不自动重发）")
+            self._notify(f"运行异常终止：{type(exc).__name__}：{str(exc)[:160]}；"
+                         "已按 ERROR 收尾落盘，可从 state.json 恢复")
+            self.status = "ERROR"
+            self._finalized_emitted = True
+            self.trace.emit("mentis", "run.finalized",
+                            f"运行异常终止：{type(exc).__name__}：{str(exc)[:200]}"
+                            "（无终态尝试已记 unknown；已记录的执行器终态与事件不变）",
+                            brief_version=self.session.current_brief.version,
+                            status="failed")
+            self._persist()
+        except Exception:
+            pass
+
+    def _run_impl(self) -> str:
         self._notify(f"P3.2 指导修订循环开始；基线 {self.baseline_dir}")
         self._freeze_and_setup()
         extra_problems: list[str] = []
@@ -989,6 +1020,14 @@ class GuidanceCycle:
         return self.status
 
     def resume(self, answers: dict | None = None, retry: bool = False) -> str:
+        """恢复循环（异常同样收尾落盘，见 _finalize_on_error）。"""
+        try:
+            return self._resume_impl(answers=answers, retry=retry)
+        except Exception as exc:
+            self._finalize_on_error(exc)
+            raise
+
+    def _resume_impl(self, answers: dict | None = None, retry: bool = False) -> str:
         """恢复循环：回答诊断的用户决定（answers），或在核对后续办失败轮（retry=True）。"""
         if retry:
             return self._retry_failed_round()
@@ -1072,6 +1111,14 @@ class GuidanceCycle:
         return self.status
 
     def reverify(self) -> str:
+        """对已有 v2 重新复检（透明更正判定；异常同样收尾落盘）。"""
+        try:
+            return self._reverify_impl()
+        except Exception as exc:
+            self._finalize_on_error(exc)
+            raise
+
+    def _reverify_impl(self) -> str:
         """对已有 v2 用修正后的确定性工具重新复检（透明更正判定）。
 
         模型复查结论必须先通过绑定检查（对应当前 v2 产物版本）才可复用；
