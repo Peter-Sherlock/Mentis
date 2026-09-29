@@ -28,6 +28,8 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis collab-resume  恢复运行：回答请求 / 反馈修订 / 改目标 / 撤回
   python -m mentis guide-revise   P3.2 指导修订循环：冻结首稿→观察测量→诊断→指令→修订→复检
   python -m mentis guide-resume   回答诊断提出的用户决定后继续修订
+  python -m mentis field-start    P5.2a 真实使用会话：自然语言目标→委托→三入口→使用记录
+  python -m mentis field-feedback 查看作品后补记逐字反馈（绑定该运行的会话记录）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -78,6 +80,21 @@ def main(argv=None) -> int:
                       help="核对后续办失败轮（确认无活跃写入者；计入修订预算）")
     gres.add_argument("--reverify", action="store_true",
                       help="用修正后的确定性工具对已有 v2 重新复检（透明更正，不重新委托）")
+    fstart = sub.add_parser("field-start", help="P5.2a 真实使用会话（自然语言目标→委托→三入口→使用记录）")
+    fstart.add_argument("--goal", required=True, help="用你自己的话描述目标（自然语言，不做问卷）")
+    fstart.add_argument("--design", action="store_true", help="共同设计模式（先确认风格方向；默认自主）")
+    fstart.add_argument("--direction", default="", help="直接给出风格方向（跳过方向提问）")
+    fstart.add_argument("--non-interactive", action="store_true", help="不等待输入：待决保持未决")
+    fstart.add_argument("--timeout", type=int, default=420, help="单次执行器超时秒数（1—600）")
+    fstart.add_argument("--max-repairs", type=int, default=1, help="自动修复轮数上限（默认 1）")
+    fstart.add_argument("--label", default="", help="会话标签（便于你识别）")
+    ffb = sub.add_parser("field-feedback", help="查看作品后补记逐字反馈（P5.2a）")
+    ffb.add_argument("--run", required=True, help="运行目录（runtime/collab/<运行ID> 或 runtime/guidance/<运行ID>）")
+    ffb.add_argument("--satisfied", required=True, choices=["yes", "no"], help="整体满意：yes / no")
+    ffb.add_argument("--quote", required=True, help="你的原话（逐字记录，一句话即可）")
+    ffb.add_argument("--block", default="", help="被卡住/打断/不明白的地方（原话，可选）")
+    ffb.add_argument("--operation", default="", help="你做了什么（可选，默认'查看作品与报告后提交'）")
+    ffb.add_argument("--label", default="", help="会话标签（可选）")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -126,6 +143,26 @@ def main(argv=None) -> int:
         from mentis.guidance_cli import run_guide_resume
 
         return run_guide_resume(args)
+    if args.command == "field-start":
+        from mentis.field import run_field_start
+
+        interactive = (not args.non_interactive) and sys.stdin.isatty()
+        status, _session_dir, _run_dir = run_field_start(
+            goal=args.goal, design=args.design, direction=args.direction,
+            interactive=interactive, timeout_s=args.timeout,
+            max_repairs=args.max_repairs, label=args.label)
+        return 0 if status in ("DELIVERED", "PENDING") else 1
+    if args.command == "field-feedback":
+        from mentis.field import run_field_feedback
+
+        try:
+            run_field_feedback(Path(args.run), satisfied=args.satisfied == "yes",
+                               quote=args.quote, blocks=args.block,
+                               operation=args.operation, label=args.label)
+        except ValueError as exc:
+            print(f"反馈未记录：{exc}", file=sys.stderr)
+            return 2
+        return 0
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())
     print(f"Python {platform.python_version()} on {platform.system()}")
