@@ -129,7 +129,9 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.session = session
     obj.base_dir = Path(meta["base_dir"]) if meta.get("base_dir") else COLLAB_DIR
     obj.workspace = Path(meta["workspace"])
-    obj.obs_dir = COLLAB_DIR / obj.run_id / "observation"
+    # 观察目录跟随恢复运行自身的 base_dir（原硬编码 COLLAB_DIR 会把自定义位置
+    # 运行的截图泄漏回 runtime/collab——T4 轮修复）
+    obj.obs_dir = obj.base_dir / obj.run_id / "observation"
     obj.adapter = adapter or CodexCliAdapter(executable=resolve_codex_executable())
     obj.gateway = gateway if gateway is not None else ModelGateway(config=ModelConfig())
     obj.browser_capture = browser_capture

@@ -194,9 +194,11 @@ class MultiAttemptTimelineTests(unittest.TestCase):
 
         collab = make_collab(adapter=FakeAdapter(), base_dir=self.root / "collab")
         self.assertEqual(collab.run(), "DELIVERED")
-        # 复用同一 adapter 实例：恢复不重放历史委托，但执行器行为计数连续
+        # 复用同一 adapter 实例：恢复不重放历史委托，但执行器行为计数连续；
+        # 注入 stub 截图（恢复对象默认真实 Chrome，泄漏过 runtime/collab——已修）
         restored = collaboration_from_state(collab.run_dir / "state.json",
-                                            adapter=collab.adapter)
+                                            adapter=collab.adapter,
+                                            browser_capture=stub_capture)
         self.assertEqual(restored.resume(feedback="首图换成咖啡杯特写"), "DELIVERED")
         manifest = json.loads((collab.run_dir / "trace" / "manifest.json")
                               .read_text(encoding="utf-8"))
@@ -219,7 +221,8 @@ class MultiAttemptTimelineTests(unittest.TestCase):
         collab = make_collab(adapter=FakeAdapter(), base_dir=self.root / "collab")
         self.assertEqual(collab.run(), "DELIVERED")
         restored = collaboration_from_state(collab.run_dir / "state.json",
-                                            adapter=collab.adapter)
+                                            adapter=collab.adapter,
+                                            browser_capture=stub_capture)
         self.assertEqual(restored.resume(revoke=True), "WITHDRAWN")
         kinds = [(e["source"], e["kind"], e["status"]) for e in load_events(collab.run_dir)]
         self.assertIn(("user", "authorization.revoked", "failed"), kinds)
