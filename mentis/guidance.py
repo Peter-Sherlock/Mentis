@@ -257,6 +257,8 @@ class GuidanceCycle:
         self._v1_dir = self.run_dir / "v1"
         self._preserved: list = []
         self._dropped_preserved: list = []
+        self._v1_structure = None
+        self._form_field_requirements: list = []
         self._constraints: list[str] = []
         self._goal = ""
         self._workspace_ready = False
@@ -329,6 +331,14 @@ class GuidanceCycle:
                     self._notify(f"接受记录被拒绝：{exc}")
                 self._persist()
                 return self.status
+            if verdict == "unverified":
+                self._save_version(v2_html, "v2")
+                self.status = "UNVERIFIED"
+                self.verdict = "unverified"
+                self._notify("复检存在未知（测量不可信/缺记录/缺复查截图）："
+                             "不判通过也不判失败；需先核对观察链，不消耗修订预算")
+                self._persist()
+                return self.status
             if round_no == self.max_rounds:
                 self._save_version(v2_html, "v2")
                 self.status = verdict.upper()
@@ -353,8 +363,7 @@ class GuidanceCycle:
         freeze_baseline(self.baseline_dir, self.run_dir)
         goal, constraints = parse_frozen_brief(self._v1_dir)
         self._goal, self._constraints = goal, constraints
-        self._preserved = preserved_items(self._v1_dir)
-        self._calibrate_preserved()
+        self._ensure_v1_reference(force=True)
         s = self.session
         s.goal = goal
         s.init_brief(goal)
@@ -375,27 +384,47 @@ class GuidanceCycle:
         self._notify(f"已冻结 v1（sha256 前 12 位 {freeze_baseline_sha(self._v1_dir)}）；"
                      f"保留项 {len(self._preserved)} 项：{', '.join(l for l, _ in self._preserved)}")
 
+    def _ensure_v1_reference(self, force: bool = False):
+        """从冻结 v1 派生核对基准：保留项（逐段校准）与表单逐字段必填要求。
+
+        校准不降级：整句跨 DOM 节点时按"实际出现在 v1 的每一段"逐项核对，
+        而不是只保留第一段；v1 中从未出现的段落不作为回归判据（如实丢弃并记录）。
+        """
+        if getattr(self, "_v1_structure", None) is not None and not force:
+            return
+        self._preserved = preserved_items(self._v1_dir)
+        self._calibrate_preserved()
+        self._form_field_requirements = sorted({
+            i.text for i in self._v1_structure.items
+            if i.kind in ("input", "textarea") and i.extra.get("required") == "yes"
+        })
+
     def _calibrate_preserved(self):
-        """保留项核对串按 v1 实际呈现校准：素材整句可能跨 DOM 节点，
-        以"v1 结构文本中确实出现的最短稳定段"为回归判据；无法核对者不作为判据。"""
-        structure = observe_structure(str(self._v1_dir / "index.html"))
-        blob = "\n".join(i.text for i in structure.items)
+        """保留项核对串按 v1 实际呈现逐段校准；无法核对者不作为判据（记录在案）。"""
+        self._v1_structure = observe_structure(str(self._v1_dir / "index.html"))
+        blob = "\n".join(i.text for i in self._v1_structure.items)
         calibrated, dropped = [], []
         for label, needle in self._preserved:
-            current = needle
-            while current and current not in blob:
-                parts = [p for p in re.split(r"[，。；、,;·\s（）]", current) if p]
-                if len(parts) <= 1:
-                    current = ""
-                    break
-                current = parts[0]
-            if current and current in blob:
-                if current != needle:
-                    self._notify(f"保留项校准：{label} 核对串「{needle}」→「{current}」（以 v1 实际呈现为准）")
-                calibrated.append((label, current))
+            if needle in blob:
+                calibrated.append((label, needle))
+                continue
+            segments = [p for p in re.split(r"[，。；、,;·\s（）]+", needle) if len(p.strip()) >= 2]
+            matched = [s for s in segments if s in blob]
+            missing = [s for s in segments if s not in blob]
+            if matched:
+                multiple = len(matched) > 1
+                for idx, seg in enumerate(matched, 1):
+                    sub_label = f"{label}·{idx}" if multiple else label
+                    calibrated.append((sub_label, seg))
+                    self._notify(f"保留项校准：{label}「{needle}」→ 逐段核对「{seg}」"
+                                 f"（v1 实际呈现粒度；每段独立判回归）")
+                for seg in missing:
+                    dropped.append((f"{label}（v1 未呈现）", seg))
+                    self._notify(f"保留项 {label} 的段落「{seg}」在 v1 中未出现："
+                                 "不作为回归判据（v1 本未呈现的要求不能算修订造成的回归）")
             else:
                 dropped.append((label, needle))
-                self._notify(f"保留项 {label}（{needle}）在 v1 中不可整体核对：不作为回归判据（仍写入指令供保留）")
+                self._notify(f"保留项 {label}（{needle}）在 v1 中不可核对：不作为回归判据（仍写入指令供保留）")
         self._preserved = calibrated
         self._dropped_preserved = dropped
 
@@ -566,28 +595,37 @@ class GuidanceCycle:
 
     def _verify_round(self, record: RoundRecord, tag: str, v2_html: Path,
                       bundle: DiagnosisBundle, defect_ids: list) -> str:
-        """独立复检：确定性保留项/溢出检查 + 模型复查（可看 v2 截图）。"""
+        """独立复检：确定性保留项/溢出检查 + 模型复查（可看 v2 截图）。
+
+        测量不可信、缺记录或缺复查截图 → unknown：不判通过，记为 unverified。
+        """
         pack2, images2 = self._observe(v2_html, f"{tag}-verify")
-        findings, regression = self._deterministic_checks(pack2)
+        findings, regression, unknown = self._deterministic_checks(pack2)
+        if self.include_images and self.browser_capture is not None and not images2:
+            unknown.append("复查截图缺失：视觉类解决声明无法核对（不作为通过依据）")
         resolved, unresolved, new_issues = self._model_review(
             v2_html, bundle, defect_ids, pack2, images2, tag, record)
         verification = {
             "deterministic_findings": findings,
             "preserved_regression": regression,
+            "measurement_unknown": unknown,
             "model_resolved": resolved,
             "model_unresolved": unresolved,
             "model_new_issues": new_issues,
             "measurement_v2": {v.name: {"overflow_px": v.overflow_px,
                                         "overflowing": len(v.overflowing),
-                                        "clipped": len(v.clipped_text)}
+                                        "clipped": len(v.clipped_text),
+                                        "inner_width": v.inner_width,
+                                        "errors": list(v.errors)}
                                for v in pack2.measurement.viewports},
         }
         record.verification = verification
-        review_passed = not regression and not unresolved and not new_issues
+        review_passed = not regression and not unresolved and not new_issues and not unknown
         self.session.record_review(
             self.session.attempts[-1].attempt_id, findings=findings + [
                 f"模型复查：已解决 {resolved or '无'}；未解决 {unresolved or '无'}；"
-                f"新问题 {new_issues or '无'}"],
+                f"新问题 {new_issues or '无'}"]
+                + [f"测量未知：{u}" for u in unknown],
             passed=review_passed,
             disposition=Disposition.ACCEPT if review_passed else Disposition.REVISE)
         (self.run_dir / f"review-{tag}.md").write_text(
@@ -595,6 +633,8 @@ class GuidanceCycle:
         record.review_path = str(self.run_dir / f"review-{tag}.md")
         if regression:
             return "regression"
+        if unknown:
+            return "unverified"
         if not unresolved and not new_issues and resolved:
             return "improved"
         if not unresolved and not new_issues and not resolved:
@@ -602,9 +642,25 @@ class GuidanceCycle:
             return "not_improved"
         return "partially_improved"
 
-    def _deterministic_checks(self, pack: ObservationPack) -> tuple[list, list]:
-        """保留项与溢出的确定性复检；与模型意见无关的硬门槛。"""
-        findings, regression = [], []
+    def _measurement_anomalies(self, v) -> list:
+        """单视口测量可信度：报错、尺寸为 0 或与目标视口不符都不可作为"通过"依据。"""
+        problems = []
+        if v.errors:
+            problems.append("测量报错：" + "；".join(v.errors))
+        if v.inner_width <= 0:
+            problems.append(f"视口尺寸异常：innerWidth {v.inner_width}")
+        elif v.inner_width != v.width:
+            problems.append(f"视口宽度不符：请求 {v.width}px、实际 {v.inner_width}px"
+                            "（布局不在目标视口，溢出数值不可信）")
+        return problems
+
+    def _deterministic_checks(self, pack: ObservationPack) -> tuple[list, list, list]:
+        """保留项（逐段）、表单逐字段必填与溢出的确定性复检。
+
+        返回 (findings, regression, unknown)：unknown 是"无法确认"项——
+        测量不可信或缺记录时溢出记为未知，不得以零溢出判通过。
+        """
+        findings, regression, unknown = [], [], []
         text_blob = "\n".join(i.text for i in pack.structure.items)
         for label, needle in self._preserved:
             if needle in text_blob:
@@ -613,13 +669,32 @@ class GuidanceCycle:
                 findings.append(f"保留项 {label}（{needle}）：缺失")
                 regression.append(f"{label}缺失（{needle}）")
         inputs = [i for i in pack.structure.items if i.kind in ("input", "textarea")]
-        required = [i for i in inputs if i.extra.get("required") == "yes"]
-        if len(inputs) >= 2 and required:
-            findings.append(f"报名表单：字段 {len(inputs)}（必填 {len(required)}）在")
-        else:
-            regression.append("报名表单缺失或必填校验丢失")
-            findings.append("报名表单：字段不足或无必填")
+        by_text = {}
+        for i in inputs:
+            by_text.setdefault(i.text, []).append(i)
+        for name in getattr(self, "_form_field_requirements", []) or []:
+            hits = by_text.get(name, [])
+            if not hits:
+                regression.append(f"表单字段 {name} 缺失")
+                findings.append(f"表单字段 {name}：缺失")
+            elif not any(h.extra.get("required") == "yes" for h in hits):
+                regression.append(f"表单字段 {name} 的必填要求丢失")
+                findings.append(f"表单字段 {name}：存在但必填要求丢失")
+            else:
+                findings.append(f"表单字段 {name}：存在且必填")
+        if getattr(self, "_form_field_requirements", []) and len(inputs) < len(
+                self._form_field_requirements):
+            regression.append(f"表单字段总数减少：要求 ≥{len(self._form_field_requirements)}，"
+                              f"实际 {len(inputs)}")
+            findings.append(f"表单字段总数：{len(inputs)}（要求 ≥{len(self._form_field_requirements)}）")
+        if not pack.measurement.viewports:
+            unknown.append("无渲染测量记录：溢出与表单行为无法确认")
         for v in pack.measurement.viewports:
+            anomalies = self._measurement_anomalies(v)
+            if anomalies:
+                unknown.append(f"{v.name} 视口测量不可信：{'；'.join(anomalies)}")
+                findings.append(f"{v.name} 视口横向溢出：未知（测量不可信，不作为通过依据）")
+                continue
             ni = v.network_intent or {}
             if ni.get("hasFetch") or ni.get("hasXHR") or ni.get("hasBeacon"):
                 regression.append(f"{v.name} 视口出现网络调用声明（违反本地无网络约束）")
@@ -628,7 +703,7 @@ class GuidanceCycle:
                     f"{v.name} 视口出现横向溢出 {v.overflow_px}px（{len(v.overflowing)} 个元素）")
             else:
                 findings.append(f"{v.name} 视口无横向溢出")
-        return findings, regression
+        return findings, regression, unknown
 
     def _model_review(self, v2_html: Path, bundle: DiagnosisBundle, defect_ids: list,
                       pack2: ObservationPack, images2: list, tag: str,
@@ -657,6 +732,7 @@ class GuidanceCycle:
             "ok": gw_record.ok, "mock": gw_record.mock, "model": gw_record.model,
             "usage": gw_record.usage, "error": gw_record.error,
             "image_refs": gw_record.image_refs,
+            "reviewed_html_sha256": _sha256_file(v2_html),  # 复查所针对产物版本的绑定
             "response": gw_record.response_text[:4000],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         record.review_path = str(self.run_dir / f"model-review-{tag}.json")
@@ -888,8 +964,9 @@ class GuidanceCycle:
     def reverify(self) -> str:
         """对已有 v2 用修正后的确定性工具重新复检（透明更正判定）。
 
-        模型复查结论复用最近一次真实复查（同一 v2 产物，记录见 model-review-*.json）；
-        本方法只重跑保留项/溢出等确定性检查并重测 v2，不新增模型调用、不重新委托。
+        模型复查结论必须先通过绑定检查（对应当前 v2 产物版本）才可复用；
+        本方法重跑确定性检查并重测 v2，不新增模型调用、不重新委托。
+        历史复核文件按序号保留，不覆盖（误判与更正记录可审计）。
         """
         last = self.rounds[-1] if self.rounds else None
         v2_html = self.run_dir / "v2" / "index.html"
@@ -898,58 +975,73 @@ class GuidanceCycle:
             self._notify("没有可复核的 v2 产物")
             self._persist()
             return self.status
-        self._calibrate_preserved()
-        pack2, _ = self._observe(v2_html, f"round{last.round_no}-recheck")
-        findings, regression = self._deterministic_checks(pack2)
+        self._ensure_v1_reference(force=True)
+        suffix = ""
+        k = 1
+        while (self.run_dir / f"review-round{last.round_no}-recheck{suffix}.md").is_file():
+            k += 1
+            suffix = str(k)
+        pack2, _ = self._observe(v2_html, f"round{last.round_no}-recheck{suffix}")
+        findings, regression, unknown = self._deterministic_checks(pack2)
         resolved, unresolved, new_issues = [], [], []
-        reuse_note = "无历史模型复查记录：按未确认处理"
         review_file = self.run_dir / f"model-review-round{last.round_no}.json"
-        if last.verdict and review_file.is_file():
+        bound, bind_note = self._review_binding_status(last, v2_html, review_file)
+        if bound:
             try:
                 prior = json.loads(review_file.read_text(encoding="utf-8"))
                 data = json.loads(prior.get("response", "{}"))
                 resolved = [r for r in data.get("resolved", []) if str(r).strip()]
                 unresolved = [r for r in data.get("unresolved", []) if str(r).strip()]
                 new_issues = [str(x) for x in data.get("new_issues", []) if str(x).strip()]
-                reuse_note = f"复用历史模型复查（{review_file.name}，含图像输入）"
             except (json.JSONDecodeError, ValueError) as exc:
-                reuse_note = f"历史复查不可解析（{exc}）：按未确认处理"
                 unresolved = ["review-unreadable"]
-        elif not last.verdict:
-            unresolved = ["review-missing"]
-            reuse_note = "该轮无已完成的模型复查：按未确认处理"
+                bind_note = f"{bind_note}；但复查响应不可解析（{exc}）：按未确认处理"
+        elif review_file.is_file():
+            unresolved = ["review-unbound"]
+        else:
+            unresolved = ["review-missing"] if not last.verdict else ["review-unbound"]
         verification = {
             "deterministic_findings": findings,
             "preserved_regression": regression,
+            "measurement_unknown": unknown,
             "model_resolved": resolved,
             "model_unresolved": unresolved,
             "model_new_issues": new_issues,
-            "model_review_source": reuse_note,
+            "model_review_binding": bind_note,
             "measurement_v2": {v.name: {"overflow_px": v.overflow_px,
                                         "overflowing": len(v.overflowing),
-                                        "clipped": len(v.clipped_text)}
+                                        "clipped": len(v.clipped_text),
+                                        "inner_width": v.inner_width,
+                                        "errors": list(v.errors)}
                                for v in pack2.measurement.viewports},
         }
         last.verification = verification
-        if verdict_is_improvement(regression, resolved, unresolved, new_issues):
-            verdict = "improved"
-        elif regression:
+        unconfirmed = all(u in ("review-unbound", "review-missing", "review-unreadable")
+                          for u in unresolved) and bool(unresolved)
+        if regression:
             verdict = "regression"
+        elif unknown or unconfirmed:
+            verdict = "unverified"
+        elif verdict_is_improvement(regression, resolved, unresolved, new_issues):
+            verdict = "improved"
         elif resolved:
-            verdict = "partially_improved" if unresolved or new_issues else "improved"
+            verdict = "partially_improved"
         else:
             verdict = "not_improved"
+        prior_verdict = last.verdict or "（未复检）"
+        correction = "复核重检（结论维持）" if verdict == last.verdict else "复核更正"
         last.notes.append(
-            f"复核更正：原判定 {last.verdict or '（未复检）'} → {verdict}；"
-            f"原因：保留项核对串粒度缺陷已修正（核对串以 v1 实际呈现校准）；{reuse_note}")
+            f"{correction}：{prior_verdict} → {verdict}；"
+            f"依据：逐段保留项/逐字段必填/测量可信度检查 + 复查绑定确认；{bind_note}")
         last.verdict = verdict
         self.verdict = verdict
-        review_passed = not regression and not unresolved and not new_issues
+        review_passed = not regression and not unknown and not unresolved and not new_issues
         self.session.record_review(
-            self.session.attempts[-1].attempt_id, findings=findings + [reuse_note],
+            self.session.attempts[-1].attempt_id,
+            findings=findings + [f"测量未知：{u}" for u in unknown] + [bind_note],
             passed=review_passed,
             disposition=Disposition.ACCEPT if review_passed else Disposition.REVISE)
-        review_path = self.run_dir / f"review-round{last.round_no}-recheck.md"
+        review_path = self.run_dir / f"review-round{last.round_no}-recheck{suffix}.md"
         review_path.write_text(json.dumps(verification, ensure_ascii=False, indent=2),
                                encoding="utf-8")
         last.review_path = str(review_path)
@@ -957,15 +1049,64 @@ class GuidanceCycle:
             self.status = "IMPROVED"
             try:
                 self.session.accept(self.session.attempts[-1].attempt_id)
-                self._notify("复核更正后满足改善与保留项条件：已接受（completed ≠ 用户满意，后者单独记录）")
+                self._notify("复核后满足改善与保留项条件：已接受（completed ≠ 用户满意，后者单独记录）")
             except Exception as exc:
                 self._notify(f"接受被拒绝：{exc}")
                 self.status = "NOT_ACCEPTED"
         else:
             self.status = verdict.upper()
-        self._notify(f"复核判定：{verdict}（原判定已保留在轮次备注中）")
+        self._notify(f"复核判定：{verdict}（历史判定与备注全部保留，可审计）")
         self._persist()
         return self.status
+
+    def _review_binding_status(self, last: RoundRecord, v2_html: Path,
+                               review_file: Path) -> tuple[bool, str]:
+        """确认历史模型复查对应当前 v2 产物版本；不能确认就不复用其结论。
+
+        新版记录直接比对 reviewed_html_sha256；旧版记录无该字段时，
+        用"复查图像指纹 + 当轮测量记录的 source_sha256"间接绑定。
+        """
+        if not review_file.is_file():
+            return False, "无历史模型复查记录：按未确认处理"
+        try:
+            prior = json.loads(review_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError) as exc:
+            return False, f"历史复查记录不可解析（{exc}）：按未确认处理"
+        if not prior.get("ok"):
+            return False, "历史复查调用未成功：按未确认处理"
+        current_sha = _sha256_file(v2_html)
+        recorded_sha = prior.get("reviewed_html_sha256")
+        if recorded_sha:
+            if recorded_sha == current_sha:
+                return True, f"复查绑定当前产物（reviewed_html_sha256 一致：{current_sha[:12]}）"
+            return False, (f"复查针对旧产物（记录 {str(recorded_sha)[:12]} ≠ "
+                           f"当前 {current_sha[:12]}）：不复用其结论")
+        refs = [str(r) for r in (prior.get("image_refs") or [])]
+        if not refs:
+            return False, "历史复查未记录图像输入且无产物哈希：无法确认对应版本，按未确认处理"
+        verify_dir = self.run_dir / f"observation-round{last.round_no}-verify"
+        for ref in refs:
+            name, _, sha12 = ref.partition(";")
+            path = verify_dir / name
+            if not sha12 or not path.is_file():
+                return False, f"复查图像 {name} 缺指纹或文件缺失：无法确认绑定，按未确认处理"
+            actual = _sha256_file(path)[:12]
+            if actual != sha12:
+                return False, (f"复查图像 {name} 指纹不符（记录 {sha12} ≠ 现存 {actual}）："
+                               "复查针对旧版本，不复用其结论")
+        measurement_file = verify_dir / "measurement.json"
+        if not measurement_file.is_file():
+            return False, "缺少当轮测量记录：无法确认截图对应产物版本，按未确认处理"
+        try:
+            measured_sha = json.loads(
+                measurement_file.read_text(encoding="utf-8")).get("source_sha256")
+        except json.JSONDecodeError:
+            return False, "当轮测量记录不可解析：无法确认绑定，按未确认处理"
+        if measured_sha != current_sha:
+            return False, (f"当轮测量对应产物（{str(measured_sha)[:12]}）与当前 v2"
+                           f"（{current_sha[:12]}）不一致：不复用复查结论")
+        return True, ("复查绑定当前产物（legacy 间接绑定：复查图像指纹与当轮测量 sha256 "
+                      "均与现存 v2 一致）")
 
     def _merged_model_usage(self) -> dict:
         """恢复后的网关只计恢复后的调用；与落盘的先前用量合并，避免漏计。"""
@@ -1027,6 +1168,10 @@ class GuidanceCycle:
                 lines.append(f"  - 保留项回归：{v['preserved_regression'] or '无'}；"
                              f"模型复查已解决 {v['model_resolved'] or '无'}、"
                              f"未解决 {v['model_unresolved'] or '无'}、新问题 {v['model_new_issues'] or '无'}")
+                if v.get("measurement_unknown"):
+                    lines.append(f"  - **测量未知（不作为通过依据）**：{'；'.join(v['measurement_unknown'])}")
+                if v.get("model_review_binding"):
+                    lines.append(f"  - 复查绑定：{v['model_review_binding']}")
                 for vp, m in v["measurement_v2"].items():
                     lines.append(f"  - {vp}：溢出 {m['overflow_px']}px"
                                  f"（溢出元素 {m['overflowing']}、裁剪 {m['clipped']}）")
@@ -1114,6 +1259,12 @@ def compose_revision_instruction(bundle: DiagnosisBundle, defect_ids: list,
 def verdict_is_improvement(regression: list, resolved: list, unresolved: list,
                            new_issues: list) -> bool:
     return not regression and not unresolved and not new_issues and bool(resolved)
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def freeze_baseline_sha(v1_dir: Path) -> str:
@@ -1207,4 +1358,5 @@ def guidance_from_state(state_path: str | Path, adapter=None, gateway=None,
     obj._constraints = [i.text for i in obj.session.current_brief.constraints]
     obj._v1_dir = obj.run_dir / "v1"
     obj._workspace_ready = obj.workspace.is_dir()
+    obj._ensure_v1_reference()  # 从冻结 v1 重建逐段保留项与逐字段必填基准
     return obj

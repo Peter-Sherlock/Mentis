@@ -85,8 +85,20 @@ DIAGNOSIS_NEEDS_USER = json.dumps({
     }],
 }, ensure_ascii=False)
 
+DIAGNOSIS_GENERIC = json.dumps({
+    "diagnoses": [{
+        "phenomenon": "结构层确认的问题（引用结构条目，不依赖测量）",
+        "evidence_refs": ["h:1"],
+        "severity": "blocking",
+        "interpretation": "标题区块存在需修正的问题",
+        "modification_candidates": ["修正该问题"],
+    }],
+    "next_action": "agent_decide",
+    "decision_requests": [],
+}, ensure_ascii=False)
+
 REVIEW_RESOLVED = json.dumps({
-    "resolved": ["d1"], "unresolved": [], "new_issues": [], "summary": "溢出已消除",
+    "resolved": ["d1"], "unresolved": [], "new_issues": [], "summary": "已解决",
 }, ensure_ascii=False)
 
 DIAGNOSIS_MISSING_PRICE = json.dumps({
@@ -124,8 +136,12 @@ class FakeGateway:
     def complete(self, system, user_prompt, json_mode=True, mock=False, images=None):
         self.calls.append({"prompt": user_prompt, "images": [n for n, _ in (images or [])]})
         text = self.responses.pop(0) if self.responses else "{}"
+        import hashlib
+
+        # 与真实网关同格式：名称;sha256 前 12 位（绑定检查依赖该格式）
+        refs = [f"{n};{hashlib.sha256(b).hexdigest()[:12]}" for n, b in (images or [])]
         return SimpleNamespace(ok=True, mock=True, model="mock-model", usage={"total_tokens": 1},
-                               error="", response_text=text, image_refs=[n for n, _ in (images or [])],
+                               error="", response_text=text, image_refs=refs,
                                request_id="fake")
 
 
@@ -146,7 +162,14 @@ class FakeAdapter:
         root = Path(spec.workspace)
         step = "first" if len(self.prompts) == 1 else "second"
         behavior = self.behavior.get(step, "fixed")
-        page = {"defect": DEFECT_PAGE, "fixed": FIXED_PAGE, "regression": REGRESSION_PAGE}.get(behavior)
+        page = {
+            "defect": DEFECT_PAGE, "fixed": FIXED_PAGE, "regression": REGRESSION_PAGE,
+            # 验收修复②的受控页：讲师姓名在、经验段被删（旧工具只查姓名会放过）
+            "keep-name": FIXED_PAGE.replace("<p>三年手冲教学经验</p>\n", ""),
+            # 验收修复②的受控页：contact 字段丢失 required（旧工具"至少一个必填"会放过）
+            "drop-required": FIXED_PAGE.replace('<input name="contact" required>',
+                                                '<input name="contact">'),
+        }.get(behavior)
         if page is not None:
             root.joinpath("index.html").write_text(page, encoding="utf-8")
         from mentis.contracts import AttemptStatus
@@ -174,6 +197,8 @@ def file_aware_measure(page, out_dir):
     html = page.read_text(encoding="utf-8")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    import hashlib
+
     viewports = []
     for name, (w, h) in (("mobile", (390, 844)), ("desktop", (1280, 800))):
         viewport = ViewportMeasurement(name=name, width=w, height=h, inner_width=w,
@@ -192,7 +217,8 @@ def file_aware_measure(page, out_dir):
         viewport.network_intent = {"hasFetch": False, "hasXHR": False, "hasBeacon": False}
         viewports.append(viewport)
     return RenderMeasurement(
-        source_path=str(page), source_sha256="b" * 64, browser="fake", browser_version="0",
+        source_path=str(page), source_sha256=hashlib.sha256(page.read_bytes()).hexdigest(),
+        browser="fake", browser_version="0",
         viewports=viewports,
         limitations=["测试替身：由文件内容生成，无真实浏览器渲染"],
         created_at="2026-09-28T00:00:00")
@@ -314,6 +340,145 @@ class FailingThenFixedAdapter(FakeAdapter):
                 final_response="", error="Codex 未报告成功终态（进程退出码 1）",
                 events=[], cli_version="fake")
         return super()._run(spec)
+
+
+class AcceptanceFixTests(GuidanceTestBase):
+    """P3.2 验收修复：先复现旧工具的误判，再断言修复后的行为。"""
+
+    def test_broken_measurement_blocks_pass(self):
+        """① 复现旧误判：测量报错且视口 0 时，旧逻辑以 overflow 0 判"无横向溢出"通过。
+        修复后：测量不可信 → unknown → UNVERIFIED，不得标改善。"""
+        def broken_measure(page, out_dir):
+            m = file_aware_measure(page, out_dir)
+            for v in m.viewports:
+                v.errors = ["测量报告解析失败: 未找到测量报告"]
+                v.inner_width = 0
+                v.overflow_px = 0
+                v.overflowing = []
+                v.clipped_text = []
+            return m
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
+                           measure=broken_measure)
+        status = cycle.run()
+        self.assertEqual(status, "UNVERIFIED")
+        self.assertEqual(cycle.verdict, "unverified")
+        review = json.loads((cycle.run_dir / "review-round1.md").read_text(encoding="utf-8"))
+        self.assertTrue(any("测量不可信" in u for u in review["measurement_unknown"]))
+        self.assertFalse(any("无横向溢出" in f and "未知" not in f
+                             for f in review["deterministic_findings"]))
+        self.assertFalse(cycle.session.attempts[-1].accepted)
+
+    def test_viewport_clamp_blocks_pass(self):
+        """① 视口被钳制（请求 390 实际 500）：溢出 0 也不可判通过。"""
+        def clamped_measure(page, out_dir):
+            m = file_aware_measure(page, out_dir)
+            for v in m.viewports:
+                if v.name == "mobile":
+                    v.inner_width = 500  # Windows 无头最小窗宽钳制的模拟
+            return m
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
+                           measure=clamped_measure)
+        self.assertEqual(cycle.run(), "UNVERIFIED")
+        review = json.loads((cycle.run_dir / "review-round1.md").read_text(encoding="utf-8"))
+        self.assertTrue(any("视口宽度不符" in u for u in review["measurement_unknown"]))
+
+    def test_missing_screenshots_block_visual_pass(self):
+        """① 复查截图缺失：视觉类解决声明无法核对 → unknown → UNVERIFIED。"""
+        def failing_capture(index, out_dir):
+            raise RuntimeError("chrome exploded")
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
+                           browser_capture=failing_capture)
+        self.assertEqual(cycle.run(), "UNVERIFIED")
+        review = json.loads((cycle.run_dir / "review-round1.md").read_text(encoding="utf-8"))
+        self.assertTrue(any("截图缺失" in u for u in review["measurement_unknown"]))
+
+    def test_experience_segment_regression_caught(self):
+        """② 复现旧误判：讲师姓名在、经验段被删 → 旧工具（只查姓名）判改善。
+        修复后：逐段核对 → 经验段缺失 = 回归。"""
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "keep-name"}),
+                           max_rounds=1)
+        status = cycle.run()
+        self.assertEqual(status, "REGRESSION")
+        review = json.loads((cycle.run_dir / "review-round1.md").read_text(encoding="utf-8"))
+        self.assertTrue(any("三年手冲教学经验" in r for r in review["preserved_regression"]))
+        self.assertFalse(cycle.session.attempts[-1].accepted)
+
+    def test_per_field_required_regression_caught(self):
+        """② 复现旧误判：contact 丢失 required（name 仍必填）→ 旧工具"至少一个必填"放过。
+        修复后：逐字段核对 → contact 必填要求丢失 = 回归。"""
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "drop-required"}),
+                           max_rounds=1)
+        status = cycle.run()
+        self.assertEqual(status, "REGRESSION")
+        review = json.loads((cycle.run_dir / "review-round1.md").read_text(encoding="utf-8"))
+        self.assertTrue(any("contact" in r and "必填" in r
+                            for r in review["preserved_regression"]))
+
+    def test_reverify_rejects_stale_review_binding(self):
+        """③ 复现旧误判：v2 在复查后被改动，旧 reverify 仍复用旧复查结论判改善。
+        修复后：绑定不符 → 不复用 → UNVERIFIED。"""
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
+                           max_rounds=1)
+        self.assertEqual(cycle.run(), "IMPROVED")
+        v2 = cycle.run_dir / "v2" / "index.html"
+        v2.write_text(v2.read_text(encoding="utf-8").replace(
+            "<title>", "<title><!-- revised-after-review -->"), encoding="utf-8")
+        # 改动只进文件字节（head 内注释），不触保留项：若 binding 生效应判 UNVERIFIED
+        status = cycle.reverify()
+        self.assertEqual(status, "UNVERIFIED")
+        review = json.loads(
+            (cycle.run_dir / "review-round1-recheck.md").read_text(encoding="utf-8"))
+        self.assertEqual(review["model_unresolved"], ["review-unbound"])
+        self.assertIn("不复用", review["model_review_binding"])
+        # 初始 run 的 accept 是当时的历史事实，不追溯撤销；但最新评审必须是不通过
+        latest = cycle.session.reviews[-1]
+        self.assertFalse(latest.passed)
+        from mentis.contracts import Disposition as _Disposition
+
+        self.assertIs(latest.disposition, _Disposition.REVISE)
+
+    def test_reverify_legacy_binding_via_screenshots(self):
+        """③ legacy 记录（无直接哈希）：截图指纹 + 当轮测量 sha256 与现存 v2 一致 → 可复用。"""
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
+                           max_rounds=1)
+        self.assertEqual(cycle.run(), "IMPROVED")
+        review_file = cycle.run_dir / "model-review-round1.json"
+        data = json.loads(review_file.read_text(encoding="utf-8"))
+        data.pop("reviewed_html_sha256")  # 模拟本轮修复之前的记录格式
+        review_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        status = cycle.reverify()
+        self.assertEqual(status, "IMPROVED")
+        review = json.loads(
+            (cycle.run_dir / "review-round1-recheck.md").read_text(encoding="utf-8"))
+        self.assertIn("legacy 间接绑定", review["model_review_binding"])
+
+    def test_reverify_keeps_history_files(self):
+        """复核文件按序号保留：第二次 reverify 不覆盖第一次的更正记录。"""
+        baseline = make_baseline(self.root)
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
+                           max_rounds=1)
+        self.assertEqual(cycle.run(), "IMPROVED")
+        self.assertEqual(cycle.reverify(), "IMPROVED")   # 第一次复核
+        self.assertEqual(cycle.reverify(), "IMPROVED")   # 第二次复核
+        self.assertTrue((cycle.run_dir / "review-round1-recheck.md").is_file())
+        self.assertTrue((cycle.run_dir / "review-round1-recheck2.md").is_file())
+        notes = "；".join(cycle.rounds[-1].notes)
+        self.assertIn("结论维持", notes)  # 第二次为重检，不冒充"更正"
 
 
 class GuidanceLoopTests(GuidanceTestBase):
@@ -508,7 +673,7 @@ class GuidanceLoopTests(GuidanceTestBase):
         self.assertEqual(len(adapter.prompts), 1)
 
     def test_preserved_needle_calibrated_to_v1_presentation(self):
-        """素材整句跨 DOM 节点时，核对串按 v1 实际呈现收窄（否则会误报回归）。"""
+        """素材整句跨 DOM 节点时逐段校准：姓名与经验各自独立判回归（不降级为只查姓名）。"""
         baseline = make_baseline(self.root)
         run_dir = self.root / "run"
         freeze_baseline(baseline, run_dir)
@@ -519,8 +684,10 @@ class GuidanceLoopTests(GuidanceTestBase):
         self.assertEqual(cycle.run(), "IMPROVED")  # 校准后不误报
         import json as _json
         meta = _json.loads((cycle.run_dir / "state.json").read_text(encoding="utf-8"))
-        calibrated = dict(meta["preserved_items"])
-        self.assertEqual(calibrated.get("讲师"), "林小豆")
+        lecturer = [n for l, n in meta["preserved_items"] if l.startswith("讲师")]
+        self.assertEqual(sorted(lecturer), ["三年手冲教学经验", "林小豆"])  # 两段都在判据里
+        review = _json.loads((cycle.run_dir / "review-round1.md").read_text(encoding="utf-8"))
+        self.assertTrue(any("三年手冲教学经验" in f for f in review["deterministic_findings"]))
 
     def test_reverify_corrects_false_regression(self):
         """复现真实误判：过严核对串造成假回归 → reverify 修正工具后透明更正。"""
@@ -530,14 +697,20 @@ class GuidanceLoopTests(GuidanceTestBase):
         cycle = self.cycle(baseline, gateway, adapter, max_rounds=1)
         original = guidance_module.preserved_items
         guidance_module.preserved_items = lambda v1: [("讲师", "林小豆，三年手冲教学经验")]
-        cycle._calibrate_preserved = lambda: None  # 模拟修正前：无校准
+
+        def no_calibration(self_=cycle):  # 模拟最初版本：完全不校准（整句硬核对）
+            from mentis.observation import observe_structure
+
+            cycle._v1_structure = observe_structure(str(cycle._v1_dir / "index.html"))
+            cycle._dropped_preserved = []
+        cycle._calibrate_preserved = no_calibration
         try:
             self.assertEqual(cycle.run(), "REGRESSION")  # 过严核对串 → 假回归
         finally:
             guidance_module.preserved_items = original
             del cycle._calibrate_preserved  # 恢复校准方法
         self.assertFalse(cycle.session.attempts[-1].accepted)
-        status = cycle.reverify()  # 校准核对串 + 复用历史复查 → 更正
+        status = cycle.reverify()  # 逐段校准 + 绑定确认 → 更正
         self.assertEqual(status, "IMPROVED")
         self.assertTrue(cycle.session.attempts[-1].accepted)
         self.assertIn("复核更正", "；".join(cycle.rounds[-1].notes))
