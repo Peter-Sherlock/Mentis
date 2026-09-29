@@ -2,7 +2,7 @@
 
 代表非专业用户与执行型 Agent 持续协作的代理：帮助形成目标，决定下一步，委托工作，观察实际产物，诊断问题并给出有效修改指导。
 
-**当前状态：P3.2 最小真实指导与修订闭环。** DeepSeek 真实诊断（含双视口截图图像输入）、渲染测量（真实 390/1280 视口横向溢出与表单声明行为）、Codex CLI 隔离委托、指导修订循环已实现；**单案例**的改善记录与验收修复见 [P3.2 记录](docs/progress/P3.2.md)（不构成普遍专业能力结论）。开发位置与证据边界见 [docs/DEVELOPMENT_STATUS.md](docs/DEVELOPMENT_STATUS.md)；案例与评价材料仍为 AI 草案。
+**当前状态：P3.2 最小真实指导与修订闭环已完成，P5.2a 使用入口已交付，P2.4 尚未实施。** DeepSeek 真实诊断（含双视口截图图像输入）、渲染测量和 Codex CLI 隔离委托已接通；**单案例**的改善记录与验收修复见 [P3.2 记录](docs/progress/P3.2.md)（不构成普遍专业能力结论）。下一步的 Mentis × Codex 交互旁观/回放及强基线评测见 [交互可见性实施计划](docs/INTERACTION_VISIBILITY_PLAN.md)；当前证据状态见 [开发状态](docs/DEVELOPMENT_STATUS.md)。案例与评价材料仍为 AI 草案。
 
 ## 运行（核心 Python 无第三方包依赖）
 

@@ -234,18 +234,24 @@ def record_feedback(run_dir: Path, satisfied: bool, quote: str, blocks: str = ""
 
 def run_field_start(goal: str, design: bool = False, direction: str = "",
                     interactive: bool = False, timeout_s: int = 420, max_repairs: int = 1,
-                    label: str = "", base_dir=None, collab_factory=None) -> tuple[str, Path, Path]:
-    """自然语言目标 → 一次被记录的真实使用会话。返回 (状态, 会话目录, 运行目录)。"""
-    from mentis.collab import Collaboration
+                    label: str = "", base_dir=None, collab_base_dir=None,
+                    collab_factory=None) -> tuple[str, Path, Path]:
+    """自然语言目标 → 一次被记录的真实使用会话。返回 (状态, 会话目录, 运行目录)。
+
+    collab_base_dir 控制运行目录的落点（默认 runtime/collab；测试须隔离）。
+    """
+    from mentis.collab import COLLAB_DIR, Collaboration
 
     fs = FieldSession(label=label or "collab", base_dir=base_dir)
     fs.command = (f"field-start --goal \"{goal[:60]}...\"" if len(goal) > 60
                   else f"field-start --goal \"{goal}\"") + (" --design" if design else "")
     fs.event("研究者提示", "入口命令与说明由开发 Agent 提供；系统行为见下方输出")
     fs.begin_capture()
+    collab_base = Path(collab_base_dir) if collab_base_dir else COLLAB_DIR
     factory = collab_factory or (lambda: Collaboration(
         goal=goal, mode="design" if design else "autonomous", direction=direction,
-        interactive=interactive, max_repairs=max_repairs, timeout_s=timeout_s))
+        interactive=interactive, max_repairs=max_repairs, timeout_s=timeout_s,
+        base_dir=collab_base))
     collab = factory()
     status = collab.run()
     run_dir = collab.run_dir

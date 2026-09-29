@@ -17,7 +17,7 @@ except ImportError:  # discover -s tests 以顶层模块导入
     from test_collab import FakeAdapter, stub_capture
 
 
-def make_factory(adapter, design: bool = False):
+def make_factory(adapter, design: bool = False, base_dir=None):
     def factory():
         from mentis.collab import Collaboration
 
@@ -25,7 +25,7 @@ def make_factory(adapter, design: bool = False):
             goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）",
             mode="design" if design else "autonomous",
             adapter=adapter, gateway=None, browser_capture=stub_capture,
-            use_model=False, interactive=False)
+            use_model=False, interactive=False, base_dir=base_dir)
     return factory
 
 
@@ -39,8 +39,8 @@ class FieldSessionTests(unittest.TestCase):
         """机制检查：操作、系统行为、研究者提示、阻塞、证据入口全部入档。"""
         status, session_dir, run_dir = run_field_start(
             goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）",
-            interactive=False, base_dir=self.root / "field",
-            collab_factory=make_factory(FakeAdapter()))
+            interactive=False, base_dir=self.root / "field", collab_base_dir=self.root / "collab",
+            collab_factory=make_factory(FakeAdapter(), base_dir=self.root / "collab"))
         self.assertEqual(status, "DELIVERED")
         record = (session_dir / "usage-record.md").read_text(encoding="utf-8")
         for section in ("实际操作", "系统行为", "阻塞与等待", "用户原话", "证据入口"):
@@ -62,8 +62,8 @@ class FieldSessionTests(unittest.TestCase):
         """机制检查：逐字反馈入会话记录（绑定尝试）并持久化往返。"""
         _status, _session_dir, run_dir = run_field_start(
             goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）",
-            interactive=False, base_dir=self.root / "field",
-            collab_factory=make_factory(FakeAdapter(behavior={"first": "good"})))
+            interactive=False, base_dir=self.root / "field", collab_base_dir=self.root / "collab",
+            collab_factory=make_factory(FakeAdapter(behavior={"first": "good"}), base_dir=self.root / "collab"))
         entry = record_feedback(
             run_dir, satisfied=False,
             quote="首屏太挤了，价格我没看到；改回插画大一点",
@@ -84,8 +84,8 @@ class FieldSessionTests(unittest.TestCase):
         """机制检查：待决中（零尝试）的运行不伪造契约绑定，反馈只入档案并标注。"""
         _status, _s, run_dir = run_field_start(
             goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）", design=True,
-            interactive=False, base_dir=self.root / "field",
-            collab_factory=make_factory(FakeAdapter(), design=True))
+            interactive=False, base_dir=self.root / "field", collab_base_dir=self.root / "collab",
+            collab_factory=make_factory(FakeAdapter(), design=True, base_dir=self.root / "collab"))
         self.assertEqual(_status, "PENDING")
         entry = record_feedback(run_dir, satisfied=False, quote="还没出结果，先不评价")
         self.assertEqual(entry["bound_attempt"], "（无）")
@@ -97,17 +97,17 @@ class FieldSessionTests(unittest.TestCase):
     def test_field_feedback_rejects_empty_quote(self):
         _status, _s, run_dir = run_field_start(
             goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）",
-            interactive=False, base_dir=self.root / "field",
-            collab_factory=make_factory(FakeAdapter(), design=True))
+            interactive=False, base_dir=self.root / "field", collab_base_dir=self.root / "collab",
+            collab_factory=make_factory(FakeAdapter(), design=True, base_dir=self.root / "collab"))
         with self.assertRaises(ValueError):
-            run_field_feedback(run_dir, satisfied=True, quote="   ")
+            run_field_feedback(run_dir, satisfied=True, quote="   ", base_dir=self.root / "field")
 
     def test_blocking_lines_list_pending_decisions(self):
         """机制检查：待决请求作为阻塞项列出（沉默≠批准）。"""
         _status, _s, run_dir = run_field_start(
             goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）", design=True,
-            interactive=False, base_dir=self.root / "field",
-            collab_factory=make_factory(FakeAdapter(), design=True))
+            interactive=False, base_dir=self.root / "field", collab_base_dir=self.root / "collab",
+            collab_factory=make_factory(FakeAdapter(), design=True, base_dir=self.root / "collab"))
         fs = FieldSession(label="probe", base_dir=self.root / "field")
         lines = fs._blocking_lines(run_dir)
         fs.end_capture()
