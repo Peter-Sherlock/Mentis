@@ -13,7 +13,8 @@ import unittest
 from pathlib import Path
 
 from mentis.contracts import AttemptStatus
-from mentis.trace import (TraceArchiveError, TraceWriter, load_events, render_timeline)
+from mentis.trace import (TraceArchiveError, TraceWriter, load_events,
+                          render_conversation, render_timeline)
 
 try:
     from tests.test_collab import FakeAdapter, make_collab, stub_capture
@@ -32,6 +33,16 @@ class RecordingAdapter(FakeAdapter):
         if not hasattr(self, "prompts"):
             self.prompts = []
         self.prompts.append(spec.prompt)
+        return super()._run(spec)
+
+
+class PublicMessageAdapter(RecordingAdapter):
+    """离线夹具：模拟 Codex 对外消息，不模拟内部推理。"""
+
+    def _run(self, spec):
+        spec.on_event({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "初稿已完成。\n清理步骤被拦截，临时目录仍在。",
+        }}, {"first": False})
         return super()._run(spec)
 
 
@@ -100,6 +111,37 @@ class TraceWriterTests(unittest.TestCase):
         self.assertTrue(p.is_file())
         self.assertEqual(ref["sha256"], hashlib.sha256(p.read_bytes()).hexdigest())
         self.assertEqual(ref["sha256"], hashlib.sha256(text.encode("utf-8")).hexdigest())
+
+    def test_conversation_verifies_full_public_message_and_marks_old_gap(self):
+        run_dir = self.root / "run"
+        w = TraceWriter(run_dir, "run-x")
+        prompt = w.archive_prompt("attempt-1", "确切指令全文")
+        w.emit("mentis", "delegation.prepared", "委托", attempt_id="attempt-1", refs=[prompt])
+        long_message = "已完成。" + "细节" * 100
+        message = w.archive_executor_message("attempt-1", long_message)
+        w.emit("executor", "executor.item", "最终消息：「已完成。细节…」",
+               attempt_id="attempt-1", refs=[message])
+        w.emit("executor", "executor.item", "最终消息：「旧版截断内容」",
+               attempt_id="attempt-1")
+        view = render_conversation(run_dir)
+        self.assertIn("确切指令全文", view)
+        self.assertIn(long_message, view)
+        self.assertIn("仅存事件摘要，可能已截断", view)
+        from mentis.trace_export import export_timeline
+        export_path = self.root / "share.json"
+        export_timeline(run_dir, export_path)
+        self.assertNotIn(long_message, export_path.read_text(encoding="utf-8"))
+        Path(message["path"]).write_text("被改动", encoding="utf-8")
+        self.assertIn("哈希不匹配", render_conversation(run_dir))
+        self.assertEqual(len(load_events(run_dir)), 3)  # 视图不回填事件
+
+    def test_public_message_archive_failure_marks_trace_incomplete(self):
+        w = TraceWriter(self.root / "run", "run-x")
+        blocked = w.trace_dir / "blocked"
+        blocked.write_text("file", encoding="utf-8")
+        w.messages_dir = blocked  # mkdir 遇到同名文件
+        self.assertIsNone(w.archive_executor_message("attempt-1", "公开回复"))
+        self.assertFalse(w.finalize()["integrity"]["events_complete"])
 
     def test_manifest_integrity_and_delegations(self):
         run_dir = self.root / "run"
@@ -182,6 +224,21 @@ class TraceIntegrationTests(unittest.TestCase):
         self.assertIn("事后回放（T1）", timeline)
         self.assertIn("当前核验：**通过**", timeline)
         self.assertIn("delegation.prepared", timeline)
+
+    def test_run_report_opens_exact_exchange_without_native_rollout(self):
+        collab = make_collab(adapter=PublicMessageAdapter(behavior={"first": "good"}),
+                             base_dir=self.root / "collab")
+        self.assertEqual(collab.run(), "DELIVERED")
+        view_path = collab.run_dir / "conversation.md"
+        view = view_path.read_text(encoding="utf-8")
+        self.assertIn(collab.adapter.prompts[0], view)
+        self.assertIn("清理步骤被拦截，临时目录仍在。", view)
+        self.assertIn("conversation.md", (collab.run_dir / "report.md").read_text(encoding="utf-8"))
+        messages = [r for e in load_events(collab.run_dir) for r in e.get("refs", [])
+                    if r.get("role") == "executor_message"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["sha256"], hashlib.sha256(
+            "初稿已完成。\n清理步骤被拦截，临时目录仍在。".encode("utf-8")).hexdigest())
 
     def test_prompt_archive_failure_blocks_delegation(self):
         """契约 §1：prompt 落盘失败 → 不发起委托，尝试按失败记录并留痕。"""

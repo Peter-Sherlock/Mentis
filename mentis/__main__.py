@@ -31,6 +31,7 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis field-start    P5.2a 真实使用会话：自然语言目标→委托→三入口→使用记录
   python -m mentis field-feedback 查看作品后补记逐字反馈（绑定该运行的会话记录）
   python -m mentis trace           P2.4 事后回放 / --follow 实时旁观（只读）/ --export 导出白名单时间线
+  python -m mentis conversation    本地交流视图：确切委托、Codex 公开回复与动作摘要（只读）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -104,6 +105,8 @@ def main(argv=None) -> int:
     tr.add_argument("--export", nargs="?", const="trace-export.json", default="", metavar="路径",
                     help="T3 导出白名单时间线 JSON（默认 trace-export.json；不含 prompt 原文/"
                          "用户逐字反馈/密钥字段；历史运行导出材料清单+缺口，不回填）")
+    conversation = sub.add_parser("conversation", help="本地交流视图（确切指令、公开回复与动作摘要；只读）")
+    conversation.add_argument("--run", required=True, help="运行目录（runtime/collab/<ID> 或 runtime/guidance/<ID>）")
     args = parser.parse_args(argv)
 
     if args.command == "demo-contract":
@@ -195,6 +198,17 @@ def main(argv=None) -> int:
             follow_timeline(run_dir)
         else:
             print(render_timeline(run_dir))
+        return 0
+    if args.command == "conversation":
+        from mentis.trace import render_conversation
+
+        run_dir = Path(args.run)
+        if not run_dir.is_dir():
+            print(f"运行目录不存在：{run_dir.resolve()}", file=sys.stderr)
+            return 2
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")  # 确切指令可能含 ¥ 等本机 GBK 不可编码字符
+        print(render_conversation(run_dir))
         return 0
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())

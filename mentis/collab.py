@@ -316,10 +316,15 @@ class Collaboration:
                 kind = str(event.get("type", "?"))
                 item = event.get("item") if isinstance(event.get("item"), dict) else {}
                 itype = str(item.get("type", ""))
+                refs = []
                 if itype == "command_execution":
                     detail = f"命令 {str(item.get('command', ''))[:140]}（{item.get('status', '')}）"
                 elif kind == "item.completed" and itype == "agent_message":
                     detail = f"最终消息：「{str(item.get('text', ''))[:160]}」"
+                    message_ref = self.trace.archive_executor_message(
+                        attempt.attempt_id, str(item.get("text", "")))
+                    if message_ref is not None:
+                        refs.append(message_ref)
                 elif itype == "reasoning":
                     detail = "推理条目（内容不入默认层）"
                 else:
@@ -328,7 +333,7 @@ class Collaboration:
                     detail = f"首事件延迟 {meta.get('first_event_latency_s', 0):.1f}s；" + detail
                 self.trace.emit("executor", "executor.started" if meta.get("first") else "executor.item",
                                 detail, attempt_id=attempt.attempt_id, brief_version=brief_version,
-                                native_thread_id=self.thread_id or None, status="pending")
+                                native_thread_id=self.thread_id or None, status="pending", refs=refs)
             except Exception:
                 pass
 
@@ -951,6 +956,14 @@ class Collaboration:
         }
         (self.run_dir / "state.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        from mentis.trace import render_conversation
+        self._conversation_ready = False
+        try:
+            (self.run_dir / "conversation.md").write_text(
+                render_conversation(self.run_dir), encoding="utf-8")
+            self._conversation_ready = True
+        except OSError:
+            pass  # 派生视图失败不改写执行结局；原始 trace 仍可回放
         (self.run_dir / "report.md").write_text(
             self.render_report(meta, browser_obs), encoding="utf-8")
 
@@ -996,6 +1009,11 @@ class Collaboration:
                 lines.append(f"- 修订前快照：`{snap.resolve()}`（旧版产物本体，可与当前版本对照）")
         lines.append("")
         lines.append("## 看依据")
+        if getattr(self, "_conversation_ready", False):
+            lines.append(f"- Mentis 与 Codex 的可见交流：`{(self.run_dir / 'conversation.md').resolve()}`"
+                         "（确切委托、公开回复与动作摘要；本地私有，不含内部推理）")
+        else:
+            lines.append("- 交流视图未生成；可从 trace/events.jsonl 与 trace/prompts/ 核对。")
         lines.append("- 授权：exec-workspace（user-cli-invocation）；策略代决范围："
                      + "；".join(self.session.current_policy.decided_scope))
         for q in self.question_routes:

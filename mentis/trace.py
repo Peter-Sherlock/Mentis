@@ -77,6 +77,7 @@ class TraceWriter:
         self.run_dir = Path(run_dir)
         self.trace_dir = self.run_dir / "trace"
         self.prompts_dir = self.trace_dir / "prompts"
+        self.messages_dir = self.trace_dir / "messages"
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.prompts_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.trace_dir / "events.jsonl"
@@ -141,6 +142,22 @@ class TraceWriter:
             raise TraceArchiveError(
                 f"prompt 落盘失败（{type(exc).__name__}）：本次委托不发起") from exc
         return {"path": str(prompt_path), "sha256": sha, "role": "prompt"}
+
+    def archive_executor_message(self, attempt_id: str, message_text: str) -> dict | None:
+        """保存 Codex 对外消息全文；失败只降低追踪完整性，不中断执行器。"""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", attempt_id):
+            self.write_failures += 1
+            return None
+        payload = message_text.encode("utf-8")
+        sha = hashlib.sha256(payload).hexdigest()
+        path = self.messages_dir / f"{attempt_id}-{sha}.md"
+        try:
+            self.messages_dir.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        except OSError:
+            self.write_failures += 1
+            return None
+        return {"path": str(path), "sha256": sha, "role": "executor_message"}
 
     # ---- 委托台账（manifest 用，从事件重建以兼容续接） ----
 
@@ -450,6 +467,91 @@ def render_timeline(run_dir) -> str:
             prev_time = e.get("time_utc")
     lines.append("")
     return "\n".join(lines)
+
+
+def _verified_exchange_text(run_dir: Path, ref: dict, role: str) -> tuple[str | None, str]:
+    """交流视图只读取本运行 trace/ 内且哈希匹配的文本。"""
+    if not isinstance(ref, dict) or ref.get("role") != role:
+        return None, "引用缺失"
+    raw_path = ref.get("path")
+    expected = ref.get("sha256")
+    if not isinstance(raw_path, str) or not isinstance(expected, str):
+        return None, "引用路径或哈希缺失"
+    path = _resolve_ref(run_dir, raw_path).resolve()
+    if not path.is_relative_to((run_dir / "trace").resolve()):
+        return None, "引用不在本运行 trace/ 内"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None, "引用文件缺失"
+    if hashlib.sha256(data).hexdigest() != expected:
+        return None, "引用文件哈希不匹配"
+    try:
+        return data.decode("utf-8"), ""
+    except UnicodeError:
+        return None, "引用文件不是 UTF-8 文本"
+
+
+def _literal_block(value: str) -> str:
+    """Markdown 中保留公开消息原文，包括其中可能出现的反引号。"""
+    fence = "```"
+    while fence in value:
+        fence += "`"
+    return f"{fence}text\n{value}\n{fence}"
+
+
+def render_conversation(run_dir) -> str:
+    """本地可见交流：确切委托、执行器公开消息与动作摘要；不解析原生 rollout。"""
+    run_dir = Path(run_dir)
+    events = load_events(run_dir)
+    lines = [f"# Mentis 与 Codex 的可见交流：{run_dir.name}", "",
+             "本地只读视图；依现存追踪文件生成，不增补原始事件。"
+             "仅含发送给执行器的指令、执行器对外消息和有界动作摘要；"
+             "不含内部推理或原生命令输出。", ""]
+    if not events:
+        lines += ["该运行没有可回放的事件流；不能据此重建交流。", ""]
+        return "\n".join(lines)
+    lines.append(f"原始事件 {len(events)} 条；来源 `trace/events.jsonl`。"
+                 "凡只留有摘要或引用损坏之处均逐项标明。")
+    lines.append("")
+    for event in events:
+        seq = event.get("seq", "?")
+        kind = event.get("kind", "?")
+        source = event.get("source", "?")
+        attempt = event.get("attempt_id") or "-"
+        summary = str(event.get("summary", ""))
+        refs = event.get("refs") if isinstance(event.get("refs"), list) else []
+        if kind == "delegation.prepared" and event.get("status") == "ok":
+            ref = next((r for r in refs if isinstance(r, dict) and r.get("role") == "prompt"), None)
+            message, error = _verified_exchange_text(run_dir, ref, "prompt")
+            lines.append(f"## [{seq}] Mentis 发给 Codex｜{attempt}｜brief v{event.get('brief_version') or '?'}")
+            if message is None:
+                lines.append(f"确切指令不可读取：{error}。仅有事件摘要：{summary}")
+            else:
+                lines.append(f"确切发送指令；SHA-256 `{ref['sha256']}`：\n\n{_literal_block(message)}")
+            lines.append("")
+        elif source == "executor" and kind in ("executor.started", "executor.item"):
+            ref = next((r for r in refs if isinstance(r, dict) and r.get("role") == "executor_message"), None)
+            if ref is not None:
+                message, error = _verified_exchange_text(run_dir, ref, "executor_message")
+                lines.append(f"## [{seq}] Codex 回复 Mentis｜{attempt}")
+                if message is None:
+                    lines.append(f"公开消息全文不可读取：{error}。事件摘要：{summary}")
+                else:
+                    lines.append(f"公开消息原文；SHA-256 `{ref['sha256']}`：\n\n{_literal_block(message)}")
+                lines.append("")
+            elif "最终消息：「" in summary:
+                lines += [f"## [{seq}] Codex 回复 Mentis｜{attempt}",
+                          "**仅存事件摘要，可能已截断；不能当作完整回复。**",
+                          _literal_block(summary), ""]
+            else:
+                lines.append(f"- [{seq}] Codex 动作：{summary}（事件摘要）")
+        elif source == "mentis" and kind in ("review.recorded", "executor.confirmed",
+                                                "run.resumed", "run.finalized"):
+            lines += ["", f"## [{seq}] Mentis｜{kind}", summary, ""]
+        elif source == "executor" and kind == "executor.completed":
+            lines += ["", f"## [{seq}] Codex 终态", summary, ""]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _gap_seconds(start: str | None, end: str | None) -> float | None:
