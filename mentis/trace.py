@@ -513,6 +513,10 @@ def render_conversation(run_dir) -> str:
         return "\n".join(lines)
     lines.append(f"原始事件 {len(events)} 条；来源 `trace/events.jsonl`。"
                  "凡只留有摘要或引用损坏之处均逐项标明。")
+    delegations = sum(1 for e in events if e.get("kind") == "delegation.prepared"
+                      and e.get("status") == "ok")
+    lines.append(f"本运行记录到 {delegations} 次委托；同一委托中的多条 Codex 消息是进度或结果，"
+                 "不表示 Mentis 在这些消息之间逐条回复。")
     lines.append("")
     for event in events:
         seq = event.get("seq", "?")
