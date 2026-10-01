@@ -81,18 +81,55 @@ class CodexTaskResult:
     first_event_latency_s: float = 0.0  # 进程启动 → 首个可解析事件（T2 实测记录用）
     stderr_tail: str = ""               # 独立收集的 stderr 尾部（诊断用，有界）
     native_error: str = ""              # 执行器原生 error/turn.failed 消息（T3：原文有界保留）
+    # stdin 发送状态（E1 补修）：sent=全部写入并关闭；broken_pipe=子进程提前关闭；
+    # error=其他写入错误；incomplete=截止时间内未写完；not_applicable=无 prompt。
+    # 非 sent 时指令未确认完整送达，执行结果一律不可判 completed。
+    stdin_status: str = "not_applicable"
+    stdin_error: str = ""
 
 
 class _PopenStream:
-    """T2 真实逐行流：stdout 队列线程 + stderr 独立线程；超时杀进程（锁由调用方保留）。"""
+    """T2 真实逐行流：stdout 队列线程 + stderr 独立线程 + stdin 发送线程。
 
-    def __init__(self, command, cwd, env, timeout_s):
-        self._timeout_s = timeout_s
+    启动、stdin 发送与事件读取共用同一个绝对截止时间：子进程不读 stdin 时，
+    发送线程会阻塞在管道写上，由主流程在截止时间杀进程树来解除阻塞，
+    发送不允许无限阻塞执行器超时。超时用 taskkill /F /T 杀整棵进程树——
+    Windows 上 .cmd 包装进程退出不代表 node/codex 子进程退出。
+    """
+
+    def __init__(self, command, cwd, env, timeout_s, stdin_bytes: bytes = b""):
+        self._deadline = time.monotonic() + max(timeout_s, 1)
         self.proc = subprocess.Popen(command, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self._q = queue.Queue()
         self._stderr = []
         self.timed_out = False
+        # stdin 发送状态：sent 全部写入；broken_pipe 子进程提前关闭管道；
+        # error 其他 OSError；incomplete 到截止时仍未写完（指令未完整送达，
+        # 任何"完成"都不可信，由调用方按 unknown 处理）。
+        self.stdin_status = "pending"
+        self.stdin_error = ""
+        self.stdin_bytes_written = 0
+        self._stdin_done = threading.Event()
+
+        def send_stdin():
+            try:
+                written = 0
+                view = memoryview(stdin_bytes)
+                while written < len(stdin_bytes):
+                    chunk = self.proc.stdin.write(view[written:])
+                    written += chunk if chunk else len(view[written:])
+                    self.stdin_bytes_written = written
+                self.proc.stdin.close()
+                self.stdin_status = "sent"
+            except BrokenPipeError as exc:
+                self.stdin_status = "broken_pipe"
+                self.stdin_error = f"{type(exc).__name__}: {exc}"
+            except OSError as exc:
+                self.stdin_status = "error"
+                self.stdin_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                self._stdin_done.set()
 
         def pump_out():
             try:
@@ -109,16 +146,36 @@ class _PopenStream:
             except Exception:
                 pass
 
+        if stdin_bytes:
+            threading.Thread(target=send_stdin, daemon=True).start()
+        else:
+            self._stdin_done.set()
+            self.stdin_status = "not_applicable"
         threading.Thread(target=pump_out, daemon=True).start()
         threading.Thread(target=pump_err, daemon=True).start()
 
+    def wait_stdin(self) -> str:
+        """等待 stdin 发送结束（截止时间内）；未完成返回 incomplete。"""
+        remaining = self._deadline - time.monotonic()
+        self._stdin_done.wait(timeout=max(remaining, 0.1))
+        if not self._stdin_done.is_set():
+            self.stdin_status = "incomplete"
+            self.stdin_error = "stdin 发送超过共享截止时间仍未完成"
+        return self.stdin_status
+
+    def _kill_tree(self):
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                           capture_output=True, timeout=15)
+        else:
+            self.proc.kill()
+
     def lines(self):
-        deadline = time.monotonic() + self._timeout_s
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 self.timed_out = True
-                self.proc.kill()
+                self._kill_tree()
                 return
             try:
                 raw = self._q.get(timeout=min(remaining, 0.5))
@@ -129,14 +186,23 @@ class _PopenStream:
             yield raw.decode("utf-8", errors="replace").rstrip("\r\n")
 
     def finish(self, grace_s: int = 15):
+        if self.timed_out:
+            self._kill_tree()
         try:
-            self.proc.wait(timeout=grace_s)
+            self.proc.wait(timeout=grace_s if not self.timed_out else 10)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
+            self._kill_tree()
             try:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
+        finally:
+            for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                try:
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+                except OSError:
+                    pass
         time.sleep(0.2)  # stderr 线程补收
         stderr = b"".join(self._stderr).decode("utf-8", errors="replace")
         return (self.proc.returncode if self.proc.returncode is not None else -1), stderr
@@ -157,6 +223,7 @@ class CodexCliAdapter:
         self.lock_dir = Path(lock_dir)
         self.runner = runner or subprocess.run
         self._runner_injected = runner is not None  # 注入 runner 走兼容路径；默认走 T2 逐行流
+        self._default_stream_path = stream_factory is None  # bound method 每次访问都是新对象，不能靠 is 判断
         self.stream_factory = stream_factory or self._default_stream
         if cli_version:
             self.cli_version = cli_version
@@ -237,6 +304,9 @@ class CodexCliAdapter:
             if timed_out:
                 # 超时：状态 unknown、锁保留；已到达的事件保留用于核对与续接
                 result.error = "Codex turn 超时；执行器是否仍在写入未知，禁止自动重试"
+                if result.stdin_status not in ("sent", "not_applicable"):
+                    result.error += (f"；stdin 发送状态 {result.stdin_status}，"
+                                     f"指令未确认完整送达（{result.stdin_error or '无原始错误'}）")
                 return result
         finally:
             # timeout 的子进程/文件状态可能尚未可判定，故意保留锁。
@@ -263,46 +333,58 @@ class CodexCliAdapter:
                 partial = partial.decode("utf-8", errors="replace")
             for line in partial.splitlines():
                 self._process_event_line(line, result, spec.on_event)
+            result.stdin_status = "incomplete"
+            result.stdin_error = "runner 路径 stdin 写入未在超时前完成"
             return True
         except OSError as exc:
             result.status = AttemptStatus.FAILED
             result.error = f"Codex 进程启动失败: {type(exc).__name__}"
+            result.stdin_status = "error"
+            result.stdin_error = f"{type(exc).__name__}: {exc}"
             return False
+        result.stdin_status = "sent"
         for line in (completed.stdout or "").splitlines():
             self._process_event_line(line, result, spec.on_event)
         result.stderr_tail = (completed.stderr or "")[-500:]
         self._classify(result, spec, expected_thread_id, root, completed.returncode)
         return False
 
-    def _feed_stdin(self, stream, prompt: str) -> None:
-        """真实流路径：启动后立即写入 prompt 并关闭管道（官方 "-" 约定）。"""
-        stdin = getattr(getattr(stream, "proc", None), "stdin", None)
-        if stdin is None or stdin.closed:
-            return  # 注入的测试流不承载 stdin
-        try:
-            stdin.write(prompt.encode("utf-8"))
-            stdin.close()
-        except OSError:
-            pass
-
     def _run_streaming(self, command, spec, root, result, child_env,
                        expected_thread_id) -> bool:
         """T2 真实路径：逐行消费 stdout（不等待 turn 结束），独立收集 stderr。"""
         started = time.monotonic()
         try:
-            stream = self.stream_factory(command, root, child_env, spec.timeout_s)
+            if self._default_stream_path:
+                stream = self._default_stream(command, root, child_env, spec.timeout_s,
+                                              spec.prompt.encode("utf-8"))
+            else:
+                stream = self.stream_factory(command, root, child_env, spec.timeout_s)
         except OSError as exc:
             result.status = AttemptStatus.FAILED
             result.error = f"Codex 进程启动失败: {type(exc).__name__}"
+            result.stdin_status = "error"
+            result.stdin_error = f"{type(exc).__name__}: {exc}"
             return False
-        self._feed_stdin(stream, spec.prompt)
+        # 与事件读取共享同一绝对截止时间；发送未完成时不提前消费事件。
+        # 注入的测试流（T2/T3 夹具）不建模 stdin，按 not_applicable 处理。
+        wait_stdin = getattr(stream, "wait_stdin", None)
+        result.stdin_status = wait_stdin() if callable(wait_stdin) else "not_applicable"
+        result.stdin_error = getattr(stream, "stdin_error", "")
         for line in stream.lines():
             self._process_event_line(line, result, spec.on_event, started=started)
         returncode, stderr_text = stream.finish()
         result.stderr_tail = (stderr_text or "")[-500:]
         if stream.timed_out:
+            result.stdin_error = result.stdin_error or (
+                "incomplete：共享截止时间内未完成" if result.stdin_status != "sent" else "")
             return True
         self._classify(result, spec, expected_thread_id, root, returncode)
+        if result.stdin_status not in ("sent", "not_applicable"):
+            # 指令未确认完整送达（broken_pipe/error/incomplete）：任何"完成"都不可信，
+            # 按 unknown 保锁处理，不自动重发；原始错误保留在 stdin_error。
+            result.status = AttemptStatus.UNKNOWN
+            result.error = (f"stdin 发送状态 {result.stdin_status}，指令未确认完整送达"
+                            f"（{result.stdin_error or '无原始错误'}）；结果不可判，需核对")
         return False
 
     def _classify(self, result, spec, expected_thread_id, root, returncode):
@@ -343,8 +425,8 @@ class CodexCliAdapter:
             if result.native_error:
                 result.error += f"；执行器报错：{result.native_error[:200]}"
 
-    def _default_stream(self, command, cwd, env, timeout_s):
-        return _PopenStream(command, cwd, env, timeout_s)
+    def _default_stream(self, command, cwd, env, timeout_s, stdin_bytes: bytes = b""):
+        return _PopenStream(command, cwd, env, timeout_s, stdin_bytes)
 
     def _process_event_line(self, line: str, result: CodexTaskResult, on_event,
                             started: float | None = None) -> None:

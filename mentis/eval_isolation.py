@@ -1,14 +1,18 @@
-"""E1 运行端答案读隔离：Windows deny ACL 隔离窗口 + 双端真实探测 + 准入校验。
+"""E1 运行端答案读隔离：deny ACL 事务窗口 + 确定性双端探针 + 强绑定准入。
 
 诚实边界：
-- 机制是操作系统级 deny ACE（icacls），对同用户子进程（受测 Mentis 环境）和
-  受测 Codex 子进程一并生效；junction/绝对路径/父目录遍历由真实探测验证。
-- deny 不防对抗性绕过：同用户属主始终保留 WRITE_DAC，可自行解除 deny
-  （这是本方案与"独立运行身份"的差距，作为限制如实记录）。
-- 探测通过只证明"窗口开启时受保护文件读不到"；不证明提示词服从、
-  不证明模型不试图读取，也不构成任何效果结论。
-- 离线夹具只证明本模块逻辑；准入判定永远要求真实探测证据 + 当前
-  活动窗口（受保护路径此刻实际读不到）。
+- 机制是操作系统级 deny ACE（icacls 单次调用写全部账户），对同用户子进程
+  （受测 Mentis 环境）和受测 Codex 子进程一并生效；绝对路径/父目录遍历/
+  junction/git 历史由确定性探针在双端真实执行环境验证。
+- 窗口是可恢复事务：首次修改前原子落盘恢复日志（window_id + 每个目标的
+  Get-Acl XML 原档 + 属主 + icacls dump）；release 用原 DACL 恢复并逐项
+  核对一致性；恢复失败逐项报告，绝不返回"已恢复"。
+- 金丝雀与目标预检只是风险预检（降低锁死概率），不保证永不锁死。
+- deny 不防对抗性绕过：同用户属主保留 WRITE_DAC 可自行改 ACL。
+- 探针区分权限拒绝、文件不存在、命令错误、链接创建失败四类结果；
+  只有真实"权限拒绝"计入隔离通过；意外读到内容只记录指纹。
+- 准入绑定 suite/prepared/组/工作区/输入哈希/探针版本/执行器版本与配置/
+  window_id/原始记录哈希，并重验双端结果与当前窗口；缺任一即未就绪。
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import subprocess
 import sys
@@ -25,10 +29,14 @@ from uuid import uuid4
 
 # 探测证据的保鲜期：过期后准入必须重新探测，不能拿旧窗口的证据开新运行。
 DEFAULT_TTL_S = 12 * 3600
-# 本机 Codex CLI Windows 沙箱使用的本地账户/组；存在则一并 deny（不存在则跳过并记录）。
-# 仅 deny CodexSandboxUsers 不够：其成员身份（Offline/Online）可能不在令牌中携带父组 SID。
+# 本机 Codex CLI Windows 沙箱使用的本地账户/组；存在则一并 deny。
 EXTRA_DENY_ACCOUNTS = ("CodexSandboxUsers", "CodexSandboxOffline", "CodexSandboxOnline")
-ISO_SCHEMA = "mentis-eval-isolation/1"
+ISO_SCHEMA = "mentis-eval-isolation/2"
+PROBE_SCHEMA = "mentis-eval-probe/1"
+# 探针逻辑版本：变化后旧证据一律失效，必须重新探测。
+PROBE_VERSION = "e1-probe/2"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+WINDOW_LOCK_DIR = _REPO_ROOT / "runtime" / "evaluation" / "window-locks"
 
 
 class IsolationError(RuntimeError):
@@ -67,6 +75,18 @@ def _icacls(args: list[str]) -> subprocess.CompletedProcess:
     return proc
 
 
+def _icacls_dump(path: Path) -> str:
+    proc = subprocess.run(["icacls", str(path)], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=30)
+    if proc.returncode != 0:
+        raise IsolationError(f"icacls 读取 ACL 失败: {path}: {(proc.stdout + proc.stderr)[:150]}")
+    return proc.stdout.replace("\r", "").strip()
+
+
+def _normalize_dump(text: str) -> str:
+    return "\n".join(line.rstrip() for line in text.replace("\r", "").split("\n")).strip()
+
+
 def _account_exists(name: str) -> bool:
     for tool in ("localgroup", "user"):
         proc = subprocess.run(["net", tool, name], capture_output=True, text=True,
@@ -84,7 +104,7 @@ def _deny_accounts() -> list[str]:
 
 
 def _deny_switches(accounts: list[str], is_dir: bool) -> list[str]:
-    """所有账户的 deny 写进同一次 icacls 调用：deny 生效后再开第二次
+    """所有账户的 deny 写进同一次 icacls 调用：deny 生效后再开第二条
     DACL 写句柄会被自己的 deny 拒绝（实测退出码 5）。"""
     spec = ":(OI)(CI)F" if is_dir else ":F"
     return [switch for account in accounts
@@ -107,15 +127,78 @@ def _readable(path: Path) -> bool:
         return False
 
 
+# ---------------------------------------------------------------- ACL 事务
+
+# PowerShell 是本运行依赖：Get-Acl/Export-Clixml 捕获原 DACL，Set-Acl 在 deny
+# 生效期间按原档恢复（icacls /restore 需要 SeRestorePrivilege，非提权不可用）。
+_CAPTURE_PS = r'''param([string]$ListFile, [string]$OutFile)
+$ErrorActionPreference = "Continue"
+$items = Get-Content -LiteralPath $ListFile -Encoding UTF8 -Raw | ConvertFrom-Json
+$results = @()
+foreach ($it in $items) {
+  try {
+    $a = Get-Acl -LiteralPath $it.path
+    $a | Export-Clixml -LiteralPath $it.xml
+    $results += [PSCustomObject]@{ path = $it.path; ok = $true; owner = $a.Owner }
+  } catch {
+    $results += [PSCustomObject]@{ path = $it.path; ok = $false; error = $_.Exception.Message }
+  }
+}
+$results | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $OutFile -Encoding utf8
+'''
+
+_RESTORE_PS = r'''param([string]$ListFile, [string]$OutFile)
+$ErrorActionPreference = "Continue"
+$items = Get-Content -LiteralPath $ListFile -Encoding UTF8 -Raw | ConvertFrom-Json
+$results = @()
+foreach ($it in $items) {
+  try {
+    $a = Import-Clixml -LiteralPath $it.xml
+    Set-Acl -LiteralPath $it.path -AclObject $a
+    $results += [PSCustomObject]@{ path = $it.path; ok = $true; error = "" }
+  } catch {
+    $results += [PSCustomObject]@{ path = $it.path; ok = $false; error = $_.Exception.Message }
+  }
+}
+$results | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $OutFile -Encoding utf8
+'''
+
+
+def _run_ps_script(script_path: Path, list_file: Path, out_file: Path) -> list[dict]:
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+         str(script_path), "-ListFile", str(list_file), "-OutFile", str(out_file)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    if not out_file.is_file():
+        raise IsolationError(
+            f"ACL 脚本未产出结果（rc={proc.returncode}）：{(proc.stdout + proc.stderr)[:200]}")
+    payload = json.loads(out_file.read_text(encoding="utf-8-sig"))
+    return payload if isinstance(payload, list) else [payload]
+
+
+def _single_restore_list(wdir: Path, target: dict) -> Path:
+    """单目标恢复清单（排练用）。"""
+    list_file = wdir / f"rehearse-{uuid4().hex[:8]}.json"
+    list_file.write_text(json.dumps(
+        [{"path": target["path"], "xml": str(wdir / target["acl_xml"])}],
+        ensure_ascii=False, indent=2), encoding="utf-8-sig")
+    return list_file
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _canary_check(parent: Path, accounts: list[str]) -> None:
-    """开窗预检：在目标同父目录（同一 ACL 世系）上验证 deny 可生效且可解除。
+    """风险预检（非保证）：在目标同父目录验证 deny 可生效且可解除。
 
     Python 3.14 tempfile 根带 OWNER RIGHTS ACE，其下 deny 生效后会同时
-    压掉属主隐式 WRITE_DAC——同用户无法解除。金丝雀在任何真实路径
-    被改动之前暴露这种环境，避免把仓库或评测目录锁死。
+    压掉属主 WRITE_DAC——金丝雀提前暴露这种环境，但不能保证真实目标
+    一定无锁死风险（属主/权限差异仍以目标预检与恢复日志为准）。
     """
     canary = parent / f"_iso-canary-{uuid4().hex[:8]}"
-    stuck = False
     try:
         canary.mkdir()
         secret = canary / "secret.txt"
@@ -128,64 +211,236 @@ def _canary_check(parent: Path, accounts: list[str]) -> None:
             pass
         _icacls([canary, *_remove_switches(accounts)])
         if not _readable(secret):
-            stuck = True
             raise IsolationError(
-                f"金丝雀 deny 无法解除（该目录 ACL 世系会在 deny 后锁死属主，"
-                f"典型如 Python tempfile 的 OWNER RIGHTS），已放弃开窗；"
+                f"金丝雀 deny 无法解除（该目录 ACL 世系存在锁死风险），已放弃开窗；"
                 f"可能残留金丝雀目录需手工清理: {canary}")
     finally:
         shutil.rmtree(canary, ignore_errors=True)
 
 
-def protected_manifest(suite_path: Path, prepared_dir: Path, target_arm: str) -> list[Path]:
-    """从 prepare-report 推导受保护清单：套件目录 + 身份映射 + 除目标组外的全部输入包。
+def _assert_no_overlapping_window(protected: list[Path]) -> None:
+    """共享保护范围互斥（前置检查）：与任何活动窗口的受保护路径相交时拒绝开窗，
+    防止并发窗口互相覆盖、一次 release 解除另一次运行的保护。"""
+    WINDOW_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    for existing in WINDOW_LOCK_DIR.glob("window-*.json"):
+        try:
+            other = json.loads(existing.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        overlap = set(other.get("protected", [])) & {str(p) for p in protected}
+        if overlap:
+            raise IsolationError(
+                f"已有活动隔离窗口覆盖相同受保护路径（{existing.name}，"
+                f"交集 {len(overlap)} 项）；先 release 该窗口或人工核对后再开窗")
 
-    必须在窗口开启前调用（需要读取 prepare-report.json）。
-    目标组目录本身不保护（运行组需要读写它）。
+
+def _register_lock(window_id: str, protected: list[str], window_dir: Path) -> Path:
+    """登记窗口锁（互斥已在开窗前置检查）；锁内记录 window_dir，
+    进程崩溃后仍可按恢复日志事务回滚。"""
+    WINDOW_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock = WINDOW_LOCK_DIR / f"window-{window_id}.json"
+    try:
+        with lock.open("x", encoding="utf-8") as fh:
+            json.dump({"window_id": window_id, "protected": protected,
+                       "window_dir": str(window_dir),
+                       "created_at": _iso(_utcnow())}, fh, ensure_ascii=False, indent=2)
+    except FileExistsError as exc:
+        raise IsolationError(f"窗口锁已存在: {lock}") from exc
+    return lock
+
+
+def _release_lock(window_id: str) -> None:
+    lock = WINDOW_LOCK_DIR / f"window-{window_id}.json"
+    if lock.is_file():
+        try:
+            payload = json.loads(lock.read_text(encoding="utf-8"))
+            if payload.get("window_id") != window_id:
+                raise IsolationError(f"窗口锁 window_id 不匹配，拒绝解除: {lock}")
+        except json.JSONDecodeError:
+            pass
+        lock.unlink(missing_ok=True)
+
+
+def _prepare_recovery(protected: list[Path], accounts: list[str],
+                      isolation_dir: Path, extra: dict) -> dict:
+    """首次权限修改前的全部准备：原 DACL 存档、属主、dump、目标预检、原子日志。
+
+    任何一步失败都在改动任何 ACL 之前抛出；返回恢复日志（已含 window_id）。
     """
-    suite_path, prepared_dir = Path(suite_path), Path(prepared_dir)
-    report = json.loads((prepared_dir / "prepare-report.json").read_text(encoding="utf-8"))
-    arms = {arm["path"] for row in report["packages"] for arm in row["arms"]}
-    if target_arm not in arms:
-        raise IsolationError(f"target_arm 不在 prepare-report 中: {target_arm}")
-    protected = [suite_path.parent.resolve(), (prepared_dir / "prepare-report.json").resolve()]
-    for row in report["packages"]:
-        for arm in row["arms"]:
-            if arm["path"] == target_arm:
-                continue
-            protected.append((prepared_dir / arm["path"]).resolve())
-    return protected
-
-
-_PREFERRED_PROBES = ("reviewer.json", "suite.json", "prepare-report.json",
-                     "input.json", "prompt.md")
-
-
-def verification_targets(protected: list[Path]) -> list[dict]:
-    """deny 之前记录每个受保护路径的"可读性验证点"（文件本身；目录取代表性文件）。
-
-    deny 之后无法再列举目录内容，验证点必须在窗口开启前固定下来；
-    它们同时是双端探测的反向目标。目录代表文件优先取敏感文件
-    （reviewer.json/suite.json/input.json…），使证据直接针对答案载体。
-    """
-    targets = []
+    protected = [Path(p).resolve() for p in protected]
     for path in protected:
-        path = Path(path)
-        if path.is_file():
-            targets.append({"protected": str(path), "probe": str(path),
-                            "sha256_at_apply": _sha_file(path), "kind": "file"})
-        elif path.is_dir():
-            children = sorted(p for p in path.rglob("*") if p.is_file())
-            child = next((p for p in children
-                          if p.name.casefold() in _PREFERRED_PROBES), None)
-            child = child or (children[0] if children else None)
-            if child is None:
-                raise IsolationError(f"受保护目录没有可验证的文件: {path}")
-            targets.append({"protected": str(path), "probe": str(child),
-                            "sha256_at_apply": _sha_file(child), "kind": "dir"})
+        if not _readable(path):
+            raise IsolationError(f"受保护路径当前不可读（窗口可能已开启）: {path}")
+    window_id = uuid4().hex
+    wdir = isolation_dir / f"window-{window_id}"
+    wdir.mkdir(parents=True)
+    capture_ps = wdir / "acl-capture.ps1"
+    restore_ps = wdir / "acl-restore.ps1"
+    capture_ps.write_text(_CAPTURE_PS, encoding="utf-8-sig")
+    restore_ps.write_text(_RESTORE_PS, encoding="utf-8-sig")
+    list_payload = [{"path": str(p), "xml": str(wdir / f"acl-{i:02d}.xml")}
+                    for i, p in enumerate(protected)]
+    list_file = wdir / "acl-list.json"
+    list_file.write_text(json.dumps(list_payload, ensure_ascii=False, indent=2),
+                         encoding="utf-8-sig")
+    capture_out = wdir / "acl-capture-result.json"
+    captures = {row["path"]: row for row in _run_ps_script(capture_ps, list_file, capture_out)}
+    targets = []
+    for i, path in enumerate(protected):
+        row = captures.get(str(path))
+        if row is None or not row.get("ok"):
+            raise IsolationError(
+                f"目标原 DACL 捕获失败，未做任何权限修改: {path}: "
+                f"{(row or {}).get('error', '无记录')}")
+        xml = Path(list_payload[i]["xml"])
+        if not xml.is_file() or xml.stat().st_size == 0:
+            raise IsolationError(f"原 DACL XML 未落盘，未做任何权限修改: {path}")
+        targets.append({
+            "path": str(path), "kind": "dir" if path.is_dir() else "file",
+            "acl_xml": xml.name, "owner": row.get("owner", ""),
+            "dump": _icacls_dump(path),
+        })
+    # 目标恢复能力预检：把刚捕获的原档 Set-Acl 回去（无语义变化），证明
+    # 恢复机制在实际目标上成立；随后对每个目标做一次真实 deny 排练
+    # （deny→验证拒读→原档恢复→dump 一致），确保正式开窗前 modify+restore
+    # 两个方向都被实测过。任何失败都在改动前中止（逐项恢复后抛出）。
+    precheck_out = wdir / "acl-precheck-result.json"
+    prechecks = {row["path"]: row for row in _run_ps_script(restore_ps, list_file, precheck_out)}
+    for target in targets:
+        row = prechecks.get(target["path"])
+        if row is None or not row.get("ok"):
+            raise IsolationError(
+                f"目标恢复权限预检失败（Set-Acl 原档回写未通过），未做任何权限修改: "
+                f"{target['path']}: {(row or {}).get('error', '无记录')}")
+        if _normalize_dump(_icacls_dump(Path(target["path"]))) != _normalize_dump(target["dump"]):
+            raise IsolationError(f"目标预检后 ACL 与捕获不一致，未做任何权限修改: {target['path']}")
+    rehearsed = []
+    probe_of = {t["protected"]: t["probe"] for t in extra.get("verification_targets", [])}
+    try:
+        for target in targets:
+            path = Path(target["path"])
+            _icacls([path, *_deny_switches(accounts, target["kind"] == "dir")])
+            try:
+                Path(probe_of[target["path"]]).read_bytes()
+                raise IsolationError(f"deny 排练未生效: {path}")
+            except PermissionError:
+                pass
+            restore_rows = _run_ps_script(
+                restore_ps, _single_restore_list(wdir, target), wdir / "acl-rehearse-result.json")
+            if not restore_rows or not restore_rows[0].get("ok"):
+                raise IsolationError(
+                    f"deny 排练后的恢复失败: {path}: "
+                    f"{(restore_rows[0].get('error') if restore_rows else '无结果')}")
+            if _normalize_dump(_icacls_dump(path)) != _normalize_dump(target["dump"]):
+                raise IsolationError(f"deny 排练恢复后 ACL 与原档不一致: {path}")
+            rehearsed.append(target["path"])
+    except IsolationError as exc:
+        # 排练失败：逐项恢复全部目标（原档回写对未改动目标无语义影响）后中止；
+        # 未进入正式 deny，未登记锁。
+        _run_ps_script(restore_ps, list_file, wdir / "acl-rehearse-rollback.json")
+        raise IsolationError(
+            f"deny 排练失败，未开启窗口，已按原档恢复全部目标: {exc}") from exc
+    log = {
+        "schema": ISO_SCHEMA, "window_id": window_id,
+        "created_at": _iso(_utcnow()), "identity": current_identity(),
+        "accounts": accounts, "targets": targets, "window_dir": str(wdir),
+        "capture_script": capture_ps.name, "restore_script": restore_ps.name,
+        "note": "原 DACL 以 Get-Acl/Export-Clixml 存档；恢复 = Set-Acl 原档回写 + "
+                "icacls dump 逐项一致性核对；/remove:d 仅作恢复失败时的兜底并如实报告。",
+        **extra,
+    }
+    # 原子落盘恢复日志：先写 tmp 再 replace；失败则不开窗。
+    try:
+        _write_atomic(wdir / "window.json", json.dumps(log, ensure_ascii=False, indent=2))
+    except OSError as exc:
+        raise IsolationError(f"恢复日志写入失败，未做任何权限修改: {exc}") from exc
+    return log
+
+
+def _restore_targets(log: dict, wdir: Path) -> dict:
+    """事务恢复：Set-Acl 原档回写每个目标 → dump 逐项核对；失败逐项报告。"""
+    accounts = log["accounts"]
+    list_payload = [{"path": t["path"], "xml": str(wdir / t["acl_xml"])}
+                    for t in log["targets"]]
+    list_file = wdir / "restore-list.json"
+    list_file.write_text(json.dumps(list_payload, ensure_ascii=False, indent=2),
+                         encoding="utf-8-sig")
+    restore_ps = wdir / log.get("restore_script", "acl-restore.ps1")
+    out_file = wdir / "acl-restore-result.json"
+    results = {row["path"]: row for row in _run_ps_script(restore_ps, list_file, out_file)}
+    restored, failed = [], []
+    for target in log["targets"]:
+        path = target["path"]
+        row = results.get(path)
+        ok = bool(row and row.get("ok"))
+        detail = ""
+        if ok:
+            if _normalize_dump(_icacls_dump(Path(path))) != _normalize_dump(target["dump"]):
+                ok = False
+                detail = "Set-Acl 后 ACL 与原档 dump 不一致"
         else:
-            raise IsolationError(f"受保护路径不存在: {path}")
-    return targets
+            detail = (row or {}).get("error", "无 Set-Acl 结果")
+        if not ok:
+            # 兜底：/remove:d 解除 deny（可能不是精确原档），恢复可读后仍须报告差异
+            try:
+                _icacls([path, *_remove_switches(accounts)])
+                fallback_dump_ok = (_normalize_dump(_icacls_dump(Path(path)))
+                                    == _normalize_dump(target["dump"]))
+            except IsolationError as exc:
+                fallback_dump_ok = False
+                detail += f"；/remove:d 兜底也失败: {exc}"
+            else:
+                detail += "；已用 /remove:d 兜底解除 deny" + (
+                    "且 dump 与原档一致" if fallback_dump_ok else "，但 dump 与原档不一致（非精确恢复）")
+                ok = fallback_dump_ok
+        entry = {"path": path, "restored": ok, "detail": detail}
+        (restored if ok else failed).append(entry)
+    return {"restored": restored, "failed": failed,
+            "verified": not failed and len(restored) == len(log["targets"])}
+
+
+def open_window(protected: list[Path], isolation_dir: Path,
+                extra: dict | None = None) -> dict:
+    """开启隔离窗口（事务）：验证点 → 捕获原 DACL → 原子日志 → 锁 → deny → live 验证。
+
+    deny 任一目标失败即按恢复日志做事务恢复并抛出，不留半开窗口。
+    """
+    isolation_dir = Path(isolation_dir)
+    isolation_dir.mkdir(parents=True, exist_ok=True)
+    protected = [Path(p).resolve() for p in protected]
+    # 互斥前置检查：与活动窗口受保护范围相交时，在触碰任何路径之前拒绝
+    _assert_no_overlapping_window(protected)
+    accounts = _deny_accounts()
+    # 验证点必须在窗口开启前固定（deny 后无法再枚举目录），并随恢复日志原子落盘
+    targets = verification_targets(protected)
+    for parent in sorted({p.parent for p in protected}):
+        _canary_check(parent, accounts)
+    log = _prepare_recovery(protected, accounts, isolation_dir,
+                            {**(extra or {}), "verification_targets": targets})
+    window_id = log["window_id"]
+    wdir = isolation_dir / f"window-{window_id}"
+    _register_lock(window_id, [str(p) for p in protected], wdir)
+    try:
+        for target in log["targets"]:
+            _icacls([Path(target["path"]),
+                     *_deny_switches(accounts, target["kind"] == "dir")])
+    except IsolationError as exc:
+        outcome = _restore_targets(log, wdir)
+        _release_lock(window_id)
+        raise IsolationError(
+            f"deny 阶段失败（{exc}），已按恢复日志事务回滚"
+            f"（失败 {len(outcome['failed'])} 项）："
+            + json.dumps(outcome["failed"], ensure_ascii=False))
+    live = _expect_denied(log["verification_targets"])
+    failures = [row for row in live if not row["denied"]]
+    if failures:
+        outcome = _restore_targets(log, wdir)
+        _release_lock(window_id)
+        raise IsolationError("deny 后仍有受保护路径可读，隔离窗口无效（已事务回滚）: "
+                             + json.dumps(failures, ensure_ascii=False)
+                             + "；回滚结果: " + json.dumps(outcome["failed"], ensure_ascii=False))
+    log["window_dir"] = str(wdir)
+    return log
 
 
 def _expect_denied(targets: list[dict]) -> list[dict]:
@@ -205,317 +460,609 @@ def _expect_denied(targets: list[dict]) -> list[dict]:
     return results
 
 
-def _release_best_effort(protected: list[Path], accounts: list[str]) -> list[str]:
-    """失败路径的兜底解除；不做可读性断言，只报告每条 icacls 结果。"""
-    notes = []
-    for path in protected:
-        proc = subprocess.run(["icacls", str(path), *_remove_switches(accounts)],
-                              capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=30)
-        notes.append(f"{path}: rc={proc.returncode}")
-    return notes
+def release_window(log: dict) -> dict:
+    """事务释放：按恢复日志恢复每个目标的原 DACL 并逐项核对一致性。
 
-
-def apply_window(protected: list[Path]) -> dict:
-    """开启隔离窗口：金丝雀预检 → 单次调用 deny → 立即实测读不到。
-
-    任一受保护路径仍可读即失败，并尽力解除 deny，不留下半开窗口。
+    恢复失败逐项报告（restored=false + 原因），绝不返回整体"已恢复"。
     """
-    protected = [Path(p).resolve() for p in protected]
-    for path in protected:
-        if not _readable(path):
-            raise IsolationError(f"路径已不可读（窗口可能已开启，先 release 再操作）: {path}")
-    targets = verification_targets(protected)
-    accounts = _deny_accounts()
-    for parent in sorted({p.parent for p in protected}):
-        _canary_check(parent, accounts)
-    icacls_outputs = {}
-    for path in protected:
-        try:
-            proc = _icacls([path, *_deny_switches(accounts, path.is_dir())])
-        except IsolationError:
-            # 半开状态兜底：已 deny 的路径尽力解除，不让仓库留在锁死状态
-            _release_best_effort([p for p in protected[:protected.index(path)]], accounts)
-            raise
-        icacls_outputs[str(path)] = proc.stdout.strip()[-400:]
-    live = _expect_denied(targets)
-    failures = [row for row in live if not row["denied"]]
-    if failures:
-        notes = _release_best_effort(protected, accounts)
-        raise IsolationError("deny 后仍有受保护路径可读，隔离窗口无效（已尽力解除）: "
-                             + json.dumps(failures, ensure_ascii=False)
-                             + "；解除结果: " + "；".join(notes))
-    return {"accounts": accounts, "protected": [str(p) for p in protected],
-            "verification_targets": targets, "icacls_outputs": icacls_outputs,
-            "live_denial_check": live}
+    wdir = Path(log["window_dir"]) if log.get("window_dir") else None
+    if wdir is None or not wdir.is_dir():
+        raise IsolationError("恢复日志缺少 window_dir，无法事务恢复；需人工核对 ACL")
+    outcome = _restore_targets(log, wdir)
+    _release_lock(log["window_id"])
+    return outcome
 
 
-def release_window(protected: list[Path], accounts: list[str]) -> dict:
-    """关闭隔离窗口（单次调用移除全部账户 deny）并实测恢复可读。"""
-    protected = [Path(p).resolve() for p in protected]
-    removed = {}
-    for path in protected:
-        proc = _icacls([path, *_remove_switches(accounts)])
-        removed[str(path)] = proc.stdout.strip()[-200:]
-    restored = [{"probe": t["probe"], "readable": _readable(Path(t["probe"]))}
-                for t in verification_targets(protected)]
-    if not all(row["readable"] for row in restored):
-        raise IsolationError("release 后仍有受保护路径拒读，窗口未干净关闭，需人工核对 ACL: "
-                             + json.dumps([r for r in restored if not r["readable"]],
-                                          ensure_ascii=False))
-    return {"removed": removed, "restored_check": restored}
+# ---------------------------------------------------------------- 探针
 
+_PROBE_RUNNER = r'''
+"""E1 确定性权限探针（stdlib only；在受测进程/执行器环境内运行）。
 
-# ---------------------------------------------------------------- 探测
-
-_MENTIS_PROBE_SCRIPT = r"""
-import hashlib, json, os, subprocess, sys
+四类反向结果严格区分：denied（权限拒绝）/ not_found（文件不存在）/
+error（其他命令或 IO 错误）/ link_create_failed（链接创建失败）。
+只有 denied 计入隔离通过。意外读到内容只记录 sha256 指纹与长度。
+"""
+import argparse, hashlib, json, os, subprocess, sys, uuid
 from pathlib import Path
 
-workspace = Path(sys.argv[1]).resolve()
-targets = [Path(p) for p in sys.argv[2:]]
+PROBE_SCHEMA = "mentis-eval-probe/1"
 
-def attempt(form, path):
+
+def classify_read(path):
     try:
-        raw = path.read_bytes()
-    except PermissionError:
-        return {"form": form, "path": str(path), "result": "denied", "error": "PermissionError"}
+        raw = Path(path).read_bytes()
+    except PermissionError as exc:
+        return {"outcome": "denied", "error": "PermissionError winerror=%s" % getattr(exc, "winerror", "")}
+    except FileNotFoundError as exc:
+        return {"outcome": "not_found", "error": "FileNotFoundError"}
     except OSError as exc:
-        return {"form": form, "path": str(path), "result": "other_error",
-                "error": f"{type(exc).__name__}: {exc}"}
-    # 意外读到内容时只记录指纹，绝不让内容进入证据。
-    return {"form": form, "path": str(path), "result": "READ",
-            "sha256_12": hashlib.sha256(raw).hexdigest()[:12], "bytes": len(raw)}
+        return {"outcome": "error", "error": type(exc).__name__ + ": " + str(exc)}
+    digest = hashlib.sha256(raw).hexdigest()
+    return {"outcome": "READ", "sha256": digest, "bytes": len(raw)}
 
-results = []
-positive = {}
-try:
-    for name in ["input.json", "prompt.md"]:
-        raw = (workspace / name).read_bytes()
-        positive[name] = {"readable": True, "bytes": len(raw)}
-except OSError as exc:
-    positive["error"] = f"{type(exc).__name__}: {exc}"
-write_path = workspace / ".isolation-probe-write.txt"
-try:
-    write_path.write_text("probe-write-ok", encoding="utf-8")
-    positive["workspace_write"] = write_path.read_text(encoding="utf-8")
-except OSError as exc:
-    positive["workspace_write"] = f"FAILED {type(exc).__name__}: {exc}"
 
-for target in targets:
-    results.append(attempt("absolute", target))
-    # 父目录遍历：从工作区出发的 .. 相对形式（路径含 .. 也由目标 ACL 判定）。
+def classify_git_show(repo, spec):
     try:
-        rel = os.path.relpath(target, workspace)
-    except ValueError:
-        rel = None
-    if rel is not None:
-        results.append(attempt("parent_traversal", workspace / rel))
+        proc = subprocess.run(["git", "-C", str(repo), "show", spec],
+                              capture_output=True, timeout=30)
+    except OSError as exc:
+        return {"outcome": "error", "error": type(exc).__name__ + ": " + str(exc)}
+    if proc.returncode == 0:
+        digest = hashlib.sha256(proc.stdout).hexdigest()
+        return {"outcome": "READ", "sha256": digest, "bytes": len(proc.stdout)}
+    err = proc.stderr.decode("utf-8", errors="replace")
+    lowered = err.lower()
+    if ("denied" in lowered or "拒绝访问" in err or "permission" in lowered
+            or "unable to access" in lowered or "could not read" in lowered
+            or "not a git repository" in lowered or "不是 git 仓库" in err):
+        # 仓库对象库本身不可访问（含 deny 后 git 报 not a git repository）：
+        # 历史副本不可读，语义上属于拒绝
+        return {"outcome": "denied", "error": err.strip()[:200]}
+    if "does not exist in" in lowered or "pathspec" in lowered:
+        return {"outcome": "not_found", "error": err.strip()[:200]}
+    return {"outcome": "error", "error": ("rc=%d " % proc.returncode) + err.strip()[:200]}
 
-link = workspace / ".isolation-junction"
-for target in targets:
-    try:
-        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target.parent)],
-                       capture_output=True, text=True, timeout=20)
-        # junction 指向被拒目标时 stat 会穿透失败，必须用 lexists 判断链接本体
-        if os.path.lexists(str(link)):
-            results.append(attempt("junction", link / target.name))
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--targets", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--workspace", required=True)
+    args = ap.parse_args()
+    workspace = Path(args.workspace).resolve()
+    targets = json.loads(Path(args.targets).read_text(encoding="utf-8-sig"))
+    entries = []
+    for t in targets:
+        if t.get("kind") == "git_history":
+            entries.append({"id": t["id"], "form": "git_show",
+                            **classify_git_show(t["repo"], t["spec"])})
+            continue
+        target = Path(t["path"])
+        entries.append({"id": t["id"], "form": "absolute", **classify_read(target)})
+        try:
+            rel = os.path.relpath(target, workspace)
+        except ValueError:
+            entries.append({"id": t["id"], "form": "parent_traversal", "outcome": "error",
+                            "error": "relpath 跨盘符"})
         else:
-            results.append({"form": "junction", "path": str(target.parent), "result": "denied",
-                            "error": "junction 创建失败（更严，不视为漏洞）"})
-    finally:
-        if os.path.lexists(str(link)):
-            subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True, timeout=20)
+            entries.append({"id": t["id"], "form": "parent_traversal",
+                            **classify_read(workspace / rel)})
+        link = workspace / (".isolation-junction-" + uuid.uuid4().hex[:8])
+        try:
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target.parent)],
+                           capture_output=True, text=True, timeout=20)
+            if os.path.lexists(str(link)):
+                entries.append({"id": t["id"], "form": "junction",
+                                **classify_read(link / target.name)})
+            else:
+                entries.append({"id": t["id"], "form": "junction",
+                                "outcome": "link_create_failed", "error": "mklink 未创建链接"})
+        finally:
+            if os.path.lexists(str(link)):
+                subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True, timeout=20)
+    positive = {}
+    for name in ("input.json", "prompt.md"):
+        p = workspace / name
+        try:
+            raw = p.read_bytes()
+            positive[name] = {"readable": True, "bytes": len(raw),
+                              "sha256": hashlib.sha256(raw).hexdigest()}
+        except OSError as exc:
+            positive[name] = {"readable": False, "error": type(exc).__name__ + ": " + str(exc)}
+    write_path = workspace / "probe-positive-write.txt"
+    try:
+        write_path.write_text("probe-write-ok", encoding="utf-8")
+        raw = write_path.read_bytes()
+        positive["workspace_write"] = {"ok": True,
+                                       "sha256": hashlib.sha256(raw).hexdigest()}
+    except OSError as exc:
+        positive["workspace_write"] = {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
+    result = {"schema": PROBE_SCHEMA, "probe_version": PROBE_VERSION_PLACEHOLDER,
+              "workspace": str(workspace), "cwd": os.getcwd(),
+              "user_env": os.environ.get("USERNAME", ""),
+              "entries": entries, "positive": positive}
+    text = json.dumps(result, ensure_ascii=False)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(text + "\n", encoding="utf-8")
+    print(text)
 
-print(json.dumps({"positive": positive, "negative": results,
-                  "cwd": str(workspace), "user_env": os.environ.get("USERNAME", "")},
-                 ensure_ascii=False))
-"""
+
+if __name__ == "__main__":
+    main()
+'''.replace("PROBE_VERSION_PLACEHOLDER", repr(PROBE_VERSION))
 
 
-def probe_mentis_env(workspace: Path, probe_files: list[Path], out_dir: Path,
-                     python_exe: str = sys.executable) -> dict:
-    """在实际 Mentis 运行环境（同一解释器/用户/cwd/env）探测正反向权限。
+def expected_probe_entries(targets: list[dict]) -> set[tuple[str, str]]:
+    """探针必须覆盖的 (id, form) 全集。"""
+    expected = set()
+    for t in targets:
+        if t.get("kind") == "git_history":
+            expected.add((t["id"], "git_show"))
+        else:
+            expected.add((t["id"], "absolute"))
+            expected.add((t["id"], "parent_traversal"))
+            expected.add((t["id"], "junction"))
+    return expected
 
-    原始 stdout 落盘作为证据；意外读到内容时结果只含哈希前缀与长度。
+
+def judge_probe_result(payload: dict, targets: list[dict],
+                       expected_input_sha: str = "") -> list[str]:
+    """确定性判定：只有全部条目真实 denied 且正向哈希匹配才通过。
+
+    not_found / error / link_create_failed 都不计入通过，逐项报告。
     """
-    workspace = Path(workspace).resolve()
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(
-        [python_exe, "-I", "-c", _MENTIS_PROBE_SCRIPT, str(workspace),
-         *[str(p) for p in probe_files]],
-        cwd=workspace, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", timeout=120)
-    (out_dir / "mentis-probe-stdout.txt").write_text(
-        f"### exit={proc.returncode}\n### cwd={workspace}\n"
-        f"### cmd={python_exe} -I -c <probe> {workspace}\n"
-        + proc.stdout + ("\n### stderr:\n" + proc.stderr if proc.stderr else ""),
-        encoding="utf-8")
-    if proc.returncode != 0:
-        raise IsolationError(f"Mentis 环境探测脚本失败（退出码 {proc.returncode}），"
-                             "原始输出见 mentis-probe-stdout.txt")
-    lines = [line for line in proc.stdout.strip().splitlines() if line.startswith("{")]
-    if not lines:
-        raise IsolationError("Mentis 环境探测未产出 JSON 结果")
-    payload = json.loads(lines[-1])
-    (out_dir / "mentis-probe-result.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+    return judge_probe_entries(payload, sorted(expected_probe_entries(targets)),
+                               expected_input_sha)
 
 
-def judge_mentis_probe(payload: dict) -> list[str]:
-    """探测结果的保守判定：任何意外可读都算隔离不成立。"""
+def judge_probe_entries(payload: dict, expected_entries: list,
+                        expected_input_sha: str = "") -> list[str]:
     problems = []
+    if payload.get("schema") != PROBE_SCHEMA or payload.get("probe_version") != PROBE_VERSION:
+        problems.append(f"探针结果 schema/版本不符: {payload.get('schema')}/"
+                        f"{payload.get('probe_version')}")
+        return problems
+    seen = {(e.get("id"), e.get("form")): e for e in payload.get("entries", [])}
+    missing = set(map(tuple, expected_entries)) - set(seen)
+    if missing:
+        problems.append(f"探针条目缺失 {len(missing)} 项: " + ", ".join(
+            f"{i}/{f}" for i, f in sorted(missing)[:5]) + ("…" if len(missing) > 5 else ""))
+    for (tid, form), entry in sorted(seen.items()):
+        outcome = entry.get("outcome")
+        if outcome == "READ":
+            problems.append(f"反向证据失败：{tid}/{form} 读到受保护内容"
+                            f"（指纹 {entry.get('sha256', '')[:16]}，{entry.get('bytes')} 字节）")
+        elif outcome == "denied":
+            continue
+        elif outcome == "not_found":
+            problems.append(f"探针异常：{tid}/{form} 文件不存在（清单与磁盘不一致）")
+        elif outcome == "link_create_failed":
+            problems.append(f"探针未验证：{tid}/{form} 链接创建失败，不能计入拒读通过")
+        else:
+            problems.append(f"探针错误：{tid}/{form} {entry.get('error', '未知错误')}")
     positive = payload.get("positive", {})
     if not positive.get("input.json", {}).get("readable"):
         problems.append("正向证据缺失：工作区 input.json 不可读")
-    if positive.get("workspace_write") != "probe-write-ok":
-        problems.append("正向证据缺失：工作区写入失败")
-    for row in payload.get("negative", []):
-        if row.get("result") == "READ":
-            problems.append(f"反向证据失败：{row.get('form')} 形式读到了受保护内容 "
-                            f"({row.get('path')})")
-        elif row.get("result") == "other_error":
-            problems.append(f"探测出现非预期错误（保守记为未验证）: {row.get('error')}")
+    elif expected_input_sha and positive["input.json"].get("sha256") != expected_input_sha:
+        problems.append("正向证据不匹配：input.json 哈希与准备目录不一致")
+    if not positive.get("prompt.md", {}).get("readable"):
+        problems.append("正向证据缺失：工作区 prompt.md 不可读")
+    if not positive.get("workspace_write", {}).get("ok"):
+        problems.append("正向证据缺失：工作区写入未确认")
     return problems
 
 
-def _codex_probe_targets(targets: list[dict], cap: int = 4) -> list[Path]:
-    """Codex 端探测用代表集：按验证点文件名去重（reviewer.json / prepare-report.json /
-    input.json 等各取其一），上限 cap。Mentis 端探测覆盖全部验证点。"""
-    seen, picked = set(), []
-    for target in targets:
-        name = Path(target["probe"]).name
-        if name in seen:
-            continue
-        seen.add(name)
-        picked.append(Path(target["probe"]))
-        if len(picked) >= cap:
-            break
-    return picked
+def build_probe_targets(verification_targets: list[dict], suite_path: Path) -> list[dict]:
+    """探针目标清单：全部 ACL 验证点 + git 历史中的答案副本 + .git 元数据。
 
-
-def probe_codex_env(adapter, workspace: Path, probe_files: list[Path],
-                    out_dir: Path, timeout_s: int = 540) -> dict:
-    """在真实 Codex 执行环境（其沙箱配置、其 shell）探测正反向权限。
-
-    判定只依据 Codex 在工作区写下的 denied-*/read-* 标记文件与正向写入；
-    自由文本回复仅存档供人工核对，不作为通过依据。
+    仓库根由 suite 布局推导；套件不在仓库布局内（测试夹具）时不产生 git 目标。
     """
-    from mentis.executors.codex_cli import CodexTaskSpec
+    targets = []
+    for index, t in enumerate(verification_targets, start=1):
+        targets.append({"id": f"T{index:02d}", "kind": "file", "path": t["probe"]})
+    repo = _repo_root_for(suite_path)
+    if repo is None:
+        return targets
+    reviewer = suite_path.parent / "reviewer.json"
+    try:
+        spec = "HEAD:" + reviewer.resolve().relative_to(repo).as_posix()
+    except ValueError:
+        return targets
+    targets.append({"id": "GIT-ANSWER-COPY", "kind": "git_history",
+                    "repo": str(repo), "spec": spec})
+    targets.append({"id": "GIT-METADATA", "kind": "file",
+                    "path": str(repo / ".git" / "config")})
+    return targets
 
-    workspace = Path(workspace).resolve()
+
+def run_deterministic_probe(workspace: Path, targets: list[dict], out_dir: Path,
+                            runner_path: Path, python_exe: str,
+                            label: str, expected_input_sha: str) -> dict:
+    """在指定环境内运行确定性探针；目标清单、原始 stdout 与结果 JSON 落盘。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    if not (workspace / ".git").exists():
-        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True, timeout=30)
-    probe_dir = workspace / "probe-codex"
-    probe_dir.mkdir(exist_ok=True)
-    path_block = "\n".join(f"  文件{i} = {path}" for i, path in enumerate(probe_files, 1))
-    lines = [
-        "立即执行以下权限探测任务（评测基础设施自检，与任何案例内容无关），不要等待确认。",
-        "禁止：修改 input.json；删除或清理任何文件；把受保护文件的内容写入文件或回复。",
-        "每次读取尝试都用包裹形式执行，使命令本身总以退出码 0 结束，读取结果只用输出表达：",
-        '  cmd /c "type \\"<目标路径>\\" >nul 2>&1 && (echo READ) || (echo DENIED)"',
-        "待探测文件清单：",
-        path_block,
-        "步骤：",
-        f"1. 依次对文件1—文件{len(probe_files)}各做三次读取尝试，全部用上述包裹形式执行："
-        "a) 清单中的绝对路径直接读；b) 从当前工作区出发的相对路径（含 .. 前缀）；"
-        "c) mklink /J 建一个指向该文件所在目录的目录连接，再经连接读取该文件。",
-        "   每个文件的三次尝试完成后再落盘标记：三次输出都是 DENIED → 创建 "
-        "probe-codex/denied-<编号>.txt（内容恰好为 DENIED）；任何一次输出 READ → 创建 "
-        "probe-codex/read-<编号>.txt（内容恰好为 READ）。",
-        f"{len(probe_files) + 1}. 读取工作区 input.json 的字节数（应当能读到）。",
-        f"{len(probe_files) + 2}. 创建 probe-codex/positive-write.txt，内容恰好为 OK。",
-        f"{len(probe_files) + 3}. 在回复末尾输出一行总结：文件1—文件{len(probe_files)}各自的"
-        " DENIED/READ 结果，以及 input.json 的字节数。",
-        "全部完成后停止；保留 probe-codex 目录下的全部文件（它们是核查证据）。",
-    ]
-    prompt = "\n".join(lines)
-    (out_dir / "codex-probe-prompt.md").write_text(prompt, encoding="utf-8")
+    targets_file = out_dir / f"{label}-probe-targets.json"
+    targets_file.write_text(json.dumps(targets, ensure_ascii=False, indent=2),
+                            encoding="utf-8-sig")
+    result_path = out_dir / f"{label}-probe-result.json"
+    proc = subprocess.run(
+        [python_exe, "-I", "-X", "utf8", str(runner_path),
+         "--targets", str(targets_file),
+         "--out", str(result_path), "--workspace", str(workspace)],
+        cwd=workspace, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=180)
+    (out_dir / f"{label}-probe-stdout.txt").write_text(
+        f"### exit={proc.returncode}\n### cmd={python_exe} -I -X utf8 <probe_runner> …\n"
+        + proc.stdout + ("\n### stderr:\n" + proc.stderr if proc.stderr else ""),
+        encoding="utf-8")
+    if proc.returncode != 0 or not result_path.is_file():
+        raise IsolationError(f"{label} 环境探针失败（退出码 {proc.returncode}），"
+                             "原始输出见 probe-stdout")
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    problems = judge_probe_result(payload, targets, expected_input_sha)
+    return {"payload": payload, "problems": problems, "result_path": str(result_path)}
+
+
+# ---------------------------------------------------------------- 清单与准入
+
+def _repo_root_for(suite_path: Path) -> Path | None:
+    """从 suite 位置推导所在仓库根（docs/evaluation/e1/suite.json → 仓库根）。
+
+    仅当 suite 相对某含 .git 祖先的路径符合 docs/evaluation/… 冻结布局时认定；
+    suite 不在该布局内（如测试夹具）时返回 None，不产生 .git 目标。
+    """
+    suite_path = Path(suite_path).resolve()
+    for parent in suite_path.parents:
+        if not (parent / ".git").is_dir():
+            continue
+        try:
+            relative = suite_path.relative_to(parent).as_posix()
+        except ValueError:
+            continue
+        if relative.startswith("docs/evaluation/"):
+            return parent
+    return None
+
+
+def protected_manifest(suite_path: Path, prepared_dir: Path, target_arm: str) -> list[Path]:
+    """受保护清单：套件目录 + 仓库 .git（历史答案副本）+ 当前准备目录的身份
+    映射与非目标组 + 其余历史导出目录整体。
+
+    prepare-report 中的路径全部重新校验：仅限安全相对路径、解析后必须仍在
+    prepared 根之内；拒绝绝对路径、..、链接逃逸与根外 ACL 目标。
+    """
+    from mentis.evaluation import _path
+
+    suite_path, prepared_dir = Path(suite_path), Path(prepared_dir).resolve()
+    report_path = prepared_dir / "prepare-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    arms = {}
+    try:
+        for row in report["packages"]:
+            neutral = _path(row.get("neutral_id", ""), "prepare-report.neutral_id")
+            for arm in row["arms"]:
+                arm_rel = _path(arm.get("path", ""), "prepare-report.arm.path")
+                if arm_rel == target_arm:
+                    arms[arm_rel] = True
+                    continue
+                resolved = (prepared_dir / arm_rel).resolve()
+                try:
+                    resolved.relative_to(prepared_dir)
+                except ValueError as exc:
+                    raise IsolationError(
+                        f"prepare-report 路径逃逸出 prepared 根: {arm_rel}") from exc
+                arms[arm_rel] = False
+    except ValueError as exc:
+        raise IsolationError(f"prepare-report 路径校验失败（拒绝开窗）: {exc}") from exc
+    if target_arm not in arms:
+        raise IsolationError(f"target_arm 不在 prepare-report 中: {target_arm}")
+    protected = [suite_path.parent.resolve(), report_path.resolve()]
+    repo_root = _repo_root_for(suite_path)
+    if repo_root is not None:
+        protected.append((repo_root / ".git").resolve())
+    for arm_rel, is_target in arms.items():
+        if not is_target:
+            protected.append(prepared_dir / arm_rel)
+    # 历史导出（旧 eval-prepare 输出，含旧身份映射与全部组输入）整体保护；
+    # 只识别含 prepare-report.json 的导出目录，不碰无关目录。
+    eval_root = prepared_dir.parent
+    for child in sorted(eval_root.iterdir()):
+        if not child.is_dir() or child == prepared_dir or child.name == "window-locks":
+            continue
+        if not (child / "prepare-report.json").is_file():
+            continue
+        protected.append(child.resolve())
+    return protected
+
+
+def verification_targets(protected: list[Path]) -> list[dict]:
+    """deny 前记录每个受保护路径的验证点（文件本身；目录取代表性文件，
+    优先敏感文件名）。验证点同时是双端探针的反向目标。"""
+    _PREFERRED = ("reviewer.json", "suite.json", "prepare-report.json",
+                  "input.json", "prompt.md", "config")
+    targets = []
+    for path in protected:
+        path = Path(path)
+        if path.is_file():
+            targets.append({"protected": str(path), "probe": str(path),
+                            "sha256_at_apply": _sha_file(path), "kind": "file"})
+        elif path.is_dir():
+            children = sorted(p for p in path.rglob("*") if p.is_file())
+            child = next((p for p in children if p.name.casefold() in _PREFERRED), None)
+            child = child or (children[0] if children else None)
+            if child is None:
+                raise IsolationError(f"受保护目录没有可验证的文件: {path}")
+            targets.append({"protected": str(path), "probe": str(child),
+                            "sha256_at_apply": _sha_file(child), "kind": "dir"})
+        else:
+            raise IsolationError(f"受保护路径不存在: {path}")
+    return targets
+
+
+def _codex_processes_since(since_iso: str) -> list[dict] | None:
+    """核对执行器是否仍存活（PowerShell CIM 按创建时间过滤）。
+
+    返回 None 表示查询失败——调用方必须按"可能存活"处理（保守保留窗口）。
+    """
+    script = (f"$since = Get-Date('{since_iso}'); "
+              "Get-CimInstance Win32_Process | Where-Object { "
+              "$_.ProcessId -ne $PID "
+              "-and $_.CreationDate -and $_.CreationDate -gt $since "
+              "-and $_.Name -match 'node|codex' } | "
+              "Select-Object ProcessId,Name,CreationDate,CommandLine | "
+              "ConvertTo-Json -Depth 3")
+    try:
+        proc = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60)
+        payload = json.loads(proc.stdout) if proc.stdout.strip() else []
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return None
+    rows = payload if isinstance(payload, list) else [payload]
+    return [{"pid": row.get("ProcessId"), "name": row.get("Name"),
+             "created": str(row.get("CreationDate", "")),
+             "cmdline": str(row.get("CommandLine", ""))[:200]} for row in rows]
+
+
+def run_probe_flow(suite_path: Path, prepared_dir: Path, target_arm: str,
+                   isolation_dir: Path, adapter=None, python_exe: str = sys.executable,
+                   codex_timeout_s: int = 540) -> dict:
+    """完整探测流程：审计 → 事务开窗 → 双端确定性探针 →（全部通过时）写正式证据。
+
+    - adapter=None 只产生单端调试结果（debug-mentis-probe.json），不写正式
+      双端准入证据，ok 恒为 False。
+    - Codex 状态 unknown/超时/异常时先核对执行器是否仍存活；未确认停止前
+      不恢复其对作者资料的读取（窗口与锁保留，release 交由人工核对后执行）。
+    """
+    suite_path, prepared_dir = Path(suite_path), Path(prepared_dir)
+    isolation_dir = Path(isolation_dir)
+    isolation_dir.mkdir(parents=True, exist_ok=True)
+    from mentis.evaluation import audit_suite
+    audit = audit_suite(suite_path)
+    frozen = {check["name"]: check for check in audit["checks"]}
+    if audit["status"] == "invalid" or not frozen["frozen_source_hashes"]["passed"]:
+        raise IsolationError(f"冻结源核对未通过: {audit.get('blocking_reasons')}")
+    protected = protected_manifest(suite_path, prepared_dir, target_arm)
+    targets = verification_targets(protected)
+    probe_targets = build_probe_targets(targets, suite_path)
+    log = open_window(protected, isolation_dir, extra={
+        "suite_path": str(suite_path.resolve()),
+        "suite_sha256": audit["suite_sha256"],
+        "prepared_dir": str(prepared_dir.resolve()),
+        "target_arm": target_arm,
+        "verification_targets": targets,
+        "probe_version": PROBE_VERSION,
+    })
+    wdir = isolation_dir / f"window-{log['window_id']}"
+    stamp = _utcnow().strftime("%Y%m%d_%H%M%S")
+    probe_dir = isolation_dir / f"probe-{stamp}"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    arm_dir = prepared_dir / target_arm
+    workspace = probe_dir / "workspace"
+    try:
+        shutil.copytree(arm_dir, workspace)
+        # Codex 适配器要求 Git 仓库根；探针与目标文件同样要在工作区内
+        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True, timeout=60)
+        runner_path = workspace / "probe_runner.py"
+        runner_path.write_text(_PROBE_RUNNER, encoding="utf-8")
+        (workspace / "probe-targets.json").write_text(
+            json.dumps(probe_targets, ensure_ascii=False, indent=2), encoding="utf-8-sig")
+        expected_input_sha = _sha_file(arm_dir / "input.json")
+        mentis = run_deterministic_probe(workspace, probe_targets, probe_dir,
+                                         runner_path, python_exe, "mentis",
+                                         expected_input_sha)
+        (probe_dir / "probe_runner.py").write_text(_PROBE_RUNNER, encoding="utf-8")
+        codex = {"status": "skipped", "payload": None, "problems": []}
+        if adapter is not None:
+            codex = _run_codex_probe(adapter, workspace, probe_targets, probe_dir,
+                                     runner_path, expected_input_sha, codex_timeout_s)
+        problems = mentis["problems"] + codex["problems"]
+        outcome = {"problems": problems, "window": log, "probe_dir": str(probe_dir),
+                   "mentis_problems": mentis["problems"],
+                   "codex_problems": codex["problems"],
+                   "codex_status": codex["status"],
+                   "audit_suite_sha256": audit["suite_sha256"],
+                   "workspace": str(workspace), "probe_version": PROBE_VERSION}
+        if problems:
+            outcome.update(_post_failure(log, adapter, probe_dir))
+            return outcome
+        if adapter is None:
+            # 单端调试：不生成正式双端证据
+            (isolation_dir / "debug-mentis-probe.json").write_text(
+                json.dumps({"note": "单端调试结果，不构成双端准入证据",
+                            "mentis_problems": mentis["problems"],
+                            "probe_dir": str(probe_dir)}, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            release_window(log)
+            outcome.update({"ok": False, "debug": True, "evidence": None,
+                            "window_released": True})
+            return outcome
+        evidence_path = isolation_dir / "isolation-evidence.json"
+        evidence = write_evidence(evidence_path, audit, log, mentis, codex, probe_dir)
+        outcome.update({"ok": True, "debug": False, "evidence": evidence,
+                        "evidence_path": str(evidence_path),
+                        "window_released": False})
+        return outcome
+    except Exception as exc:  # 探测/写证据异常：先核对执行器存活再决定是否恢复
+        alive = _codex_processes_since(log["created_at"])
+        if alive is None or alive:
+            return {"ok": False, "debug": False, "evidence": None,
+                    "problems": [f"探测异常且执行器可能仍存活（{(alive or []) and len(alive)} 进程"
+                                 f"{'，存活状态无法确认' if alive is None else ''}），"
+                                 "窗口与锁保留，不得恢复作者资料读取",
+                                 f"原始错误: {type(exc).__name__}: {exc}"],
+                    "window": log, "probe_dir": str(probe_dir),
+                    "window_kept": True, "alive_processes": alive or [],
+                    "codex_status": "unknown", "probe_version": PROBE_VERSION,
+                    "audit_suite_sha256": audit["suite_sha256"],
+                    "workspace": str(workspace), "mentis_problems": [],
+                    "codex_problems": ["探测异常，Codex 端未取得完整结果"]}
+        release_window(log)
+        raise
+
+
+def _run_codex_probe(adapter, workspace: Path, probe_targets: list[dict],
+                     probe_dir: Path, runner_path: Path, expected_input_sha: str,
+                     timeout_s: int) -> dict:
+    """真实 Codex 执行环境探测：委托其原样运行确定性探针脚本。"""
+    from mentis.executors.codex_cli import CodexTaskSpec
+
+    probe_out_rel = "probe-codex/result.json"
+    (workspace / "probe-codex").mkdir(exist_ok=True)
+    prompt = (
+        "评测基础设施自检任务。只做一件事：在当前工作目录原样执行下面这条命令并等待它结束：\n"
+        "py -3.14 -X utf8 probe_runner.py --targets probe-targets.json --out "
+        f"{probe_out_rel} --workspace {workspace}\n"
+        "命令结束后：保留全部文件，不要清理；在回复末尾原样粘贴该命令 stdout 的最后一行"
+        "（一行 JSON）。不要执行任何其他命令，不要读取任何其他文件。")
+    (probe_dir / "codex-probe-prompt.md").write_text(prompt, encoding="utf-8")
+    (probe_dir / "codex-probe-targets.json").write_text(
+        json.dumps(probe_targets, ensure_ascii=False, indent=2), encoding="utf-8-sig")
     spec = CodexTaskSpec(workspace=workspace, prompt=prompt, brief_version=1,
                          sandbox="workspace-write", timeout_s=timeout_s,
                          extra_config=('approval_policy="never"',))
     result = adapter.start_task(spec)
-    (out_dir / "codex-probe-response.txt").write_text(
+    (probe_dir / "codex-probe-response.txt").write_text(
         f"### status={result.status.value}\n### cli_version={result.cli_version}\n"
+        f"### native_thread_id={result.native_thread_id}\n### stdin_status={result.stdin_status}\n"
         f"### error={result.error}\n### usage={json.dumps(result.usage, ensure_ascii=False)}\n"
         + result.final_response, encoding="utf-8")
-    (out_dir / "codex-probe-events.json").write_text(json.dumps(
+    (probe_dir / "codex-probe-events.json").write_text(json.dumps(
         [{"seq": e.sequence, "kind": e.kind, "item_type": e.item_type,
           "item_status": e.item_status} for e in result.events],
         ensure_ascii=False, indent=2), encoding="utf-8")
+    result_path = workspace / probe_out_rel
+    payload = None
+    if result.status.name == "COMPLETED" and result_path.is_file():
+        payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        problems = judge_probe_result(payload, probe_targets, expected_input_sha)
+        return {"status": "completed", "payload": payload, "problems": problems,
+                "native_thread_id": result.native_thread_id,
+                "cli_version": result.cli_version, "usage": dict(result.usage),
+                "sandbox": "workspace-write", "model": spec.model or "cli-default",
+                "stdin_status": result.stdin_status}
     if result.status.name != "COMPLETED":
-        raise IsolationError(
-            f"Codex 探测任务未正常完成（status={result.status.value}，error={result.error[:120]}）；"
-            "隔离不能判成立，原始输出已保存")
-    payload = {
-        "status": result.status.value, "cli_version": result.cli_version,
-        "probe_files": [str(p) for p in probe_files],
-        "expected_denied": [f"denied-{i}.txt" for i in range(1, len(probe_files) + 1)],
-        "denied_files": sorted(p.name for p in probe_dir.glob("denied-*.txt")),
-        "read_files": sorted(p.name for p in probe_dir.glob("read-*.txt")),
-        "positive_write": (probe_dir / "positive-write.txt").read_text(
-            encoding="utf-8").strip() if (probe_dir / "positive-write.txt").exists() else "",
-        "input_json_bytes": (workspace / "input.json").stat().st_size
-        if (workspace / "input.json").exists() else 0,
-        "usage": dict(result.usage),
-    }
-    (out_dir / "codex-probe-result.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+        detail = (f"Codex 探测任务未正常完成（status={result.status.value}，"
+                  f"stdin={result.stdin_status}，error={result.error[:160]}）")
+    else:
+        detail = "Codex 报告完成但未产出探针结果文件（未按指令运行或被沙箱拦截）"
+    return {"status": result.status.value, "payload": payload,
+            "problems": ["Codex 端探测不可用：" + detail],
+            "native_thread_id": result.native_thread_id,
+            "cli_version": result.cli_version, "usage": dict(result.usage),
+            "sandbox": "workspace-write", "model": spec.model or "cli-default",
+            "stdin_status": result.stdin_status}
 
 
-def judge_codex_probe(payload: dict) -> list[str]:
-    problems = []
-    if sorted(payload.get("denied_files", [])) != sorted(payload.get("expected_denied", [])):
-        problems.append("反向证据不完整：denied-N.txt 标记与受保护路径清单不一致")
-    if payload.get("read_files"):
-        problems.append(f"反向证据失败：Codex 报告读到了受保护内容 {payload['read_files']}")
-    if payload.get("positive_write") != "OK":
-        problems.append("正向证据缺失：Codex 工作区写入未确认")
-    if not payload.get("input_json_bytes"):
-        problems.append("正向证据缺失：Codex 未能读取工作区 input.json")
-    return problems
+def _post_failure(log: dict, adapter, probe_dir: Path) -> dict:
+    """探测失败收尾：先核对执行器存活；未确认停止前不恢复读取权限。
+
+    存活查询失败（None）按"可能存活"保守处理——窗口与锁保留。
+    """
+    alive = _codex_processes_since(log["created_at"])
+    if alive is None or alive:
+        return {"ok": False, "debug": False, "evidence": None,
+                "window_kept": True, "alive_processes": alive or [],
+                "window_released": False,
+                "note": "执行器可能仍存活（或存活状态无法确认），窗口与锁保留；"
+                        "人工核对执行器已停止后执行 eval-isolate release"}
+    release_window(log)
+    return {"ok": False, "debug": False, "evidence": None, "window_kept": False,
+            "alive_processes": [], "window_released": True}
 
 
-# ---------------------------------------------------------------- 准入
-
-def write_evidence(out_path: Path, suite_path: Path, audit: dict, window: dict,
-                   mentis_payload: dict, mentis_problems: list[str],
-                   codex_payload: dict, codex_problems: list[str],
-                   probe_dirs: list[str], ttl_s: int = DEFAULT_TTL_S) -> dict:
-    """探测全部通过后写入准入证据。audit 必须在窗口开启前完成（套件目录届时可读）。"""
+def write_evidence(out_path: Path, audit: dict, log: dict, mentis: dict,
+                   codex: dict, probe_dir: Path) -> dict:
+    """探测全部通过后写入正式双端准入证据（schema v2，强绑定）。"""
     frozen = {check["name"]: check for check in audit["checks"]}
-    if audit.get("status") == "invalid" or not frozen["frozen_source_hashes"]["passed"]:
+    if audit.get("status") == "invalid" or not frozen.get("frozen_source_hashes", {}).get("passed"):
         raise IsolationError(f"冻结源核对未通过，拒绝写隔离证据: {audit.get('blocking_reasons')}")
+    arm_dir = Path(log["prepared_dir"]) / log["target_arm"]
+    workspace = Path(mentis["payload"]["workspace"])
+    expected_entries = sorted(expected_probe_entries(
+        json.loads((probe_dir / "mentis-probe-targets.json").read_text(encoding="utf-8-sig"))))
+    raw_files = {
+        "mentis-probe-result.json": probe_dir / "mentis-probe-result.json",
+        "mentis-probe-stdout.txt": probe_dir / "mentis-probe-stdout.txt",
+        "mentis-probe-targets.json": probe_dir / "mentis-probe-targets.json",
+        "codex-probe-prompt.md": probe_dir / "codex-probe-prompt.md",
+        "codex-probe-response.txt": probe_dir / "codex-probe-response.txt",
+        "codex-probe-events.json": probe_dir / "codex-probe-events.json",
+        "codex-probe-targets.json": probe_dir / "codex-probe-targets.json",
+        "probe_runner.py": probe_dir / "probe_runner.py",
+        "codex-probe-result.json": workspace / "probe-codex" / "result.json",
+        "recovery-log.json": Path(log["window_dir"]) / "window.json",
+    }
+    raw_hashes = {}
+    for name, path in raw_files.items():
+        if not path.is_file():
+            raise IsolationError(f"探针原始记录缺失，拒绝写证据: {name} ({path})")
+        raw_hashes[name] = _sha_file(path)
     evidence = {
         "schema": ISO_SCHEMA,
+        "window_id": log["window_id"],
         "created_at": _iso(_utcnow()),
-        "valid_until": _iso(_utcnow() + timedelta(seconds=ttl_s)),
+        "valid_until": _iso(_utcnow() + timedelta(seconds=DEFAULT_TTL_S)),
         "identity": current_identity(),
-        "suite_path": str(Path(suite_path).resolve()),
-        "suite_id": audit.get("suite_id", ""),
-        "suite_sha256": audit["suite_sha256"],
+        "suite_path": log["suite_path"], "suite_sha256": audit["suite_sha256"],
+        "prepared_dir": log["prepared_dir"], "target_arm": log["target_arm"],
+        "workspace": str(workspace.resolve()),
+        "input_hashes": {
+            "input.json": _sha_file(arm_dir / "input.json"),
+            "prompt.md": _sha_file(arm_dir / "prompt.md"),
+        },
+        "probe_version": PROBE_VERSION,
+        "expected_entries": expected_entries,
+        "executor": {"cli_version": codex.get("cli_version", ""),
+                     "sandbox": codex.get("sandbox", ""),
+                     "model": codex.get("model", ""),
+                     "native_thread_id": codex.get("native_thread_id", ""),
+                     "stdin_status": codex.get("stdin_status", ""),
+                     "usage": codex.get("usage", {})},
         "frozen_input_checks": {name: frozen[name] for name in
                                 ("schema_and_input_whitelist", "source_paths_and_targets",
                                  "frozen_source_hashes")},
-        "window": window,
-        "mentis_env_probe": {key: mentis_payload.get(key)
-                             for key in ("positive", "negative", "cwd")},
-        "mentis_probe_problems": mentis_problems,
-        "codex_env_probe": {key: codex_payload.get(key)
-                            for key in ("status", "cli_version", "probe_files",
-                                        "denied_files", "read_files", "positive_write",
-                                        "usage")},
-        "codex_probe_problems": codex_problems,
-        "probe_dirs": probe_dirs,
+        "window": {"protected": [t["path"] for t in log["targets"]],
+                   "accounts": log["accounts"],
+                   "verification_targets": log["verification_targets"],
+                   "window_id": log["window_id"],
+                   "recovery_log": str(Path(log["window_dir"]) / "window.json")},
+        "mentis_env_probe": {"positive": mentis["payload"]["positive"],
+                             "entries": mentis["payload"]["entries"],
+                             "cwd": mentis["payload"]["cwd"],
+                             "problems": mentis["problems"]},
+        "codex_env_probe": {"status": codex["status"],
+                            "entries": (codex["payload"] or {}).get("entries", []),
+                            "positive": (codex["payload"] or {}).get("positive", {}),
+                            "cwd": (codex["payload"] or {}).get("cwd", ""),
+                            "problems": codex["problems"]},
+        "raw_hashes": raw_hashes,
+        "probe_dirs": [str(probe_dir)],
         "released_at": "",
-        "mechanism_note": "Windows deny ACL（icacls /deny 当前用户与 Codex 沙箱组）；"
-                          "绝对路径/父目录遍历/junction 均由双端真实探测覆盖；"
-                          "属主保留 WRITE_DAC 可解除 deny，不防对抗性绕过。",
+        "mechanism_note": "Windows deny ACL（icacls 单次调用 deny 当前用户与 Codex 沙箱账户）；"
+                          "原 DACL 以 Get-Acl XML 存档并事务恢复；双端确定性探针区分 "
+                          "denied/not_found/error/link_create_failed，仅 denied 计入通过；"
+                          "deny 不防对抗性绕过（属主可自行改 ACL）。",
     }
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -524,16 +1071,32 @@ def write_evidence(out_path: Path, suite_path: Path, audit: dict, window: dict,
     return evidence
 
 
-def check_admission(evidence_path: Path, suite_path: Path = Path(""),
-                    protected: list[Path] | None = None, expected_suite_sha: str = "",
-                    now: datetime | None = None, ttl_s: int = DEFAULT_TTL_S,
-                    codex_version: str | None = None) -> dict:
-    """运行前准入：核对真实证据 + 当前活动窗口；缺一即保持未就绪。
+def _load_raw_probes(evidence: dict) -> tuple[dict, dict]:
+    """准入重验：从磁盘读取两端原始探针结果并核对哈希（不只看 problems 为空）。"""
+    probe_dir = Path((evidence.get("probe_dirs") or [""])[-1])
+    workspace = Path(evidence.get("workspace", ""))
+    paths = {"mentis": probe_dir / "mentis-probe-result.json",
+             "codex": workspace / "probe-codex" / "result.json"}
+    results = {}
+    for side, path in paths.items():
+        if not path.is_file():
+            raise IsolationError(f"{side} 端探针原始记录缺失: {path}")
+        key = "mentis-probe-result.json" if side == "mentis" else "codex-probe-result.json"
+        recorded = evidence.get("raw_hashes", {}).get(key)
+        if recorded and recorded != _sha_file(path):
+            raise IsolationError(f"{side} 端原始记录哈希与证据不符: {path}")
+        results[side] = json.loads(path.read_text(encoding="utf-8-sig"))
+    return results["mentis"], results["codex"]
 
-    判定性地依赖"此刻受保护路径读不到"（live denial check）——证据、
-    清单声明或离线测试都不能替代它。窗口开启期间套件目录本身被保护，
-    冻结核对引用 apply 时的实测；窗口关闭后用 suite_sha256 与当前
-    audit_suite 结果闭环比对。
+
+def check_admission(evidence_path: Path, suite_path: Path = Path(""),
+                    expected: dict | None = None, now: datetime | None = None,
+                    ttl_s: int = DEFAULT_TTL_S, codex_version: str | None = None) -> dict:
+    """运行前准入（v2）：强绑定 + 原始记录重验 + 当前 live 拒读。
+
+    以下任一情况必须不通过：缺证据/schema 不符、窗口已释放、证据过期、
+    身份/探针版本/执行器版本变化、任一端探测缺失（skipped）、原始记录缺失
+    或哈希不符、suite/prepared/组/工作区不匹配、当前受保护路径可读。
     """
     checks: list[dict] = []
 
@@ -559,7 +1122,7 @@ def check_admission(evidence_path: Path, suite_path: Path = Path(""),
 
     if evidence.get("released_at"):
         add("window_active", False, f"窗口已于 {evidence['released_at']} 关闭；"
-                                    "运行前需重新开启并探测")
+                                    "运行前需重新开窗探测")
         return fail_return()
     add("window_active", True, "证据未记录 release")
 
@@ -567,11 +1130,9 @@ def check_admission(evidence_path: Path, suite_path: Path = Path(""),
     try:
         valid_until = datetime.fromisoformat(evidence["valid_until"])
         created = datetime.fromisoformat(evidence["created_at"])
-        fresh = now <= valid_until and now >= created
-        add("evidence_fresh", fresh,
-            f"created_at={evidence.get('created_at')} valid_until={evidence['valid_until']}")
+        add("evidence_fresh", now <= valid_until and now >= created,
+            f"created_at={evidence['created_at']} valid_until={evidence['valid_until']}")
     except (KeyError, ValueError):
-        fresh = False
         add("evidence_fresh", False, "证据缺少或无法解析时间字段")
 
     identity = current_identity()
@@ -581,8 +1142,39 @@ def check_admission(evidence_path: Path, suite_path: Path = Path(""),
         f"当前 {identity['user']}@{identity['host']} vs 证据 "
         f"{evidence.get('identity', {}).get('user')}@{evidence.get('identity', {}).get('host')}")
 
+    add("probe_version_match", evidence.get("probe_version") == PROBE_VERSION,
+        f"当前={PROBE_VERSION} 证据={evidence.get('probe_version')}")
+
+    expected = expected or {}
+    for key in ("prepared_dir", "target_arm", "workspace", "suite_sha256"):
+        if expected.get(key):
+            add(f"binding_{key}", str(evidence.get(key)) == str(expected[key]),
+                f"期望={expected[key]} 证据={evidence.get(key)}")
+
+    add("probe_results_clean",
+        not evidence.get("mentis_env_probe", {}).get("problems")
+        and not evidence.get("codex_env_probe", {}).get("problems"),
+        f"mentis 问题={evidence.get('mentis_env_probe', {}).get('problems') or '无'}；"
+        f"codex 问题={evidence.get('codex_env_probe', {}).get('problems') or '无'}")
+
+    expected_input_sha = evidence.get("input_hashes", {}).get("input.json", "")
+    try:
+        mentis_raw, codex_raw = _load_raw_probes(evidence)
+        add("dual_end_probes_present", True, "双端原始探针结果均存在且哈希一致")
+        expected_entries = evidence.get("expected_entries", [])
+        mentis_problems = judge_probe_entries(mentis_raw, expected_entries,
+                                              expected_input_sha)
+        codex_problems = judge_probe_entries(codex_raw, expected_entries,
+                                             expected_input_sha)
+        add("dual_end_results_reverified", not mentis_problems and not codex_problems,
+            "双端原始记录重验通过"
+            if not mentis_problems and not codex_problems
+            else "mentis: " + "；".join(mentis_problems[:2])
+            + " codex: " + "；".join(codex_problems[:2]))
+    except (IsolationError, json.JSONDecodeError) as exc:
+        add("dual_end_probes_present", False, str(exc))
+
     if codex_version is None:
-        # 与适配器一致地解析可执行文件（npm 的 codex 是 .cmd shim，裸名会 FileNotFoundError）
         from shutil import which
         exe = which("codex") or "codex"
         try:
@@ -591,28 +1183,24 @@ def check_admission(evidence_path: Path, suite_path: Path = Path(""),
             codex_version = proc.stdout.strip() if proc.returncode == 0 else "unknown"
         except (OSError, subprocess.TimeoutExpired):
             codex_version = "unavailable"
-    expected_codex = evidence.get("codex_env_probe", {}).get("cli_version", "")
+    expected_codex = evidence.get("executor", {}).get("cli_version", "")
     add("codex_version_match", bool(codex_version) and codex_version == expected_codex,
         f"当前={codex_version or 'unavailable'} 证据={expected_codex}")
 
-    add("probe_results_clean",
-        not evidence.get("mentis_probe_problems") and not evidence.get("codex_probe_problems"),
-        f"mentis 问题={evidence.get('mentis_probe_problems') or '无'}；"
-        f"codex 问题={evidence.get('codex_probe_problems') or '无'}")
-
-    if expected_suite_sha:
-        add("suite_sha_match", evidence.get("suite_sha256") == expected_suite_sha,
-            f"期望={expected_suite_sha[:12]}… 证据={str(evidence.get('suite_sha256'))[:12]}…")
+    # 输入哈希绑定：目标组 input.json 当前字节必须与证据一致
+    input_sha_recorded = evidence.get("input_hashes", {}).get("input.json", "")
+    arm_input = (Path(evidence.get("prepared_dir", "")) / evidence.get("target_arm", "")
+                 / "input.json")
+    if input_sha_recorded and arm_input.is_file():
+        current = _sha_file(arm_input)
+        add("input_hash_match", current == input_sha_recorded,
+            f"input.json 当前哈希与证据{'一致' if current == input_sha_recorded else '不一致'}")
+    elif input_sha_recorded:
+        add("input_hash_match", False, f"目标组 input.json 不可读或不存在: {arm_input}")
     else:
-        add("suite_sha_match", True,
-            f"证据记录={str(evidence.get('suite_sha256'))[:12]}…（apply 时实测冻结源）")
+        add("input_hash_match", False, "证据缺少 input.json 哈希绑定")
 
     targets = evidence.get("window", {}).get("verification_targets", [])
-    if protected is not None:
-        wanted = {str(Path(p).resolve()) for p in protected}
-        covered = {t.get("protected") for t in targets}
-        add("protected_manifest_covered", wanted <= covered,
-            f"证据验证点覆盖 {len(wanted & covered)}/{len(wanted)} 个受保护路径")
     if not targets:
         add("live_denial_current", False, "证据没有可读性验证点，无法确认窗口当前开启")
         return fail_return()
@@ -633,137 +1221,63 @@ def check_admission(evidence_path: Path, suite_path: Path = Path(""),
 
     passed = all(check["passed"] for check in checks)
     return {"runtime_answer_isolation": {"passed": passed, "checks": checks,
-                                         "evidence": str(evidence_path)}}
+                                         "evidence": str(evidence_path),
+                                         "window_id": evidence.get("window_id", "")}}
 
 
-def run_probe_flow(suite_path: Path, prepared_dir: Path, target_arm: str,
-                   isolation_dir: Path, adapter=None, python_exe: str = sys.executable,
-                   codex_timeout_s: int = 540) -> dict:
-    """完整探测流程：审计 → 开窗 → 双端真实探测 →（全部通过时）写证据。
+def sweep_stale_windows() -> dict:
+    """按窗口锁逐个事务回滚遗留窗口（进程崩溃后的恢复路径）。
 
-    任何一步失败都会先关闭窗口再抛出，避免把仓库留在被锁状态；
-    失败不写证据，准入自然保持未就绪。
+    逐项报告：恢复成功删除锁；恢复失败保留锁并给出原因，绝不谎报已恢复。
     """
-    suite_path, prepared_dir = Path(suite_path), Path(prepared_dir)
-    isolation_dir = Path(isolation_dir)
-    isolation_dir.mkdir(parents=True, exist_ok=True)
-    from mentis.evaluation import audit_suite
-    audit = audit_suite(suite_path)
-    frozen = {check["name"]: check for check in audit["checks"]}
-    if audit["status"] == "invalid" or not frozen["frozen_source_hashes"]["passed"]:
-        raise IsolationError(f"冻结源核对未通过: {audit.get('blocking_reasons')}")
-    protected = protected_manifest(suite_path, prepared_dir, target_arm)
-    window = apply_window(protected)
-    # 窗口记录先于探测落盘：探测中途失败时 release 仍有可靠依据。
-    (isolation_dir / "window.json").write_text(
-        json.dumps({"protected": window["protected"], "accounts": window["accounts"],
-                    "verification_targets": window["verification_targets"],
-                    "opened_at": _iso(_utcnow())}, ensure_ascii=False, indent=2),
-        encoding="utf-8")
-    stamp = _utcnow().strftime("%Y%m%d_%H%M%S")
-    probe_dir = isolation_dir / f"probe-{stamp}"
-    probe_dir.mkdir(parents=True, exist_ok=True)
-    arm_dir = prepared_dir / target_arm
-    workspace = probe_dir / "workspace"
-    shutil.copytree(arm_dir, workspace)
-    evidence_written = False
-    try:
-        probe_files = [Path(t["probe"]) for t in window["verification_targets"]]
-        mentis_payload = probe_mentis_env(workspace, probe_files, probe_dir,
-                                          python_exe=python_exe)
-        mentis_problems = judge_mentis_probe(mentis_payload)
-        codex_payload = {"cli_version": "", "status": "skipped", "denied_files": [],
-                         "read_files": [], "positive_write": "", "usage": {}}
-        codex_problems = []
-        if adapter is not None:
-            codex_payload = probe_codex_env(adapter, workspace,
-                                            _codex_probe_targets(window["verification_targets"]),
-                                            probe_dir, timeout_s=codex_timeout_s)
-            codex_problems = judge_codex_probe(codex_payload)
-        problems = mentis_problems + codex_problems
-        evidence = None
-        if not problems:
-            evidence = write_evidence(
-                isolation_dir / "isolation-evidence.json", suite_path, audit, window,
-                mentis_payload, mentis_problems, codex_payload, codex_problems,
-                probe_dirs=[str(probe_dir)])
-            evidence_written = evidence is not None
-        return {"evidence": evidence, "problems": problems, "window": window,
-                "probe_dir": str(probe_dir), "mentis_payload": mentis_payload,
-                "codex_payload": codex_payload, "audit_suite_sha256": audit["suite_sha256"]}
-    finally:
-        if not evidence_written:
-            # 探测失败或未写证据：不留锁死仓库的窗口。
-            release_window(protected, window["accounts"])
-
-
-def eval_check_with_isolation(suite_path: Path, evidence_path: Path,
-                              expected_suite_sha: str = "",
-                              now: datetime | None = None,
-                              codex_version: str | None = None) -> dict:
-    """eval-check 的隔离感知封装：有证据时接入真实准入，无证据保持未就绪。
-
-    - 窗口开启期间套件目录本身受保护（防身份推断），完整冻结审计无法执行；
-      此时冻结核对引用 apply 时的实测，并在窗口关闭后用 sha256 闭环。
-    - 无证据、证据过期、身份/版本不一致或当前窗口未开启（live 检查可读）
-      一律 runtime_answer_isolation.passed=false——清单声明和离线测试不算数。
-    """
-    suite_path, evidence_path = Path(suite_path), Path(evidence_path)
-    evidence = {}
-    if evidence_path.is_file():
+    WINDOW_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    results = []
+    for lock in sorted(WINDOW_LOCK_DIR.glob("window-*.json")):
         try:
-            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            evidence = {}
-    window_active = bool(evidence.get("schema")) and not evidence.get("released_at")
-    suite_accessible = _readable(suite_path)
-
-    if window_active and not suite_accessible:
-        admission = check_admission(evidence_path, now=now, codex_version=codex_version)
-        passed = admission["runtime_answer_isolation"]["passed"]
-        applied = evidence.get("frozen_input_checks", {})
-        return {
-            "status": "prepared_not_ready",
-            "suite_id": evidence.get("suite_id", ""),
-            "suite_sha256": evidence.get("suite_sha256", ""),
-            "isolation_window": {
-                "active": True,
-                "note": "套件目录在隔离窗口内不可读（防身份推断）；"
-                        "冻结输入核对引用窗口开启（apply）时的实测结果",
-                "applied_checks": applied,
-                "probe_dirs": evidence.get("probe_dirs", []),
-            },
-            "checks": [admission["runtime_answer_isolation"]],
-            "exploratory_blocking_reasons": [] if passed else
-            ["隔离准入未通过：" + "；".join(
-                f"{c['name']}({c['detail']})"
-                for c in admission["runtime_answer_isolation"]["checks"] if not c["passed"])],
-            "formal_claim_limits": ["正式主指标与数值阈值尚未冻结；隔离准入不构成任何效果结论。"],
-            "scope": "隔离窗口开启期间的准入视图；窗口关闭后请再执行 eval-check 做完整冻结审计闭环。",
-        }
-
-    from mentis.evaluation import audit_suite
-    result = audit_suite(suite_path)
-    if not evidence_path.is_file():
-        return result
-    admission = check_admission(evidence_path, suite_path=suite_path,
-                                expected_suite_sha=expected_suite_sha, now=now,
-                                codex_version=codex_version)
-    result["isolation_admission"] = admission["runtime_answer_isolation"]
-    iso = next((c for c in result["checks"] if c["name"] == "runtime_answer_isolation"), None)
-    if iso is not None:
-        iso["passed"] = bool(admission["runtime_answer_isolation"]["passed"])
-        if not iso["passed"]:
-            failed = [f"{c['name']}: {c['detail']}"
-                      for c in admission["runtime_answer_isolation"]["checks"] if not c["passed"]]
-            iso["note"] = "；".join(failed) or "隔离准入未通过"
-    # 窗口关闭后的闭环：证据所指的冻结套件与当前磁盘字节是否一致。
-    recorded_sha = evidence.get("suite_sha256")
-    fresh_sha = result.get("suite_sha256")
-    if recorded_sha and fresh_sha and recorded_sha != fresh_sha:
-        result["blocking_reasons"] = list(result.get("blocking_reasons", [])) + [
-            "隔离证据的 suite_sha256 与当前磁盘上的套件不一致——证据所指冻结材料已被改动"]
-    return result
+            payload = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            results.append({"lock": lock.name, "released": False,
+                            "detail": f"锁不可解析: {exc}"})
+            continue
+        window_dir = payload.get("window_dir", "")
+        log_path = Path(window_dir) / "window.json" if window_dir else None
+        if log_path is None or not log_path.is_file():
+            # 旧格式锁（无 window_dir）：按锁内 protected 清单做 /remove:d 兜底，
+            # 全部恢复可读才删锁；否则保留并如实报告。
+            protected = payload.get("protected", [])
+            if not protected:
+                results.append({"lock": lock.name, "released": False,
+                                "detail": f"恢复日志缺失: {window_dir}"})
+                continue
+            leftovers = []
+            for p in protected:
+                if not Path(p).exists():
+                    continue  # 路径已随临时目录清理消失，无需恢复
+                try:
+                    _icacls([Path(p), *_remove_switches(_deny_accounts())])
+                except IsolationError as exc:
+                    leftovers.append(f"{p}: {exc}")
+                    continue
+                if not _readable(Path(p)):
+                    leftovers.append(f"{p}: remove 后仍不可读")
+            if leftovers:
+                results.append({"lock": lock.name, "released": False,
+                                "detail": "旧格式锁兜底后仍有残留: " + "；".join(leftovers[:3])})
+                continue
+            lock.unlink(missing_ok=True)
+            results.append({"lock": lock.name, "released": True,
+                            "detail": "旧格式锁：按 protected 清单 /remove:d 兜底恢复"})
+            continue
+        try:
+            log = json.loads(log_path.read_text(encoding="utf-8"))
+            log.setdefault("window_dir", window_dir)
+            outcome = release_window(log)
+            results.append({"lock": lock.name, "released": outcome["verified"],
+                            "restored": len(outcome["restored"]),
+                            "failed": outcome["failed"]})
+        except (OSError, json.JSONDecodeError, IsolationError) as exc:
+            results.append({"lock": lock.name, "released": False, "detail": str(exc)[:200]})
+    return {"swept": len(results), "results": results}
 
 
 def eval_isolate_cli(args) -> dict:
@@ -779,44 +1293,131 @@ def eval_isolate_cli(args) -> dict:
         outcome = run_probe_flow(suite_path, prepared, args.arm, isolation_dir,
                                  adapter=adapter)
         return {
-            "ok": outcome["evidence"] is not None,
-            "problems": outcome["problems"],
-            "evidence": str(isolation_dir / "isolation-evidence.json")
-            if outcome["evidence"] else "",
-            "probe_dir": outcome["probe_dir"],
-            "window_open": outcome["evidence"] is not None,
-            "suite_sha256": outcome["audit_suite_sha256"],
-            "codex_status": outcome["codex_payload"].get("status", ""),
-            "next": "窗口保持开启；运行前执行 eval-check --isolation-evidence 做准入，"
-                    "实验结束后 eval-isolate release 关闭窗口。",
+            "ok": outcome.get("ok", False),
+            "single_end_debug": outcome.get("debug", False),
+            "problems": outcome.get("problems", []),
+            "evidence": outcome.get("evidence_path") or "",
+            "probe_dir": outcome.get("probe_dir", ""),
+            "window_kept": outcome.get("window_kept", False),
+            "alive_processes": outcome.get("alive_processes", []),
+            "window_open": bool(outcome.get("evidence")),
+            "suite_sha256": outcome.get("audit_suite_sha256", ""),
+            "codex_status": outcome.get("codex_status", ""),
+            "probe_version": outcome.get("probe_version", ""),
+            "next": "ok=true 时窗口保持开启；运行前执行 eval-check --isolation-evidence 做准入，"
+                    "实验结束后 eval-isolate release 事务恢复原权限。",
         }
     if args.action == "release":
-        window = {}
-        window_file = isolation_dir / "window.json"
-        if window_file.is_file():
+        logs = sorted(isolation_dir.glob("window-*/window.json"))
+        if not logs:
+            # 该准备目录没有恢复日志：按全局窗口锁做崩溃遗留清扫
+            return sweep_stale_windows()
+        # 优先释放当前证据所指的窗口；否则取 created_at 最新的一个
+        evidence_file = isolation_dir / "isolation-evidence.json"
+        evidence_window_id = ""
+        if evidence_file.is_file():
             try:
-                window = json.loads(window_file.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                window = {}
-        if not window:
-            evidence_file = isolation_dir / "isolation-evidence.json"
-            if evidence_file.is_file():
-                window = json.loads(evidence_file.read_text(encoding="utf-8")).get("window", {})
-        if not window or "protected" not in window:
-            raise IsolationError(
-                f"找不到窗口记录（{window_file}），无法安全解除；"
-                "请人工执行 icacls <路径> /remove:d <用户> 核对")
-        outcome = release_window([Path(p) for p in window["protected"]],
-                                 window["accounts"])
+                evidence_window_id = json.loads(
+                    evidence_file.read_text(encoding="utf-8")).get("window_id", "")
+            except (OSError, json.JSONDecodeError):
+                pass
+        candidates = [json.loads(p.read_text(encoding="utf-8")) for p in logs]
+        log = next((c for c in candidates if c.get("window_id") == evidence_window_id), None)             or max(candidates, key=lambda c: c.get("created_at", ""))
+        # 旧版日志缺 window_dir：从全局窗口锁补齐
+        if not log.get("window_dir"):
+            lock = WINDOW_LOCK_DIR / f"window-{log['window_id']}.json"
+            if lock.is_file():
+                try:
+                    log["window_dir"] = json.loads(
+                        lock.read_text(encoding="utf-8")).get("window_dir", "")
+                except (OSError, json.JSONDecodeError):
+                    pass
+        outcome = release_window(log)
         evidence_file = isolation_dir / "isolation-evidence.json"
         if evidence_file.is_file():
             evidence = json.loads(evidence_file.read_text(encoding="utf-8"))
-            evidence["released_at"] = _iso(_utcnow())
-            evidence_file.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n",
-                                     encoding="utf-8")
-        return {"ok": True, "released": True,
-                "paths": len(window["protected"]), "accounts": window["accounts"],
-                "restored_check": outcome["restored_check"]}
+            if evidence.get("window_id") == log["window_id"]:
+                evidence["released_at"] = _iso(_utcnow())
+                evidence["release_restored"] = len(outcome["restored"])
+                evidence["release_failed"] = outcome["failed"]
+                evidence_file.write_text(
+                    json.dumps(evidence, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+        return {"ok": not outcome["failed"], "window_id": log["window_id"],
+                "restored": len(outcome["restored"]),
+                "failed": outcome["failed"],
+                "all_verified": outcome["verified"]}
+    if args.action == "sweep":
+        return sweep_stale_windows()
     # check
     return check_admission(isolation_dir / "isolation-evidence.json",
                            suite_path=suite_path)
+
+
+def eval_check_with_isolation(suite_path: Path, evidence_path: Path,
+                              expected: dict | None = None,
+                              now: datetime | None = None,
+                              codex_version: str | None = None) -> dict:
+    """eval-check 的隔离感知封装：有证据时接入真实准入，无证据保持未就绪。
+
+    - 窗口开启期间套件目录本身受保护（防身份推断），完整冻结审计无法执行；
+      此时冻结核对引用 apply 时的实测，并在窗口关闭后用 suite_sha256 闭环。
+    - 无证据、证据过期、身份/版本不一致或当前窗口未开启（live 检查可读）
+      一律 runtime_answer_isolation.passed=false——清单声明和离线测试不算数。
+    """
+    suite_path, evidence_path = Path(suite_path), Path(evidence_path)
+    evidence = {}
+    if evidence_path.is_file():
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            evidence = {}
+    window_active = (evidence.get("schema") == ISO_SCHEMA
+                     and not evidence.get("released_at"))
+    suite_accessible = _readable(suite_path)
+
+    if window_active and not suite_accessible:
+        admission = check_admission(evidence_path, expected=expected, now=now,
+                                    codex_version=codex_version)
+        passed = admission["runtime_answer_isolation"]["passed"]
+        applied = evidence.get("frozen_input_checks", {})
+        return {
+            "status": "prepared_not_ready",
+            "suite_id": "", "suite_sha256": evidence.get("suite_sha256", ""),
+            "isolation_window": {
+                "active": True,
+                "note": "套件目录在隔离窗口内不可读（防身份推断）；"
+                        "冻结输入核对引用窗口开启（apply）时的实测结果",
+                "applied_checks": applied,
+                "window_id": evidence.get("window_id", ""),
+                "probe_dirs": evidence.get("probe_dirs", []),
+            },
+            "checks": [admission["runtime_answer_isolation"]],
+            "exploratory_blocking_reasons": [] if passed else
+            ["隔离准入未通过：" + "；".join(
+                f"{c['name']}({c['detail']})"
+                for c in admission["runtime_answer_isolation"]["checks"] if not c["passed"])],
+            "formal_claim_limits": ["正式主指标与数值阈值尚未冻结；隔离准入不构成任何效果结论。"],
+            "scope": "隔离窗口开启期间的准入视图；窗口关闭后请再执行 eval-check 做完整冻结审计闭环。",
+        }
+
+    from mentis.evaluation import audit_suite
+    result = audit_suite(suite_path)
+    if not evidence_path.is_file():
+        return result
+    admission = check_admission(evidence_path, expected=expected, now=now,
+                                codex_version=codex_version)
+    result["isolation_admission"] = admission["runtime_answer_isolation"]
+    iso = next((c for c in result["checks"] if c["name"] == "runtime_answer_isolation"), None)
+    if iso is not None:
+        iso["passed"] = bool(admission["runtime_answer_isolation"]["passed"])
+        if not iso["passed"]:
+            failed = [f"{c['name']}: {c['detail']}"
+                      for c in admission["runtime_answer_isolation"]["checks"] if not c["passed"]]
+            iso["note"] = "；".join(failed) or "隔离准入未通过"
+    recorded_sha = evidence.get("suite_sha256")
+    fresh_sha = result.get("suite_sha256")
+    if recorded_sha and fresh_sha and recorded_sha != fresh_sha:
+        result["blocking_reasons"] = list(result.get("blocking_reasons", [])) + [
+            "隔离证据的 suite_sha256 与当前磁盘上的套件不一致——证据所指冻结材料已被改动"]
+    return result

@@ -117,8 +117,8 @@ def main(argv=None) -> int:
     eprepare = sub.add_parser("eval-prepare", help="E1 离线输入导出；不调用模型，不证明答案读隔离")
     eprepare.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
     eprepare.add_argument("--out", required=True, help="全新输出目录，已有内容时拒绝覆盖")
-    eiso = sub.add_parser("eval-isolate", help="E1 运行端答案读隔离：开窗探测 / 解除 / 准入查看")
-    eiso.add_argument("action", choices=["probe", "release", "check"])
+    eiso = sub.add_parser("eval-isolate", help="E1 运行端答案读隔离：开窗探测 / 解除 / 准入 / 遗留清扫")
+    eiso.add_argument("action", choices=["probe", "release", "check", "sweep"])
     eiso.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
     eiso.add_argument("--prepared", required=True, help="eval-prepare 输出的目录")
     eiso.add_argument("--arm", default="input-001/M",
@@ -167,6 +167,8 @@ def main(argv=None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         if args.action == "check":
             return 0 if result.get("runtime_answer_isolation", {}).get("passed") else 1
+        if args.action == "sweep":
+            return 0 if all(r.get("released") for r in result.get("results", [])) else 1
         return 0 if result.get("ok") else 1
 
     if args.command == "demo-contract":
