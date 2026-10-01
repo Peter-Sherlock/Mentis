@@ -324,7 +324,11 @@ class CollabFlowTests(unittest.TestCase):
         self.assertTrue(review.passed)
         events = load_events(collab.run_dir)
         kinds = [e["kind"] for e in events]
-        self.assertEqual(kinds.count("review.recorded"), 2)
+        # 结构检查×2（v1/v2）+ 专业评审未执行（use_model=False）×2 次 finalize 各一条
+        self.assertEqual(kinds.count("review.recorded"), 4)
+        unavailable = [e for e in events if e["kind"] == "review.recorded"
+                       and "专业评审未执行" in e["summary"]]
+        self.assertEqual(len(unavailable), 2)  # 无模型时如实标注，不冒充评审通过
         self.assertIn("brief.updated", kinds)
         prompt_v2 = (collab.run_dir / "trace" / "prompts" /
                      f"{collab.session.attempts[-1].attempt_id}.md").read_text(encoding="utf-8")

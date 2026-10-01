@@ -782,116 +782,17 @@ class GuidanceCycle:
             return "not_improved"
         return "partially_improved"
 
-    def _measurement_anomalies(self, v) -> list:
-        """单视口测量可信度：报错、尺寸为 0 或与目标视口不符都不可作为"通过"依据。"""
-        problems = []
-        if v.errors:
-            problems.append("测量报错：" + "；".join(v.errors))
-        if v.inner_width <= 0:
-            problems.append(f"视口尺寸异常：innerWidth {v.inner_width}")
-        elif v.inner_width != v.width:
-            problems.append(f"视口宽度不符：请求 {v.width}px、实际 {v.inner_width}px"
-                            "（布局不在目标视口，溢出数值不可信）")
-        return problems
-
     def _deterministic_checks(self, pack: ObservationPack) -> tuple[list, list, list]:
-        """保留项（逐段）、表单逐字段必填与溢出的确定性复检。
-
-        返回 (findings, regression, unknown)：unknown 是"无法确认"项——
-        测量不可信或缺记录时溢出记为未知，不得以零溢出判通过。
-        """
-        findings, regression, unknown = [], [], []
-        text_blob = "\n".join(i.text for i in pack.structure.items)
-        for label, needle in self._preserved:
-            if needle in text_blob:
-                findings.append(f"保留项 {label}（{needle}）：在")
-            else:
-                findings.append(f"保留项 {label}（{needle}）：缺失")
-                regression.append(f"{label}缺失（{needle}）")
-        inputs = [i for i in pack.structure.items if i.kind in ("input", "textarea")]
-        by_text = {}
-        for i in inputs:
-            by_text.setdefault(i.text, []).append(i)
-        for name in getattr(self, "_form_field_requirements", []) or []:
-            hits = by_text.get(name, [])
-            if not hits:
-                regression.append(f"表单字段 {name} 缺失")
-                findings.append(f"表单字段 {name}：缺失")
-            elif not any(h.extra.get("required") == "yes" for h in hits):
-                regression.append(f"表单字段 {name} 的必填要求丢失")
-                findings.append(f"表单字段 {name}：存在但必填要求丢失")
-            else:
-                findings.append(f"表单字段 {name}：存在且必填")
-        if getattr(self, "_form_field_requirements", []) and len(inputs) < len(
-                self._form_field_requirements):
-            regression.append(f"表单字段总数减少：要求 ≥{len(self._form_field_requirements)}，"
-                              f"实际 {len(inputs)}")
-            findings.append(f"表单字段总数：{len(inputs)}（要求 ≥{len(self._form_field_requirements)}）")
-        if not pack.measurement.viewports:
-            unknown.append("无渲染测量记录：溢出与表单行为无法确认")
-        for v in pack.measurement.viewports:
-            anomalies = self._measurement_anomalies(v)
-            if anomalies:
-                unknown.append(f"{v.name} 视口测量不可信：{'；'.join(anomalies)}")
-                findings.append(f"{v.name} 视口横向溢出：未知（测量不可信，不作为通过依据）")
-                continue
-            ni = v.network_intent or {}
-            if ni.get("hasFetch") or ni.get("hasXHR") or ni.get("hasBeacon"):
-                regression.append(f"{v.name} 视口出现网络调用声明（违反本地无网络约束）")
-            if v.overflow_px > 0 or v.overflowing:
-                regression.append(
-                    f"{v.name} 视口出现横向溢出 {v.overflow_px}px（{len(v.overflowing)} 个元素）")
-            else:
-                findings.append(f"{v.name} 视口无横向溢出")
-        return findings, regression, unknown
+        return deterministic_checks(pack, self._preserved, self._form_field_requirements)
 
     def _model_review(self, v2_html: Path, bundle: DiagnosisBundle, defect_ids: list,
                       pack2: ObservationPack, images2: list, tag: str,
                       record: RoundRecord) -> tuple[list, list, list]:
-        if not self.use_model or not self.gateway.has_credentials():
-            self._notify("模型不可用：修订复查降级为仅确定性检查")
-            return [], [f"d{i}" for i in defect_ids], []
-        defect_list = "\n".join(
-            f"- ({did}) {d.phenomenon}（证据：{'，'.join(d.evidence_refs)}）"
-            for did, d in zip(defect_ids, bundle.valid_diagnoses))
-        system = (
-            "你是网页修改复查者。给你修改前的诊断清单和修改后的观察记录与截图。"
-            "只输出 JSON：resolved（已解决的诊断编号数组）、unresolved（未解决的编号数组）、"
-            "new_issues（新发现问题的字符串数组，没有则空数组）、summary（一句话）。"
-            "编号必须来自诊断清单；不得虚构观察记录中不存在的证据。"
-        )
-        user_prompt = (
-            f"[目标] {self._goal}\n\n[修改前的诊断清单]\n{defect_list}\n\n"
-            f"[修改后的观察记录]\n{pack2.render_text()}\n\n"
-            "[输出要求] 只输出 JSON 对象：resolved/unresolved/new_issues/summary。"
-            "判断每个编号对应的问题在修改后的页面中是否仍然存在。"
-        )
-        gw_record = (self.gateway.complete(system, user_prompt, images=images2)
-                     if images2 else self.gateway.complete(system, user_prompt))
-        (self.run_dir / f"model-review-{tag}.json").write_text(json.dumps({
-            "ok": gw_record.ok, "mock": gw_record.mock, "model": gw_record.model,
-            "usage": gw_record.usage, "error": gw_record.error,
-            "image_refs": gw_record.image_refs,
-            "reviewed_html_sha256": _sha256_file(v2_html),  # 复查所针对产物版本的绑定
-            "response": gw_record.response_text[:4000],
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-        record.review_path = str(self.run_dir / f"model-review-{tag}.json")
-        if not gw_record.ok:
-            self._notify(f"模型复查调用失败（{gw_record.error}）：按未确认处理，不标改善")
-            return [], list(defect_ids), []
-        try:
-            data = json.loads(gw_record.response_text)
-        except json.JSONDecodeError as exc:
-            self._notify(f"模型复查输出不是合法 JSON（{exc}）：按未确认处理")
-            return [], list(defect_ids), []
-        known = set(defect_ids)
-        resolved = [r for r in data.get("resolved", []) if r in known]
-        unresolved = [r for r in data.get("unresolved", []) if r in known]
-        unknown_refs = [r for r in (*data.get("resolved", []), *data.get("unresolved", []))
-                        if r not in known]
-        if unknown_refs:
-            self._notify(f"复查引用了不存在的诊断编号 {unknown_refs}：已剔除并记录")
-        new_issues = [str(x) for x in data.get("new_issues", []) if str(x).strip()]
+        out_path = self.run_dir / f"model-review-{tag}.json"
+        resolved, unresolved, new_issues = run_model_review(
+            self.gateway, self._goal, v2_html, bundle, defect_ids, pack2, images2,
+            out_path, use_model=self.use_model, notify=self._notify)
+        record.review_path = str(out_path)
         return resolved, unresolved, new_issues
 
     # ---- 工作区与版本 ----
@@ -1404,6 +1305,128 @@ class GuidanceCycle:
 
 
 # ---- 指令组装与辅助 ----
+
+def _measurement_anomalies(v) -> list:
+    """单视口测量可信度：报错、尺寸为 0 或与目标视口不符都不可作为"通过"依据。"""
+    problems = []
+    if v.errors:
+        problems.append("测量报错：" + "；".join(v.errors))
+    if v.inner_width <= 0:
+        problems.append(f"视口尺寸异常：innerWidth {v.inner_width}")
+    elif v.inner_width != v.width:
+        problems.append(f"视口宽度不符：请求 {v.width}px、实际 {v.inner_width}px"
+                        "（布局不在目标视口，溢出数值不可信）")
+    return problems
+
+
+def deterministic_checks(pack: ObservationPack, preserved: list,
+                         form_field_requirements: list | None) -> tuple[list, list, list]:
+    """保留项（逐段）、表单逐字段必填与溢出的确定性复检（T4 提取为模块级，collab 复用）。
+
+    返回 (findings, regression, unknown)：unknown 是"无法确认"项——
+    测量不可信或缺记录时溢出记为未知，不得以零溢出判通过。
+    """
+    findings, regression, unknown = [], [], []
+    text_blob = "\n".join(i.text for i in pack.structure.items)
+    for label, needle in preserved:
+        if needle in text_blob:
+            findings.append(f"保留项 {label}（{needle}）：在")
+        else:
+            findings.append(f"保留项 {label}（{needle}）：缺失")
+            regression.append(f"{label}缺失（{needle}）")
+    inputs = [i for i in pack.structure.items if i.kind in ("input", "textarea")]
+    by_text = {}
+    for i in inputs:
+        by_text.setdefault(i.text, []).append(i)
+    for name in form_field_requirements or []:
+        hits = by_text.get(name, [])
+        if not hits:
+            regression.append(f"表单字段 {name} 缺失")
+            findings.append(f"表单字段 {name}：缺失")
+        elif not any(h.extra.get("required") == "yes" for h in hits):
+            regression.append(f"表单字段 {name} 的必填要求丢失")
+            findings.append(f"表单字段 {name}：存在但必填要求丢失")
+        else:
+            findings.append(f"表单字段 {name}：存在且必填")
+    if form_field_requirements and len(inputs) < len(form_field_requirements):
+        regression.append(f"表单字段总数减少：要求 ≥{len(form_field_requirements)}，"
+                          f"实际 {len(inputs)}")
+        findings.append(f"表单字段总数：{len(inputs)}（要求 ≥{len(form_field_requirements)}）")
+    if not pack.measurement.viewports:
+        unknown.append("无渲染测量记录：溢出与表单行为无法确认")
+    for v in pack.measurement.viewports:
+        anomalies = _measurement_anomalies(v)
+        if anomalies:
+            unknown.append(f"{v.name} 视口测量不可信：{'；'.join(anomalies)}")
+            findings.append(f"{v.name} 视口横向溢出：未知（测量不可信，不作为通过依据）")
+            continue
+        ni = v.network_intent or {}
+        if ni.get("hasFetch") or ni.get("hasXHR") or ni.get("hasBeacon"):
+            regression.append(f"{v.name} 视口出现网络调用声明（违反本地无网络约束）")
+        if v.overflow_px > 0 or v.overflowing:
+            regression.append(
+                f"{v.name} 视口出现横向溢出 {v.overflow_px}px（{len(v.overflowing)} 个元素）")
+        else:
+            findings.append(f"{v.name} 视口无横向溢出")
+    return findings, regression, unknown
+
+
+def run_model_review(gateway, goal: str, html_path: Path, bundle: DiagnosisBundle,
+                     defect_ids: list, pack: ObservationPack, images: list, out_path: Path,
+                     use_model: bool = True, notify=None) -> tuple[list, list, list]:
+    """模型复查：对照修改前诊断清单核对修改后观察与截图（T4 提取为模块级，collab 复用）。
+
+    返回 (resolved, unresolved, new_issues)；输出落盘 out_path 并绑定当前产物哈希。
+    """
+    def _notify(message: str):
+        if notify is not None:
+            notify(message)
+
+    if not use_model or not gateway.has_credentials():
+        _notify("模型不可用：修订复查降级为仅确定性检查")
+        return [], [f"d{i}" for i in defect_ids], []
+    defect_list = "\n".join(
+        f"- ({did}) {d.phenomenon}（证据：{'，'.join(d.evidence_refs)}）"
+        for did, d in zip(defect_ids, bundle.valid_diagnoses))
+    system = (
+        "你是网页修改复查者。给你修改前的诊断清单和修改后的观察记录与截图。"
+        "只输出 JSON：resolved（已解决的诊断编号数组）、unresolved（未解决的编号数组）、"
+        "new_issues（新发现问题的字符串数组，没有则空数组）、summary（一句话）。"
+        "编号必须来自诊断清单；不得虚构观察记录中不存在的证据。"
+    )
+    user_prompt = (
+        f"[目标] {goal}\n\n[修改前的诊断清单]\n{defect_list}\n\n"
+        f"[修改后的观察记录]\n{pack.render_text()}\n\n"
+        "[输出要求] 只输出 JSON 对象：resolved/unresolved/new_issues/summary。"
+        "判断每个编号对应的问题在修改后的页面中是否仍然存在。"
+    )
+    gw_record = (gateway.complete(system, user_prompt, images=images)
+                 if images else gateway.complete(system, user_prompt))
+    out_path.write_text(json.dumps({
+        "ok": gw_record.ok, "mock": gw_record.mock, "model": gw_record.model,
+        "usage": gw_record.usage, "error": gw_record.error,
+        "image_refs": gw_record.image_refs,
+        "reviewed_html_sha256": _sha256_file(html_path),  # 复查所针对产物版本的绑定
+        "response": gw_record.response_text[:4000],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not gw_record.ok:
+        _notify(f"模型复查调用失败（{gw_record.error}）：按未确认处理，不标改善")
+        return [], list(defect_ids), []
+    try:
+        data = json.loads(gw_record.response_text)
+    except json.JSONDecodeError as exc:
+        _notify(f"模型复查输出不是合法 JSON（{exc}）：按未确认处理")
+        return [], list(defect_ids), []
+    known = set(defect_ids)
+    resolved = [r for r in data.get("resolved", []) if r in known]
+    unresolved = [r for r in data.get("unresolved", []) if r in known]
+    unknown_refs = [r for r in (*data.get("resolved", []), *data.get("unresolved", []))
+                    if r not in known]
+    if unknown_refs:
+        _notify(f"复查引用了不存在的诊断编号 {unknown_refs}：已剔除并记录")
+    new_issues = [str(x) for x in data.get("new_issues", []) if str(x).strip()]
+    return resolved, unresolved, new_issues
+
 
 def compose_revision_instruction(bundle: DiagnosisBundle, defect_ids: list,
                                  pack: ObservationPack, preserved: list,

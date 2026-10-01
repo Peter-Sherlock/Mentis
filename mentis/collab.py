@@ -8,7 +8,9 @@
 - 执行器反问先由 Mentis 分流：素材可答、常规专业问题自主回答；只有用户独有
   事实/取舍/许可才请求用户。
 - 共同设计是用户主动选择（--design）；"不知道"记为暂定假设继续，不阻塞。
-- 模型诊断候选只记录不自动执行修改（修改收益验证属 P3.2）。
+- T4 补修：Codex 首稿是供 Mentis 审查的工作稿——交付前做专业评审（结构+渲染
+  测量+截图+模型诊断），候选逐条审查（采纳/驳回/保持现状/待用户，理由留档）；
+  成立问题在预算内转成修订指令委托 Codex 并复检；合格不改但留接受依据。
 - 不声称货币硬上限；只记录调用次数、时长与可取得的 token 用量。
 """
 
@@ -23,13 +25,21 @@ from mentis.capabilities.registry import load_registry
 from mentis.capabilities.routing import Gap, route_gap
 from mentis.capabilities.selection import select_for_task
 from mentis.contracts import AttemptStatus, DelegationPolicy, Disposition, Provenance, SourcedItem
-from mentis.diagnosis import render_bundle_markdown, run_diagnosis
+from mentis.diagnosis import DiagnosisBundle, render_bundle_markdown, run_diagnosis
 from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskResult, CodexTaskSpec
+# T4 补修：交付前专业评审复用 guidance 的观察/诊断/指令/复检机制（提取为模块级函数），
+# 不另建平行流程。
+from mentis.guidance import (AUTONOMOUS_DECISION_TEXT, ObservationPack, _CHANGE_VERBS,
+                             _NEW_FACT_HINTS, _RESERVED_NOUNS, _diagnosis_system_prompt,
+                             _measurement_anomalies, _measurement_to_dict,
+                             compose_revision_instruction, deterministic_checks,
+                             run_model_review)
 from mentis.models.gateway import ModelConfig, ModelGateway
 from mentis.observation import observe_structure
 from mentis.persist import save_session, session_from_dict
+from mentis.render_measurement import measure_page
 from mentis.session import TaskSession
-from mentis.trace import TraceArchiveError, TraceWriter
+from mentis.trace import TraceArchiveError, TraceWriter, _sha256_file
 
 COLLAB_DIR = Path("runtime") / "collab"
 STATE_VERSION = "p2.3"
@@ -142,6 +152,9 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.applied_answers = bool(meta.get("applied_answers", False))
     obj.status = meta.get("status", "created")
     obj.last_diagnosis = None
+    obj.last_professional_review = {}
+    obj._review_form_requirements = []
+    obj.measure = measure_page
     obj.run_dir = state_path.parent if isinstance(state_path, Path) else Path(state_path).parent
     obj._finalized_emitted = False
     obj.trace = TraceWriter(obj.run_dir, obj.run_id, executor_version=obj.adapter.cli_version)
@@ -155,7 +168,7 @@ class Collaboration:
     def __init__(self, goal: str, mode: str = "autonomous", direction: str = "",
                  interactive: bool = False, adapter=None, gateway=None,
                  browser_capture=None, max_repairs: int = 1, timeout_s: int = 420,
-                 use_model: bool = True, run_id: str = "", base_dir=None):
+                 use_model: bool = True, run_id: str = "", base_dir=None, measure=None):
         self.base_dir = Path(base_dir) if base_dir else COLLAB_DIR
         self.run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S") + "-" + os.urandom(2).hex()
         self.mode = mode
@@ -163,6 +176,7 @@ class Collaboration:
         self.max_repairs = max_repairs
         self.timeout_s = timeout_s
         self.use_model = use_model
+        self.measure = measure or measure_page  # 渲染测量（T4 补修：可注入替身）
         self._direction = direction
         self._last_answer = ""
         self.session = TaskSession(goal=goal)
@@ -179,6 +193,8 @@ class Collaboration:
         self.applied_answers = False
         self.status = "created"
         self.last_diagnosis = None
+        self.last_professional_review: dict = {}
+        self._review_form_requirements: list = []
         self.run_dir = self.base_dir / self.run_id
         self._finalized_emitted = False
         # P2.4-T1：追踪写入器（契约 mentis-trace/1）；委托/复检/收尾点写入
@@ -528,7 +544,11 @@ class Collaboration:
         return findings, blocking
 
     def _finalize(self, attempt) -> bool:
-        """观察 → 硬要求检查 → 有界修复 → 模型诊断候选 → 接受判定。返回是否交付。"""
+        """观察 → 硬要求检查 → 有界修复 → **交付前专业评审与指导修订** → 接受判定。
+
+        返回是否交付；最终状态（含 UNKNOWN/UNVERIFIED/FAILED）由本方法设定，
+        调用方不得再用 delivered 覆盖（T4 补修）。
+        """
         structure, browser_obs = self.observe_artifact()
         findings, blocking = self.hard_requirement_review(structure)
         self.session.record_review(
@@ -569,26 +589,397 @@ class Collaboration:
             self.status = "NOT_DELIVERED"
             self._persist(structure, browser_obs, delivered=False)
             return False
-        if self.use_model and self.gateway.has_credentials():
-            context, _ = self.current_context()
-            bundle = run_diagnosis(self.gateway, self.session.current_brief.objective,
-                                   "", structure, context)
-            self.last_diagnosis = bundle
-            (self.run_dir / "diagnosis.md").write_text(
-                render_bundle_markdown(bundle), encoding="utf-8")
-            self.notify(f"模型诊断候选：有效 {len(bundle.valid_diagnoses)} 条，"
-                        f"拒收 {len(bundle.invalid_diagnoses)} 条（仅记录，修改收益验证属 P3.2）")
+        review = self._professional_review(attempt)
+        if review.get("block_delivery"):
+            self.status = review["status"]
+            self.notify(f"运行收尾：{self.status}；{review.get('delivery_note', '')}")
+            self._persist(review.get("structure") or structure,
+                          review.get("browser_obs") or browser_obs, delivered=False)
+            return False
+        final_attempt = review.get("accept_attempt") or attempt
         delivered = False
         try:
-            self.session.accept(attempt.attempt_id)
+            self.session.accept(final_attempt.attempt_id)
             delivered = True
-            self.notify("结构检查通过 → 初稿已交付（可查看）；最终完成与满意度由你判断，"
-                        "反馈可形成下一轮委托（PROJECT_PLAN §7 阶段性交付）")
+            self.notify("结构检查与专业评审完成 → 初稿已交付（可查看）；" + review.get("delivery_note", ""))
         except Exception as exc:
             self.notify(f"接受被拒绝：{exc}")
         self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
-        self._persist(structure, browser_obs, delivered=delivered)
+        self._persist(review.get("structure") or structure,
+                      review.get("browser_obs") or browser_obs, delivered=delivered)
         return delivered
+
+    # ---- 交付前专业评审（T4 补修：Codex 首稿是供 Mentis 审查的工作稿） ----
+
+    def _observe_full(self, tag: str, attempt_id: str | None = None):
+        """专业评审观察：结构 + 渲染测量 + 双视口截图（复用 guidance 的观察语义）。
+
+        返回 (ObservationPack, images[(名称, PNG 字节)], browser_obs)；
+        截图失败不中断——诊断将不声称看过画面（视觉维度未验证）。
+        """
+        index = self.workspace / "index.html"
+        out = self.obs_dir / f"review-{tag}"
+        structure = observe_structure(str(index))
+        measurement = self.measure(index, out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "measurement.json").write_text(
+            json.dumps(_measurement_to_dict(measurement), ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        # 观察引用绑定不可变副本（工作区 index.html 会随后续修订合法演化，
+        # 直接引用会令回放审计误报哈希不匹配——T4 真实运行发现）
+        snapshot = out / "page-snapshot.html"
+        snapshot.write_bytes(index.read_bytes())
+        images, image_names, browser_obs = [], [], None
+        capture = self.browser_capture
+        if capture is None:
+            from mentis.browser_observation import capture_local_html
+
+            capture = capture_local_html
+        try:
+            browser_obs = capture(index, out)
+            for view in browser_obs.views:
+                if view.screenshot_path and not view.error:
+                    blob = Path(view.screenshot_path).read_bytes()
+                    images.append((view.name + ".png", blob))
+                    image_names.append(f"{view.name}.png（{view.actual_width}×{view.actual_height}）")
+        except Exception as exc:
+            self.notify(f"截图采集失败（{type(exc).__name__}）：诊断不声称看过画面（视觉未验证）")
+        brief_version = self.session.current_brief.version
+        self.trace.emit("observer", "observation.structure",
+                        f"专业评审观察 {len(structure.items)} 条目（sha256 前 12 位 {structure.sha256[:12]}）",
+                        attempt_id=attempt_id, brief_version=brief_version,
+                        refs=[{"path": str(snapshot), "sha256": structure.sha256, "role": "observation"}])
+        self.trace.emit("observer", "observation.render",
+                        "渲染测量：" + "; ".join(
+                            f"{v.name} 溢出 {v.overflow_px}px/异常 {len(v.errors)}"
+                            for v in measurement.viewports),
+                        attempt_id=attempt_id, brief_version=brief_version,
+                        refs=[{"path": str(out / "measurement.json"),
+                               "sha256": _sha256_file(out / "measurement.json"),
+                               "role": "observation"}])
+        pack = ObservationPack(structure=structure, measurement=measurement,
+                               image_names=image_names)
+        return pack, images, browser_obs
+
+    def _preserved_items(self) -> list:
+        """修订必须保留的活动事实（预期值来自素材推导，随 brief 版本更新）。"""
+        return [(label, needle) for label, needle in self._expected_values().items()]
+
+    def _adjudicate_candidates(self, bundle: DiagnosisBundle, pack: ObservationPack,
+                               attempt_id: str | None) -> list:
+        """逐一审查诊断候选："字段合法、引用存在"不等于问题成立。
+
+        确定性核对 + 规则分流：保持现状类建议不进入修订任务；溢出主张对照可信
+        渲染测量数值；触及保留决定（变更意图+保留名词）转用户；其余可逆专业取舍
+        自主采纳。候选与审查依据同源模型，独立性未建立——复检以独立观察为准。
+        """
+        keep_hints = ("保持现状", "保持当前", "保留当前", "无需修改", "维持现状", "保留现状",
+                      "保持不变", "不建议修改", "无需改动", "无需调整")
+        records = []
+        measurement_errors = [e for v in pack.measurement.viewports for e in v.errors]
+        trusted = [v for v in pack.measurement.viewports if not _measurement_anomalies(v)]
+        total_overflow = sum(v.overflow_px for v in trusted)
+        total_offenders = sum(len(v.overflowing) for v in trusted)
+        brief_version = self.session.current_brief.version
+        for idx, d in enumerate(bundle.valid_diagnoses, 1):
+            no = f"d{idx}"
+            joined = d.phenomenon + "｜" + d.interpretation + "｜" + "；".join(d.modification_candidates)
+            if any(h in joined for h in keep_hints):
+                decision, status = "keep_as_is", "ok"
+                reason = "候选建议为保持现状：不进入修订任务（不为增加交流轮数强行修改）"
+            elif "溢出" in joined and trusted and total_overflow == 0 and total_offenders == 0:
+                decision, status = "reject", "ok"
+                reason = ("候选主张横向溢出，但可信渲染测量显示双视口溢出 0px、无溢出元素"
+                          "——证据不支持，驳回")
+            elif "溢出" in joined and (measurement_errors or not trusted):
+                decision, status = "pending", "unknown"
+                reason = "候选主张溢出但渲染测量不可信/缺失：留待观察修复后核对，不据此修订"
+            elif (any(v in d.phenomenon for v in _CHANGE_VERBS)
+                  and any(n in d.phenomenon for n in _RESERVED_NOUNS)):
+                decision, status = "needs_user", "pending"
+                reason = "触及用户保留决定（变更意图+保留事项）：修订暂停，等待用户决定（沉默≠批准）"
+            else:
+                decision, status = "adopt", "ok"
+                reason = ("证据引用可解析且与观察记录不矛盾；可逆的专业取舍由 Mentis 自主处理"
+                          "（ADR-002）；候选与审查同源模型、独立性未建立——复检以独立观察为准")
+            records.append({"no": no, "severity": d.severity, "phenomenon": d.phenomenon,
+                            "evidence_refs": list(d.evidence_refs),
+                            "decision": decision, "reason": reason})
+            self.trace.emit("mentis", "decision.routed",
+                            f"候选审查 {no}「{d.phenomenon[:60]}」→ {decision}；理由：{reason[:130]}",
+                            attempt_id=attempt_id, brief_version=brief_version, status=status)
+        return records
+
+    def _professional_review(self, attempt) -> dict:
+        result = self._professional_review_impl(attempt)
+        self.last_professional_review["note"] = result.get("delivery_note", "")
+        return result
+
+    def _professional_review_impl(self, attempt) -> dict:
+        """交付前专业评审与指导修订。结构硬要求通过后调用；不改现有权限规则。
+
+        返回 {"accept_attempt", "block_delivery", "status", "delivery_note",
+              "structure", "browser_obs"}——_finalize 据此决定接受与最终状态。
+        依据：当前目标与约束、领域规则（草案）、当前版本截图与可信测量；
+        所有结论关联当前产物版本；缺观察的维度如实标未验证。
+        """
+        result: dict = {"accept_attempt": None, "block_delivery": False, "status": None,
+                        "delivery_note": "", "structure": None, "browser_obs": None}
+        brief_version = self.session.current_brief.version
+        if not (self.use_model and self.gateway.has_credentials()):
+            self.last_professional_review = {"performed": False, "reason": "模型不可用"}
+            self.notify("专业评审未执行（模型不可用）：初稿仅通过结构硬要求检查，"
+                        "不宣称领域标准评审通过")
+            self.trace.emit("mentis", "review.recorded",
+                            "专业评审未执行（模型不可用）；仅结构硬要求检查"
+                            "——不宣称领域标准评审通过",
+                            attempt_id=attempt.attempt_id, brief_version=brief_version,
+                            status="unknown")
+            result["delivery_note"] = "专业评审未执行（模型不可用）；最终完成与满意度待你判断"
+            return result
+        origin = ""
+        try:
+            pack, images, browser_obs = self._observe_full("professional", attempt.attempt_id)
+        except Exception as exc:
+            self.last_professional_review = {"performed": False, "reason": f"观察失败：{type(exc).__name__}"}
+            self.notify(f"专业评审观察失败（{type(exc).__name__}）：不冒充评审通过；"
+                        "初稿按结构检查结果处理")
+            self.trace.emit("mentis", "review.recorded",
+                            f"专业评审观察失败：{type(exc).__name__}：{str(exc)[:120]}；评审未执行",
+                            attempt_id=attempt.attempt_id, brief_version=brief_version,
+                            status="unknown")
+            result["delivery_note"] = "专业评审观察失败（测量/截图不可用）；评审未执行"
+            return result
+        self._review_form_requirements = sorted({
+            i.text for i in pack.structure.items
+            if i.kind in ("input", "textarea") and i.extra.get("required") == "yes"})
+        # 诊断（领域规则草案 + 截图 + 渲染测量；无截图时模型被明确禁止声称看过画面）
+        context, _ = select_for_task(
+            load_registry(), task_label="页面诊断与修改指导",
+            task_keywords=["单页活动介绍页"],
+            decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
+            observation_capabilities={"structure_only": True, "screenshots": bool(images),
+                                      "render_measurement": True},
+            can_execute=True)
+        bundle = run_diagnosis(self.gateway, self.session.current_brief.objective, "",
+                               pack, context, images=images, system=_diagnosis_system_prompt())
+        self.last_diagnosis = bundle
+        diagnosis_path = self.run_dir / "diagnosis-professional.md"
+        image_note = ""
+        if getattr(self.gateway, "calls", None):
+            refs = getattr(self.gateway.calls[-1], "image_refs", [])
+            if refs:
+                image_note = f"\n- 图像输入：{';'.join(refs)}（随诊断请求发送的截图）"
+        diagnosis_path.write_text(render_bundle_markdown(bundle) + image_note, encoding="utf-8")
+        origin = "Mock 固定响应" if bundle.mock else f"真实模型 {bundle.model}"
+        self.trace.emit("mentis", "observation.diagnosis",
+                        f"专业评审诊断（{'Mock' if bundle.mock else '真实模型'}）："
+                        f"有效 {len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}、"
+                        f"决策请求 {len(bundle.valid_decision_requests)}",
+                        attempt_id=attempt.attempt_id, brief_version=brief_version,
+                        status="ok" if bundle.valid_diagnoses else "unknown",
+                        refs=[{"path": str(diagnosis_path),
+                               "sha256": _sha256_file(diagnosis_path), "role": "diagnosis"}])
+        self.notify(f"专业评审诊断（{origin}）：有效 {len(bundle.valid_diagnoses)}、"
+                    f"拒收 {len(bundle.invalid_diagnoses)}、决策请求 "
+                    f"{len(bundle.valid_decision_requests)}"
+                    + ("" if images else "；**无截图输入，视觉维度未验证**"))
+        # 决策请求分流：常规可逆取舍自主处理；用户独有事实/重要取舍/许可才请求决定
+        agent_decisions: list = []
+        pending_user = False
+        for request in bundle.valid_decision_requests:
+            q = request.question
+            change_intent = any(v in q for v in _CHANGE_VERBS)
+            touches_reserved = any(n in q for n in _RESERVED_NOUNS)
+            asks_new_fact = any(h in q for h in _NEW_FACT_HINTS) and not touches_reserved
+            if (change_intent and touches_reserved) or asks_new_fact:
+                answered = self.ask_user(
+                    q, blocking_action="review-fix",
+                    blocking_reason=request.blocking_reason,
+                    unique=request.user_unique_info_or_auth_basis,
+                    excluded=request.excluded_autonomous_paths)
+                if answered:
+                    agent_decisions.append(f"问：{q}\n  用户回答：{self._last_answer}")
+                else:
+                    pending_user = True
+            else:
+                agent_decisions.append(f"问：{q}\n  Mentis 自主决定：{AUTONOMOUS_DECISION_TEXT}")
+                self.trace.emit("mentis", "decision.routed",
+                                f"agent_decide：{q}；可逆专业取舍；决定 {AUTONOMOUS_DECISION_TEXT[:80]}",
+                                attempt_id=attempt.attempt_id, brief_version=brief_version)
+        # 候选审查（采纳/驳回/保持现状/待用户，理由逐条留档）
+        adjudication = self._adjudicate_candidates(bundle, pack, attempt.attempt_id)
+        adopted = [c for c in adjudication if c["decision"] == "adopt"]
+        rejected = [c for c in adjudication if c["decision"] == "reject"]
+        keep = [c for c in adjudication if c["decision"] == "keep_as_is"]
+        needs_decision = [c for c in adjudication if c["decision"] == "needs_user"]
+        pending_check = [c for c in adjudication if c["decision"] == "pending"]
+        review_doc = {
+            "reviewed_artifact_sha256": pack.sha256,
+            "observation": {"images": pack.image_names,
+                            "measurement_errors": [e for v in pack.measurement.viewports
+                                                   for e in v.errors]},
+            "source_note": (f"候选来自模型诊断（{origin}）；审查=Mentis 确定性核对与规则分流；"
+                            "与诊断同源模型，独立性未建立——修订后复检以独立观察为准"),
+            "candidates": adjudication,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        adjudication_path = self.run_dir / "professional-review.json"
+        adjudication_path.write_text(
+            json.dumps(review_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.trace.emit("mentis", "review.recorded",
+                        f"专业评审候选审查：候选 {len(adjudication)} 条 → 采纳 {len(adopted)}、"
+                        f"驳回 {len(rejected)}、保持现状 {len(keep)}、"
+                        f"待用户/待查 {len(needs_decision) + len(pending_check)}"
+                        f"（审查针对产物 {pack.sha256[:12]}；依据见 refs）",
+                        attempt_id=attempt.attempt_id, brief_version=brief_version,
+                        status="ok" if adjudication or not bundle.valid_diagnoses else "unknown",
+                        refs=[{"path": str(adjudication_path),
+                               "sha256": _sha256_file(adjudication_path), "role": "review"}])
+        self.last_professional_review = {
+            "performed": True, "origin": origin, "candidates": len(adjudication),
+            "adopted": len(adopted), "rejected": len(rejected), "keep": len(keep),
+            "needs_user": len(needs_decision) + len(pending_check), "verdict": None,
+            "unverified_visual": not images,
+        }
+        if pending_user or needs_decision:
+            self.notify("专业评审：存在等待你的决定——修订暂停（沉默≠批准）；"
+                        "初稿按当前版本处理，其余成立问题已留档")
+            result["delivery_note"] = ("专业评审完成；存在待你决定的问题，"
+                                       "修订暂停（沉默≠批准）")
+            return result
+        if pending_check:
+            self.notify("专业评审：存在待查候选（渲染测量不可信/缺失）——修订暂缓，"
+                        "先修复观察链再核对；不据不可信观察修订")
+            result["delivery_note"] = "专业评审完成；待查候选暂缓修订（观察不可信）"
+            return result
+        if not adopted:
+            # 合格不改：必须留下接受依据，不为增加交流轮数强行修改
+            self.notify(f"专业评审：{len(adjudication)} 条候选审查完毕、采纳 0——合格不改，"
+                        "接受依据已留档（professional-review.json）")
+            result["delivery_note"] = (f"专业评审（{origin}）：候选 {len(adjudication)} 条、"
+                                       "采纳 0——合格不改（接受依据见评审记录）")
+            return result
+        if self.repairs_used >= self.max_repairs:
+            self.notify(f"专业评审发现 {len(adopted)} 条成立问题，但修订预算已用尽"
+                        f"（{self.max_repairs}）：留档不执行，不冒充已解决")
+            result["delivery_note"] = (f"成立问题 {len(adopted)} 条因修订预算耗尽未修订"
+                                       "（留档）；不宣称已解决")
+            return result
+        # 成立问题 → 明确修订指令（问题位置/证据/目的/方向/保留项/复检办法）→ 预算内委托
+        defect_ids = [c["no"] for c in adopted]
+        adopted_items = [bundle.valid_diagnoses[int(c["no"][1:]) - 1] for c in adopted]
+        filtered = DiagnosisBundle(goal=bundle.goal, observation_source=bundle.observation_source,
+                                   model=bundle.model, valid_diagnoses=adopted_items)
+        instruction = compose_revision_instruction(
+            filtered, defect_ids, pack, self._preserved_items(),
+            [i.text for i in self.session.current_brief.constraints],
+            agent_decisions=agent_decisions)
+        self.repairs_used += 1
+        self.notify(f"专业评审：{len(adopted)} 条成立问题转入修订"
+                    f"（修订预算 {self.repairs_used}/{self.max_repairs}）")
+        self._snapshot_current_artifact()
+        trace_ix = self.session.notify_progress(
+            "Mentis 专业评审发起修订（notify 不阻塞）")
+        revision = self.session.record_revision(
+            feedback_interaction_id=trace_ix.interaction_id,
+            from_attempt_id=attempt.attempt_id,
+            instruction=f"[Mentis 专业评审修订指令] 确切文本见 trace/prompts/"
+                        f"（哈希=实际发送；依据链见 professional-review.json）",
+            round_no=self.repairs_used)
+        rev_attempt, rev_result = self._dispatch_codex(
+            f"review-fix-{self.repairs_used}", instruction, resume=True,
+            revision_id=revision.revision_id)
+        revision.to_attempt_id = rev_attempt.attempt_id
+        if rev_result.status is AttemptStatus.UNKNOWN:
+            self.notify("修订执行状态未知（超时/无终态）：不判通过、不自动重发；需核对后续接")
+            result.update(block_delivery=True, status="UNKNOWN",
+                          delivery_note="专业评审修订执行状态未知：需人工核对（不冒充完成）")
+            return result
+        if rev_result.status is AttemptStatus.FAILED:
+            self.notify("修订执行失败：如实停止，不自动重试")
+            result.update(block_delivery=True, status="FAILED",
+                          delivery_note="专业评审修订执行失败")
+            return result
+        # 修订完成 → 重新观察并复检（目标问题/保留项/回归/新问题；不采信 Codex 自查）
+        pack2, images2, browser_obs2 = self._observe_full(
+            "professional-verify", rev_attempt.attempt_id)
+        result["structure"], result["browser_obs"] = pack2.structure, browser_obs2
+        findings2, regression, unknown = deterministic_checks(
+            pack2, self._preserved_items(), self._review_form_requirements)
+        if self.browser_capture is not None and not images2:
+            unknown.append("复查截图缺失：视觉类解决声明无法核对（不作为通过依据）")
+        model_review_path = self.run_dir / "model-review-professional.json"
+        resolved, unresolved, new_issues = run_model_review(
+            self.gateway, self.session.current_brief.objective,
+            self.workspace / "index.html", filtered, defect_ids, pack2, images2,
+            model_review_path, use_model=self.use_model, notify=self.notify)
+        review_passed = not regression and not unresolved and not new_issues and not unknown
+        verify_doc = {
+            "reviewed_html_sha256": pack2.sha256,
+            "deterministic_findings": findings2,
+            "preserved_regression": regression,
+            "measurement_unknown": unknown,
+            "model_review": {"resolved": resolved, "unresolved": unresolved,
+                             "new_issues": new_issues,
+                             "detail": str(model_review_path)},
+            "measurement_v2": {v.name: {"overflow_px": v.overflow_px,
+                                        "overflowing": len(v.overflowing),
+                                        "clipped": len(v.clipped_text),
+                                        "inner_width": v.inner_width,
+                                        "errors": list(v.errors)}
+                               for v in pack2.measurement.viewports},
+        }
+        verify_path = self.run_dir / "professional-verify.json"
+        verify_path.write_text(
+            json.dumps(verify_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.session.record_review(
+            rev_attempt.attempt_id, findings=findings2 + [
+                f"模型复查：已解决 {resolved or '无'}；未解决 {unresolved or '无'}；"
+                f"新问题 {new_issues or '无'}"] + [f"测量未知：{u}" for u in unknown],
+            passed=review_passed,
+            disposition=Disposition.ACCEPT if review_passed else Disposition.REVISE)
+        if regression:
+            verdict = "regression"
+        elif unknown:
+            verdict = "unverified"
+        elif resolved and not unresolved and not new_issues:
+            verdict = "improved"
+        elif not unresolved and not new_issues:
+            verdict = "not_improved"
+        else:
+            verdict = "partially_improved"
+        self.last_professional_review["verdict"] = verdict
+        self.trace.emit("mentis", "review.recorded",
+                        f"修订复检：保留项回归 {regression or '无'}；测量未知 {unknown or '无'}；"
+                        f"模型复查已解决 {resolved or '无'}/未解决 {unresolved or '无'}/"
+                        f"新问题 {new_issues or '无'}；判定 {verdict}"
+                        f"（复查绑定产物 {pack2.sha256[:12]}）",
+                        attempt_id=rev_attempt.attempt_id, brief_version=brief_version,
+                        status="ok" if review_passed else "failed",
+                        refs=[{"path": str(verify_path),
+                               "sha256": _sha256_file(verify_path), "role": "review"}])
+        if verdict == "regression":
+            self.notify("修订复检发现回归：" + "；".join(regression)[:150]
+                        + "；不交付该修订版（修订前快照在 versions/）")
+            result.update(block_delivery=True, status="NOT_DELIVERED",
+                          delivery_note="专业评审修订造成回归：不交付（快照保留修订前版本）")
+            return result
+        if verdict == "unverified":
+            self.notify("修订后复检存在未知（测量不可信/缺截图/缺记录）：不判通过也不判失败；"
+                        "需先核对观察链")
+            result.update(block_delivery=True, status="UNVERIFIED",
+                          delivery_note="修订后复检存在未知：不判通过（见复检记录）")
+            return result
+        result["accept_attempt"] = rev_attempt
+        if verdict == "improved":
+            result["delivery_note"] = (f"专业评审：采纳 {len(adopted)} 条成立问题→修订→复检通过"
+                                       f"（已解决 {resolved}）")
+        else:
+            leftover = "；".join(unresolved + new_issues)[:150] or "（无明确遗留）"
+            result["delivery_note"] = (f"专业评审修订后复检判定 {verdict}；遗留问题：{leftover}"
+                                       "（修订预算已用尽，如实交付，不为遗留问题冒充已解决）")
+        return result
 
     # ---- 主流程 ----
 
@@ -607,8 +998,8 @@ class Collaboration:
                 self.status = "PENDING"
                 self._persist(None, None, delivered=False)
                 return self.status
-            delivered = self._finalize(attempt)
-            self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
+            # _finalize 内部已设定最终状态（含专业评审后的 UNKNOWN/UNVERIFIED/FAILED）
+            self._finalize(attempt)
         else:
             self.status = "FAILED"
             self.notify("委托未成功完成，不进入收尾（可 resume 重试或核对工作区）")
@@ -747,8 +1138,7 @@ class Collaboration:
         self.notify(f"执行器结局已确认为 {final_status.value}（依据：产物存在且可解析、"
                     "无活跃写入者；不声称执行器完成了其全部计划步骤）")
         if final_status is AttemptStatus.COMPLETED:
-            delivered = self._finalize(attempt)
-            self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
+            self._finalize(attempt)
         else:
             self.status = "FAILED"
             self._persist(None, None, delivered=False)
@@ -798,8 +1188,7 @@ class Collaboration:
                     self.status = "PENDING"
                     self._persist(None, None, delivered=False)
                     return self.status
-                delivered = self._finalize(attempt)
-                self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
+                self._finalize(attempt)
             else:
                 self.status = "FAILED"
                 self._persist(None, None, delivered=False)
@@ -831,8 +1220,7 @@ class Collaboration:
             )
             self.applied_answers = True
             if result.status is AttemptStatus.COMPLETED:
-                delivered = self._finalize(attempt)
-                self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
+                self._finalize(attempt)
             else:
                 self.status = "FAILED"
                 self._persist(None, None, delivered=False)
@@ -883,8 +1271,7 @@ class Collaboration:
                 resume=True, revision_id=revision.revision_id,
             )
             if result.status is AttemptStatus.COMPLETED:
-                delivered = self._finalize(attempt)
-                self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
+                self._finalize(attempt)
             else:
                 self.status = "FAILED"
                 self._persist(None, None, delivered=False)
@@ -892,8 +1279,7 @@ class Collaboration:
         # 3) 无未决：收尾最近完成的尝试
         last_completed = [a for a in self.session.attempts if a.status.value == "completed"]
         if last_completed:
-            delivered = self._finalize(last_completed[-1])
-            self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
+            self._finalize(last_completed[-1])
         else:
             self.status = "NO_WORK"
             self.notify("没有可收尾的已完成尝试")
@@ -979,6 +1365,19 @@ class Collaboration:
             lines.append(f"- 截图：`{Path(shot).resolve()}`")
         if browser_obs:
             lines.append(f"- 浏览器：{browser_obs.browser} {browser_obs.browser_version}")
+        pr = getattr(self, "last_professional_review", None) or {}
+        if pr.get("performed"):
+            lines.append(
+                f"- 交付前专业评审：已执行（{pr.get('origin')}）；候选 {pr.get('candidates')} 条 → "
+                f"采纳 {pr.get('adopted')}、驳回 {pr.get('rejected')}、保持现状 {pr.get('keep')}、"
+                f"待用户/待查 {pr.get('needs_user')}"
+                + (f"；修订复检判定 **{pr.get('verdict')}**" if pr.get("verdict") else "")
+                + ("；**无截图输入，视觉维度未验证**" if pr.get("unverified_visual") else ""))
+            if pr.get("note"):
+                lines.append(f"- 评审结论：{pr['note']}")
+        else:
+            lines.append(f"- 交付前专业评审：**未执行**（{pr.get('reason', '未运行')}）"
+                         "——不宣称领域标准评审通过")
         lines.append("- 阶段性交付语义（PROJECT_PLAN §7）：**DELIVERED = 本轮初稿已产出、"
                      "结构层硬要求检查通过、可查看**；不表示最终任务完成或用户满意，"
                      "你的意见将形成下一轮任务并继续委托修改")
@@ -991,8 +1390,8 @@ class Collaboration:
         else:
             lines.append("- 用户是否满意：**未反馈**（沉默≠满意；可稍后用 "
                          "`field-feedback` 或 `collab-resume --feedback` 提交原话）")
-        lines.append("- 视觉与表单交互：**未验证**（截图为初始画面；未执行点击/提交；"
-                     "本循环未运行渲染溢出测量——溢出声明来自执行器自查）")
+        lines.append("- 视觉与表单交互：**未验证真实点击/提交与网络行为**"
+                     "（截图为初始画面；渲染测量仅覆盖声明行为与布局数值，提交测试强制阻止导航）")
         lines.append("")
         lines.append("## 看变化")
         for b in self.session.briefs:
@@ -1023,12 +1422,19 @@ class Collaboration:
                 state = "已回答（" + (ix.answer_source or "") + "）" if ix.answer_source else "**未回答（沉默≠批准）**"
                 lines.append(f"- 请求决定：{ix.message[:60]}（阻塞 {ix.blocking_action}）——{state}")
         lines.append(f"- 模型用量：{meta['model_usage']}")
+        for name, label in (("professional-review.json", "专业评审候选审查（采纳/驳回/保持现状+理由）"),
+                            ("diagnosis-professional.md", "专业评审诊断（真实模型/Mock，含证据引用）"),
+                            ("model-review-professional.json", "修订后模型复查（绑定产物哈希）"),
+                            ("professional-verify.json", "修订后确定性复检（保留项/回归/测量）")):
+            evidence = self.run_dir / name
+            if evidence.is_file():
+                lines.append(f"- {label}：`{evidence.resolve()}`")
         if self.last_diagnosis is not None:
-            lines.append(f"- 模型诊断候选：{self.run_dir / 'diagnosis.md'}"
+            lines.append(f"- 模型诊断候选：{self.run_dir / 'diagnosis-professional.md'}"
                          f"（有效 {len(self.last_diagnosis.valid_diagnoses)} / 拒收 "
-                         f"{len(self.last_diagnosis.invalid_diagnoses)}；仅记录）")
-        lines.append("- 未验证：视觉美观、点击/表单实际行为、对比度与横向溢出的自动测量、"
-                     "部署表现；截图仅初始画面；资源与案例为草案（pending_human）；"
-                     "结构检查只证明结构层硬要求，不构成专业质量结论。")
+                         f"{len(self.last_diagnosis.invalid_diagnoses)}）")
+        lines.append("- 未验证：视觉美观、点击/表单真实提交与网络行为、对比度、部署表现；"
+                     "截图仅初始画面；资源与案例为草案（pending_human）；"
+                     "专业评审候选与审查同源模型（独立性未建立），不构成专家能力结论。")
         lines.append("")
         return "\n".join(lines)
