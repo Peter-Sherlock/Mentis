@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -87,7 +88,7 @@ class _PopenStream:
 
     def __init__(self, command, cwd, env, timeout_s):
         self._timeout_s = timeout_s
-        self.proc = subprocess.Popen(command, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+        self.proc = subprocess.Popen(command, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self._q = queue.Queue()
         self._stderr = []
@@ -144,6 +145,14 @@ class _PopenStream:
 class CodexCliAdapter:
     def __init__(self, executable: str = "codex", lock_dir: Path = DEFAULT_LOCK_DIR,
                  runner=None, cli_version: str = "", stream_factory=None):
+        # npm 安装的 codex 是 .cmd shim：CreateProcess 只追加 .exe、不查 PATHEXT，
+        # 裸名 "codex" 会 FileNotFoundError。真实启动路径解析为绝对路径（含扩展名）；
+        # 注入 runner/stream_factory 的离线路径保持原样，便于测试断言。
+        if runner is None and stream_factory is None and not Path(executable).is_file() \
+                and not Path(executable).suffix:
+            resolved = shutil.which(executable)
+            if resolved:
+                executable = resolved
         self.executable = executable
         self.lock_dir = Path(lock_dir)
         self.runner = runner or subprocess.run
@@ -184,7 +193,9 @@ class CodexCliAdapter:
             command += ["--model", spec.model]
         for override in spec.extra_config:
             command += ["-c", override]
-        command.append(spec.prompt)
+        # prompt 经 stdin 传递（官方 exec 支持 "-"）：多行/含引号的 prompt 经
+        # npm .cmd shim 的 %* 重解析会被截断（真实运行观察到的缺陷）。
+        command.append("-")
         return self._invoke(command, spec, root, task_id)
 
     def continue_task(self, native_thread_id: str, task_id: str,
@@ -200,7 +211,7 @@ class CodexCliAdapter:
             command += ["--model", spec.model]
         for override in spec.extra_config:
             command += ["-c", override]
-        command += [native_thread_id, spec.prompt]
+        command += [native_thread_id, "-"]
         return self._invoke(command, spec, root, task_id, expected_thread_id=native_thread_id)
 
     def _invoke(self, command: list[str], spec: CodexTaskSpec, root: Path,
@@ -241,7 +252,8 @@ class CodexCliAdapter:
         """注入 runner 的兼容路径（同步等待；结束后逐行回放回调）。返回是否超时。"""
         try:
             completed = self.runner(
-                command, cwd=root, env=child_env, stdin=subprocess.DEVNULL,
+                command, cwd=root, env=child_env,
+                input=spec.prompt,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=spec.timeout_s,
             )
@@ -262,6 +274,17 @@ class CodexCliAdapter:
         self._classify(result, spec, expected_thread_id, root, completed.returncode)
         return False
 
+    def _feed_stdin(self, stream, prompt: str) -> None:
+        """真实流路径：启动后立即写入 prompt 并关闭管道（官方 "-" 约定）。"""
+        stdin = getattr(getattr(stream, "proc", None), "stdin", None)
+        if stdin is None or stdin.closed:
+            return  # 注入的测试流不承载 stdin
+        try:
+            stdin.write(prompt.encode("utf-8"))
+            stdin.close()
+        except OSError:
+            pass
+
     def _run_streaming(self, command, spec, root, result, child_env,
                        expected_thread_id) -> bool:
         """T2 真实路径：逐行消费 stdout（不等待 turn 结束），独立收集 stderr。"""
@@ -272,6 +295,7 @@ class CodexCliAdapter:
             result.status = AttemptStatus.FAILED
             result.error = f"Codex 进程启动失败: {type(exc).__name__}"
             return False
+        self._feed_stdin(stream, spec.prompt)
         for line in stream.lines():
             self._process_event_line(line, result, spec.on_event, started=started)
         returncode, stderr_text = stream.finish()

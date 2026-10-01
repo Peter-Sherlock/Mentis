@@ -32,8 +32,9 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis field-feedback 查看作品后补记逐字反馈（绑定该运行的会话记录）
   python -m mentis trace           P2.4 事后回放 / --follow 实时旁观（只读）/ --export 导出白名单时间线
   python -m mentis conversation    本地交流视图：确切委托、Codex 公开回复与动作摘要（只读）
-  python -m mentis eval-check      E1 冻结清单核对（离线；不证明答案读隔离）
+  python -m mentis eval-check      E1 冻结清单核对（离线；--isolation-evidence 接入真实隔离准入）
   python -m mentis eval-prepare    E1 按白名单制作各组相同输入包（离线；拒绝覆盖）
+  python -m mentis eval-isolate    E1 答案读隔离：probe 开窗双端探测 / release 解除 / check 准入
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -111,33 +112,62 @@ def main(argv=None) -> int:
     conversation.add_argument("--run", required=True, help="运行目录（runtime/collab/<ID> 或 runtime/guidance/<ID>）")
     echeck = sub.add_parser("eval-check", help="E1 只读核对冻结源与输入白名单，不运行实验")
     echeck.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
+    echeck.add_argument("--isolation-evidence", default="",
+                        help="E1 隔离证据 JSON；提供时按真实探测证据+当前窗口做运行前准入")
     eprepare = sub.add_parser("eval-prepare", help="E1 离线输入导出；不调用模型，不证明答案读隔离")
     eprepare.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
     eprepare.add_argument("--out", required=True, help="全新输出目录，已有内容时拒绝覆盖")
+    eiso = sub.add_parser("eval-isolate", help="E1 运行端答案读隔离：开窗探测 / 解除 / 准入查看")
+    eiso.add_argument("action", choices=["probe", "release", "check"])
+    eiso.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
+    eiso.add_argument("--prepared", required=True, help="eval-prepare 输出的目录")
+    eiso.add_argument("--arm", default="input-001/M",
+                      help="探测目标组目录（相对 prepared，如 input-001/M）")
+    eiso.add_argument("--no-codex", action="store_true",
+                      help="只探测 Mentis 环境端；准入要求 Codex 端证据时不得使用")
     args = parser.parse_args(argv)
 
-    if args.command in ("eval-check", "eval-prepare"):
-        from mentis.evaluation import audit_suite, prepare_suite
+    if args.command in ("eval-check", "eval-prepare", "eval-isolate"):
+        from pathlib import Path as _Path
 
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")
         if hasattr(sys.stderr, "reconfigure"):
             sys.stderr.reconfigure(encoding="utf-8")
         if args.command == "eval-check":
-            result = audit_suite(Path(args.suite))
-        else:
+            from mentis.evaluation import audit_suite
+            if args.isolation_evidence:
+                from mentis.eval_isolation import eval_check_with_isolation
+                result = eval_check_with_isolation(_Path(args.suite),
+                                                   _Path(args.isolation_evidence))
+            else:
+                result = audit_suite(_Path(args.suite))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            # Zero means frozen input validation/preparation succeeded; the status
+            # and runtime_answer_isolation check explicitly prohibit a ready claim.
+            return 1 if result["status"] == "invalid" else 0
+        if args.command == "eval-prepare":
+            from mentis.evaluation import prepare_suite
             try:
-                report = prepare_suite(Path(args.suite), Path(args.out))
+                report = prepare_suite(_Path(args.suite), _Path(args.out))
             except (OSError, ValueError) as exc:
                 print(f"评测输入未导出：{exc}", file=sys.stderr)
                 return 2
             result = {key: report[key] for key in ("status", "suite_id", "suite_sha256", "sample_count", "checks", "blocking_reasons", "exploratory_blocking_reasons", "formal_claim_limits", "scope")}
             result["package_count"] = sum(len(row["arms"]) for row in report["packages"])
-            result["out"] = str(Path(args.out).resolve())
+            result["out"] = str(_Path(args.out).resolve())
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result["status"] != "invalid" else 1
+        from mentis.eval_isolation import IsolationError, eval_isolate_cli
+        try:
+            result = eval_isolate_cli(args)
+        except IsolationError as exc:
+            print(f"隔离操作未完成：{exc}", file=sys.stderr)
+            return 2
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        # Zero means frozen input validation/preparation succeeded; the status
-        # and runtime_answer_isolation check explicitly prohibit a ready claim.
-        return 1 if result["status"] == "invalid" else 0
+        if args.action == "check":
+            return 0 if result.get("runtime_answer_isolation", {}).get("passed") else 1
+        return 0 if result.get("ok") else 1
 
     if args.command == "demo-contract":
         from mentis.demo_contract import run_demo

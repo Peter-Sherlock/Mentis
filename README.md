@@ -2,7 +2,7 @@
 
 代表非专业用户与执行型 Agent 持续协作的代理：帮助形成目标，决定下一步，委托工作，观察实际产物，诊断问题并给出有效修改指导。
 
-**当前状态：P2.4进行中，T4技术真实往返已核对；负责人委托的[五问辅助回答](docs/progress/P2.4-T4-assisted-answers.md)已完成，本人体验仍未取证。E1已开始：5个开发样本、基线配置、白名单与哈希核对及20份输入包已准备，实际读隔离待核验，E2未运行。** 入口见[E1准备说明](docs/evaluation/e1/README.md)。阶段性“已交付”表示初稿可以查看，不代表用户满意或最终完成。新T4运行的keep漏判与历史improved的归因限制已明确记录，不能据模型复查宣称专家能力。P3.2/P5.2a及当前能力范围见[开发状态](docs/DEVELOPMENT_STATUS.md)，案例与评价材料仍为AI草案。
+**当前状态：P2.4进行中，T4技术真实往返已核对；负责人委托的[五问辅助回答](docs/progress/P2.4-T4-assisted-answers.md)已完成，本人体验仍未取证。E1进行中：5个开发样本、基线配置、白名单与哈希核对及20份输入包已准备；运行端答案读隔离已实现并双端实测（deny ACL 窗口：Mentis 环境 63/63 拒读、真实 Codex 9/9 拒读；准入接通），E2比较未运行。** 入口见[E1准备说明](docs/evaluation/e1/README.md)。阶段性“已交付”表示初稿可以查看，不代表用户满意或最终完成。新T4运行的keep漏判与历史improved的归因限制已明确记录，不能据模型复查宣称专家能力。P3.2/P5.2a及当前能力范围见[开发状态](docs/DEVELOPMENT_STATUS.md)，案例与评价材料仍为AI草案。
 
 ## 运行（核心 Python 无第三方包依赖）
 
@@ -16,8 +16,12 @@ py -3.14 -m mentis demo-routing   # 确定性的资源选择与缺口分流演�
 py -3.14 -m mentis diagnose --page runtime/demo/event_page_v1.html --fixture tests/fixtures/mock_diagnosis_response.json
 py -3.14 -m mentis observe-page --page runtime/demo/event_page_v1.html  # 本机浏览器双视口截图
 py -3.14 -m mentis guide-revise --baseline runtime/collab/<运行ID>      # P3.2 指导修订循环（真实运行加 --real）
-py -3.14 -m mentis eval-check     # E1冻结核对；prepared_not_ready明确表示隔离仍待验证
+py -3.14 -m mentis eval-check     # E1冻结核对；--isolation-evidence 接入真实隔离准入（窗口内才可能 passed）
 py -3.14 -m mentis eval-prepare --out runtime/evaluation/my-e1-preview # 离线制作输入包，已有内容拒绝覆盖
+py -3.14 -m mentis eval-isolate probe --prepared runtime/evaluation/e1-isolation-probe --arm input-001/M
+                                  # 开启 deny ACL 隔离窗口并双端真实探测（含一次真实 Codex turn）
+py -3.14 -m mentis eval-isolate release --prepared runtime/evaluation/e1-isolation-probe
+                                  # 关闭窗口并实测恢复可读
 ```
 
 ## 协作运行（P2.3：真实执行器 + 真实截图）
@@ -94,7 +98,7 @@ py -3.14 -m mentis conversation --run runtime/collab/20260929_084347-5f82  # 本
 py -3.14 -m unittest discover -s tests -v
 ```
 
-当前 169 项：入口、契约不变量、能力资源与分流、P2.2 网关/观察/诊断、P3.1 Adapter 与截图边界、P2.3 协作循环（含 v1→反馈→v2 修订路径核验：原目标/硬约束/旧版产物快照/修改依据保留）、P3.2 指导修订循环（合格不改、回归拒收、决策分流/暂停、失败轮核对续办、unknown 产物核对、状态恢复；验收修复：测量不可信判未知、保留项逐段与表单逐字段核对、复查绑定当前产物——均先复现误判后验证修复）、P5.2a 现场会话与逐字反馈归档、P2.4-T1 追踪写入与事后回放（seq/哈希/不回填）、P2.4-T2 逐行流与实时旁观、P2.4-T3 故障与隐私加固（敏感输出隐去、追踪写失败不粉饰、截断/限额不判成功、续接多 attempt 时间线、撤回落trace、现场会话异常收尾、导出白名单与旧记录兼容）、T4 补充（unknown 不崩溃回归、失败子项消息、核对确认事件、终态未入流的 session.json 交叉引用、公开回复全文归档与交流视图）、**T4 交付前专业评审**（有据触发修订、不成立/保持现状不触发、合格不改留依据、无截图不冒充视觉验证、测量不可信判 UNVERIFIED、回归不交付、预算耗尽留档、修订 unknown 停止、保留决定暂停修订、"保留当前"措辞防回归）。Mock HTTP 响应只验证请求格式、用量采集与记录边界；真实调用证据另见阶段报告。
+当前 191 项：入口、契约不变量、能力资源与分流、P2.2 网关/观察/诊断、P3.1 Adapter 与截图边界、P2.3 协作循环（含 v1→反馈→v2 修订路径核验：原目标/硬约束/旧版产物快照/修改依据保留）、P3.2 指导修订循环（合格不改、回归拒收、决策分流/暂停、失败轮核对续办、unknown 产物核对、状态恢复；验收修复：测量不可信判未知、保留项逐段与表单逐字段核对、复查绑定当前产物——均先复现误判后验证修复）、P5.2a 现场会话与逐字反馈归档、P2.4-T1 追踪写入与事后回放（seq/哈希/不回填）、P2.4-T2 逐行流与实时旁观、P2.4-T3 故障与隐私加固（敏感输出隐去、追踪写失败不粉饰、截断/限额不判成功、续接多 attempt 时间线、撤回落trace、现场会话异常收尾、导出白名单与旧记录兼容）、T4 补充（unknown 不崩溃回归、失败子项消息、核对确认事件、终态未入流的 session.json 交叉引用、公开回复全文归档与交流视图）、**T4 交付前专业评审**（有据触发修订、不成立/保持现状不触发、合格不改留依据、无截图不冒充视觉验证、测量不可信判 UNVERIFIED、回归不交付、预算耗尽留档、修订 unknown 停止、保留决定暂停修订、"保留当前"措辞防回归）、**E1 隔离**（真实 deny ACL 窗口/释放、无效 deny 必失败、金丝雀预检拦截、双端探测判定、证据过期/身份/版本不一致即失效、窗口关闭即失效、探测失败不留窗口）。Mock HTTP 响应只验证请求格式、用量采集与记录边界；真实调用证据另见阶段报告。
 
 ## 目录
 

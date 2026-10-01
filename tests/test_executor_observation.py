@@ -50,6 +50,9 @@ class CodexCliAdapterTests(unittest.TestCase):
         self.assertEqual(result.usage["input_tokens"], 10)
         self.assertEqual(result.cli_version, "codex test")
         self.assertEqual(calls[0][0][:5], ["codex", "exec", "--json", "--sandbox", "workspace-write"])
+        # prompt 经 stdin（"-" 约定）传递：npm .cmd shim 会截断含引号/多行的 argv prompt
+        self.assertEqual(calls[0][0][-1], "-")
+        self.assertEqual(calls[0][1].get("input"), "写一条评审")
         self.assertFalse(list(self.lock_dir.glob("*.lock")))
 
     def test_timeout_is_unknown_and_keeps_single_writer_lock(self):

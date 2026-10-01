@@ -52,7 +52,7 @@
 
 `eval-prepare`逐文件校验哈希和路径，然后导出到中性 `input-NNN/<method>/`。每个运行组只有公共 `input.json`、自己的 `prompt.md`及白名单文件；原sample ID、作者评分文件、私有运行state/session/历史诊断不会随包复制。评价侧映射只在父级报告，运行时只能挂载单组目录。已验证各组共同输入字节一致、冻结源篡改拒绝、路径及junction逃逸拒绝、作者字段拒绝、已有输出拒绝覆盖。
 
-**白名单导出尚未构成读隔离。** 当前同用户子进程从单组目录读取项目作者文件的探针成功（`author_file_readable=true`）。此探针不是受测Codex沙箱的正式探针，但足以说明当前同用户目录结构没有提供作者侧读拒绝。E1必须先落实独立运行身份或隔离挂载，在受测Mentis及执行器实际环境中验证作者文件和父级映射不可读，之后才能启动探索性E2。
+**白名单导出不等于读隔离；读隔离现由 deny ACL 隔离窗口提供并已双端实测。** 机制：运行前对套件目录（防 sample 身份推断）、prepare-report.json（身份映射）和除目标组外全部输入包写入 Windows deny ACL（当前用户 + Codex 沙箱账户，单次 icacls 调用；开窗前金丝雀预检保证可解除）。2026-10-01 真实核验：Mentis 环境同用户子进程 63/63 次反向读取（绝对路径/父目录遍历/junction）全部 PermissionError，正向读写正常；真实 Codex CLI 0.158.0（workspace-write）9/9 次读取尝试 DENIED、正向写入确认。运行前检查 `eval-check --isolation-evidence` 核对探测证据（schema/TTL 12h/身份/Codex 版本/双端探测/**当前 live 拒读**），任一缺失即保持未就绪；release 后同一证据立即失效。诚实边界：deny 不防对抗性绕过（同用户属主可自行解除 ACL），也不证明提示词服从或模型不试图读取；探测细节与失败尝试见[E1记录](../../progress/P2.4-E1.md)。
 
 两份固定页面真实测量的innerWidth分别390/1280，溢出均0px；记录空表单checkValidity=false、填写后=true、同步确认DOM变化。测量在注入preventDefault的副本执行，不能当作完整点击、异步提示或真实网络取证。对比度抽检、死链执行、网络取证、完整交互及独立专业质量复核仍未完成；无首稿的端到端/决定输入按设计不预造观察。
 
@@ -66,7 +66,7 @@
 py -3.14 -m mentis eval-check
 ```
 
-实际输出应包含 `sample_count: 5`、`frozen_source_hashes.passed: true`、`status: prepared_not_ready`和`runtime_answer_isolation.passed: false`。退出0表示冻结输入核对成功，**不表示已具备运行或效果结论**。制作新包可执行：
+实际输出应包含 `sample_count: 5`、`frozen_source_hashes.passed: true`和`status: prepared_not_ready`；`runtime_answer_isolation` 只在提供有效隔离证据且当前窗口开启时才为 true。制作新包可执行：
 
 ```powershell
 py -3.14 -m mentis eval-prepare --out runtime/evaluation/e1-my-preview
@@ -74,6 +74,16 @@ py -3.14 -m mentis eval-prepare --out runtime/evaluation/e1-my-preview
 
 全新输出生成20份输入包；已有内容会拒绝覆盖。此入口不运行模型或执行器。
 
+隔离核验（真实环境，含一次真实 Codex 探测 turn）：
+
+```powershell
+py -3.14 -m mentis eval-isolate probe --prepared runtime/evaluation/e1-isolation-probe --arm input-001/M
+py -3.14 -m mentis eval-check --isolation-evidence runtime/evaluation/e1-isolation-probe/isolation/isolation-evidence.json
+py -3.14 -m mentis eval-isolate release --prepared runtime/evaluation/e1-isolation-probe
+```
+
+预期：probe 返回 `ok=true, window_open=true`；窗口内 eval-check 显示 `runtime_answer_isolation.passed=true`（含 live 拒读）；release 后同一条 eval-check 立即变回 `passed=false`。
+
 ## 下一步
 
-继续E1实际读隔离与同预算运行器接入，完成后才进入E2小规模探索性对照。待独立人工复核和正式指标/阈值冻结后，才允许正式能力结论；这些不作为已授权探索准备的额外用户审批。
+继续E1公平基线运行器接入（在隔离窗口内运行受测组、共享追踪与预算执行），完成后才进入E2小规模探索性对照。待独立人工复核和正式指标/阈值冻结后，才允许正式能力结论；这些不作为已授权探索准备的额外用户审批。
