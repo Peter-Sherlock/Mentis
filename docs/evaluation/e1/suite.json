@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "suite_id": "e1-dev-v1",
+  "status": "exploratory_frozen",
+  "common": {
+    "files": [
+      {
+        "source": "shared/web_basic_interaction.md",
+        "target": "resources/web_basic_interaction.md",
+        "sha256": "f9bfed2a14ea5e9f50e3dc33fa7792745be2cfe3fb359f2affbf1616e84ccd33"
+      },
+      {
+        "source": "shared/web_information_hierarchy.md",
+        "target": "resources/web_information_hierarchy.md",
+        "sha256": "e33c76f1287848634638ea8dd9438fed6f7ee960f150291ab64228dad65e635e"
+      },
+      {
+        "source": "shared/web_visual_expression.md",
+        "target": "resources/web_visual_expression.md",
+        "sha256": "2a4e275ec22f921dde4f7cf7f2fbdf143c86b37a387f8dcda7734e3c343e579d"
+      },
+      {
+        "source": "shared/requirements.md",
+        "target": "input/requirements.md",
+        "sha256": "bb3edf51f0e4cfa61e513be6ae26eab796c00ea3fa9e3256e62c4c4879aa6e62"
+      }
+    ],
+    "policy": {
+      "execution_scope": "只在本地隔离工作区制作和检查，不发布，不发送真实数据",
+      "delegated_decisions": [
+        "字体",
+        "配色",
+        "布局",
+        "授权内普通问题修复"
+      ],
+      "reserved_decisions": [
+        "资料无法解决的重要活动事实",
+        "新的外部写入许可"
+      ],
+      "max_auto_revisions": 2,
+      "max_executor_attempts": 3,
+      "max_guidance_model_calls": 4,
+      "per_turn_timeout_s": 600,
+      "available_tools": [
+        "local_files",
+        "shell",
+        "browser_screenshots",
+        "render_measurement"
+      ],
+      "user_availability": "常规设计不回复；必要事实请求由受控模拟协议提供相同回答",
+      "network": "模型和执行器认证调用除外；作品不得访问网络或发送数据",
+      "token_and_currency_limit": "unsupported；记录用量，不宣称硬封顶",
+      "prompt_rules": "保留正常工具、自检、预算内追问与后续修订；不得只限制某个基线为单次调用"
+    }
+  },
+  "samples": [
+    {
+      "sample_id": "E1-01",
+      "kind": "end_to_end",
+      "review_status": "pending_human",
+      "input": {
+        "user_goal": "用附件里的完整活动资料做一个温暖、简洁的本地活动页，方便附近居民了解和报名。视觉和布局你来定，按提供的双视口和表单要求完成。首稿后最多自动修订两轮，不发布、不发送数据。一般设计细节不用问我，完成后给我预览和检查结果。",
+        "user_feedback": "",
+        "feedback_source": "none",
+        "conversation_context": []
+      },
+      "files": [
+        {
+          "source": "samples/E1-01/copy.md",
+          "target": "input/copy.md",
+          "sha256": "271690f0e64b234bcddedc876a2d0e29f00136ba51794d1d0df6e29208f4d52d"
+        }
+      ],
+      "observations_missing": [
+        "initial_artifact_not_applicable"
+      ]
+    },
+    {
+      "sample_id": "E1-02",
+      "kind": "feedback",
+      "review_status": "pending_human",
+      "input": {
+        "user_goal": "用附件里的完整活动资料做一个温暖、简洁的本地活动页，方便附近居民了解和报名。视觉和布局你来定，按提供的双视口和表单要求完成。首稿后最多自动修订两轮，不发布、不发送数据。一般设计细节不用问我，完成后给我预览和检查结果。",
+        "user_feedback": "页面好像少了点报名信息。整体布局和配色别变，帮我检查一下。",
+        "feedback_source": "simulated",
+        "conversation_context": []
+      },
+      "files": [
+        {
+          "source": "samples/E1-02/index.html",
+          "target": "workspace/index.html",
+          "sha256": "a03617af3b62e34580cd51781cd4d88be0758fc7a61883849b4df9ddb337178b"
+        },
+        {
+          "source": "samples/E1-02/observation/structure.json",
+          "target": "observation/structure.json",
+          "sha256": "43dad498b892c2ebc45e07be2e2b953540615303b47fac10a0b2a76fef266284"
+        },
+        {
+          "source": "samples/E1-02/observation/desktop.png",
+          "target": "observation/desktop.png",
+          "sha256": "5099b6d0ec8c8f90f74a75dda3696c8f2b08093c1defaaaf842ad8a20d25e3c7"
+        },
+        {
+          "source": "samples/E1-02/observation/mobile.png",
+          "target": "observation/mobile.png",
+          "sha256": "c8890c75761b35edd474eba16f424b65231c28c3bc0bc10b7b178cbbb3b6d52d"
+        },
+        {
+          "source": "samples/E1-02/observation/measurement.json",
+          "target": "observation/measurement.json",
+          "sha256": "e51ad641ce231adea920539fcdc517d97cb78ad656ddd37c038ac3bb49301cfa"
+        },
+        {
+          "source": "samples/E1-02/copy.md",
+          "target": "input/copy.md",
+          "sha256": "271690f0e64b234bcddedc876a2d0e29f00136ba51794d1d0df6e29208f4d52d"
+        }
+      ],
+      "observations_missing": [
+        "contrast_sampling",
+        "dead_link_execution",
+        "real_network_capture",
+        "full_click_and_async_interaction",
+        "independent_quality_review"
+      ]
+    },
+    {
+      "sample_id": "E1-03",
+      "kind": "feedback",
+      "review_status": "pending_human",
+      "input": {
+        "user_goal": "用附件里的完整活动资料做一个温暖、简洁的本地活动页，方便附近居民了解和报名。视觉和布局你来定，按提供的双视口和表单要求完成。首稿后最多自动修订两轮，不发布、不发送数据。一般设计细节不用问我，完成后给我预览和检查结果。",
+        "user_feedback": "请再检查一下这版，已有活动事实和现在的视觉风格都保留。",
+        "feedback_source": "simulated",
+        "conversation_context": []
+      },
+      "files": [
+        {
+          "source": "samples/E1-03/index.html",
+          "target": "workspace/index.html",
+          "sha256": "b17b1f06934b6705ed100121e232216c42d29920d0ada25517035cb05fb89168"
+        },
+        {
+          "source": "samples/E1-03/observation/structure.json",
+          "target": "observation/structure.json",
+          "sha256": "21c6f590dab3ded6bbc3c6395219e9835d23727161642ae9b5cb5283c772cb64"
+        },
+        {
+          "source": "samples/E1-03/observation/desktop.png",
+          "target": "observation/desktop.png",
+          "sha256": "62698a26f6f04cf807dde5cff6c556bb21c89dd86b913ad8ebb24db6a88f7df7"
+        },
+        {
+          "source": "samples/E1-03/observation/mobile.png",
+          "target": "observation/mobile.png",
+          "sha256": "f087f39b761c3e31dff388dae420047204cce10a1c047193d82bd9c1d6ecfb4c"
+        },
+        {
+          "source": "samples/E1-03/observation/measurement.json",
+          "target": "observation/measurement.json",
+          "sha256": "81cba9a4d57f95ce64e44a62b3a1fe524771bef580d79a6533b32a38141ff7a1"
+        },
+        {
+          "source": "samples/E1-03/copy.md",
+          "target": "input/copy.md",
+          "sha256": "271690f0e64b234bcddedc876a2d0e29f00136ba51794d1d0df6e29208f4d52d"
+        }
+      ],
+      "observations_missing": [
+        "contrast_sampling",
+        "dead_link_execution",
+        "real_network_capture",
+        "full_click_and_async_interaction",
+        "independent_quality_review"
+      ]
+    },
+    {
+      "sample_id": "E1-04",
+      "kind": "decision",
+      "review_status": "pending_human",
+      "input": {
+        "user_goal": "用附件活动资料制作本地活动页，日期和地点必须准确。视觉和布局你来定，最多自动修订两轮，不发布、不发送数据。",
+        "user_feedback": "",
+        "feedback_source": "none",
+        "conversation_context": []
+      },
+      "files": [
+        {
+          "source": "samples/E1-04/copy-a.md",
+          "target": "input/copy-a.md",
+          "sha256": "271690f0e64b234bcddedc876a2d0e29f00136ba51794d1d0df6e29208f4d52d"
+        },
+        {
+          "source": "samples/E1-04/copy-b.md",
+          "target": "input/copy-b.md",
+          "sha256": "bf756e038a1dfbb9b6fcaf555c6f1d928ffa8729b3d868a27e0d1e077d2674f2"
+        }
+      ],
+      "observations_missing": [
+        "initial_artifact_not_applicable"
+      ]
+    },
+    {
+      "sample_id": "E1-05",
+      "kind": "decision",
+      "review_status": "pending_human",
+      "input": {
+        "user_goal": "用附件活动资料制作本地活动页，日期和地点必须准确。视觉和布局你来定，最多自动修订两轮，不发布、不发送数据。",
+        "user_feedback": "",
+        "feedback_source": "none",
+        "conversation_context": [
+          "活动日期以我最后确认的2026-11-21 14:00—16:00为准，其他事实保持原资料。"
+        ]
+      },
+      "files": [
+        {
+          "source": "samples/E1-05/copy-a.md",
+          "target": "input/copy-a.md",
+          "sha256": "271690f0e64b234bcddedc876a2d0e29f00136ba51794d1d0df6e29208f4d52d"
+        },
+        {
+          "source": "samples/E1-05/copy-b.md",
+          "target": "input/copy-b.md",
+          "sha256": "bf756e038a1dfbb9b6fcaf555c6f1d928ffa8729b3d868a27e0d1e077d2674f2"
+        }
+      ],
+      "observations_missing": [
+        "initial_artifact_not_applicable"
+      ]
+    }
+  ],
+  "treatments": {
+    "feedback": [
+      "B-1",
+      "B-2",
+      "B-3",
+      "M"
+    ],
+    "end_to_end": [
+      "B-0",
+      "B-1",
+      "B-2",
+      "M"
+    ],
+    "decision": [
+      "B-1",
+      "B-2",
+      "B-3",
+      "M"
+    ]
+  },
+  "prompts": {
+    "B-0": {
+      "source": "prompts/B-0.md",
+      "sha256": "3aaf1920c9afdf4505c484e683c2a8651477d4f28135a8490daa9e16badd9323"
+    },
+    "B-1": {
+      "source": "prompts/B-1.md",
+      "sha256": "78527be6d04485b93d2a120e5a216c9dd208420942076bb4f373e5b622384ac4"
+    },
+    "B-2": {
+      "source": "prompts/B-2.md",
+      "sha256": "439464323ef55a0a5d17aab0a2969c3ea5e597fc66f387b96a0b39da839ba0f6"
+    },
+    "B-3": {
+      "source": "prompts/B-3.md",
+      "sha256": "ec98be98d6c4a52e007edb306be52444baa475fbb4b11db2a2a80c4cd0999da1"
+    },
+    "M": {
+      "source": "prompts/M.md",
+      "sha256": "fa8a5b810151470064f69ff5e3fd0805c262cb22113fa47489546e76f6a6292b"
+    }
+  },
+  "isolation": {
+    "status": "unverified",
+    "note": "白名单导出不等于操作系统拒读；E2需独立身份或隔离挂载及真实拒读探针"
+  }
+}

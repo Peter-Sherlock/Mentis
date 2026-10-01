@@ -1,0 +1,89 @@
+{
+  "source_path": "workspace/index.html",
+  "source_sha256": "a03617af3b62e34580cd51781cd4d88be0758fc7a61883849b4df9ddb337178b",
+  "browser": "chrome.exe",
+  "browser_version": "unknown",
+  "viewports": [
+    {
+      "name": "mobile",
+      "width": 390,
+      "height": 844,
+      "inner_width": 390,
+      "scroll_width": 390,
+      "overflow_px": 0,
+      "page_title": "周六手冲入门工作坊 · 拾光咖啡",
+      "overflowing": [],
+      "clipped_text": [],
+      "forms": [
+        {
+          "item_id": "formchk:mobile:1",
+          "index": 0,
+          "ident": "#signup-form",
+          "action": "",
+          "method": "get",
+          "fields": 2,
+          "required_fields": 2,
+          "empty_check_validity": false,
+          "empty_submit_fired": true,
+          "filled_check_validity": true,
+          "filled_submit_fired": true,
+          "sync_dom_delta": "本地演示已确认：表单校验通过。填写内容没有发送或保存，这不代表真实报名成功。\n            \n          \n        \n      \n    \n  \n\n  \n    拾光咖啡 · 周六手冲入门工作坊\n    虚构活动 · 本地演示页面\n  \n\n  \n    (() => {\n      cons",
+          "notes": []
+        }
+      ],
+      "network_intent": {
+        "actions": [],
+        "methods": [],
+        "hasFetch": false,
+        "hasXHR": false,
+        "hasBeacon": false
+      },
+      "errors": [],
+      "measurement_copy": "observer_injected_copy"
+    },
+    {
+      "name": "desktop",
+      "width": 1280,
+      "height": 800,
+      "inner_width": 1280,
+      "scroll_width": 1280,
+      "overflow_px": 0,
+      "page_title": "周六手冲入门工作坊 · 拾光咖啡",
+      "overflowing": [],
+      "clipped_text": [],
+      "forms": [
+        {
+          "item_id": "formchk:desktop:1",
+          "index": 0,
+          "ident": "#signup-form",
+          "action": "",
+          "method": "get",
+          "fields": 2,
+          "required_fields": 2,
+          "empty_check_validity": false,
+          "empty_submit_fired": true,
+          "filled_check_validity": true,
+          "filled_submit_fired": true,
+          "sync_dom_delta": "本地演示已确认：表单校验通过。填写内容没有发送或保存，这不代表真实报名成功。\n            \n          \n        \n      \n    \n  \n\n  \n    拾光咖啡 · 周六手冲入门工作坊\n    虚构活动 · 本地演示页面\n  \n\n  \n    (() => {\n      cons",
+          "notes": []
+        }
+      ],
+      "network_intent": {
+        "actions": [],
+        "methods": [],
+        "hasFetch": false,
+        "hasXHR": false,
+        "hasBeacon": false
+      },
+      "errors": [],
+      "measurement_copy": "observer_injected_copy"
+    }
+  ],
+  "limitations": [
+    "测量在注入脚本的临时副本 + iframe 包装页上执行（原文件不改，sha256 已记录）；无界面渲染初始状态，绕开 Windows 无头窗口 500px 最小宽度钳制以获得真实视口布局",
+    "真实网络请求未验证：提交测试强制阻止导航，仅扫描 action/method/fetch/XHR/sendBeacon 声明",
+    "同步 DOM 变化仅捕获提交后立即可见的文本差异；异步提示、点击手感、对比度不在此范围",
+    "字体渲染与真实设备可能不同；数值为该浏览器该视口下的一次测量"
+  ],
+  "created_at": "2026-10-01T03:04:34"
+}

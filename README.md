@@ -2,7 +2,7 @@
 
 代表非专业用户与执行型 Agent 持续协作的代理：帮助形成目标，决定下一步，委托工作，观察实际产物，诊断问题并给出有效修改指导。
 
-**当前状态：P3.2 已完成；P5.2a 入口已交付（等待真实使用记录）；P2.4 进行中——T0—T3 已完成；T4 的交付前专业评审已接通并经一次真实全链路核验（真实评审→真实 Codex 修订→前后复检，见 [P2.4-T4 记录](docs/progress/P2.4-T4.md)）；体验验证（负责人五问与原话）待完成。** 阶段性"已交付"表示"初稿做好，可以查看"，不表示最终完成或用户满意；用户意见形成下一轮任务的机制已有离线测试。DeepSeek 真实诊断（含图像输入）、渲染测量和 Codex CLI 隔离委托已接通；**单案例**的改善记录与验收修复见 [P3.2 记录](docs/progress/P3.2.md)（不构成普遍专业能力结论）。下一步见 [交互可见性实施计划](docs/INTERACTION_VISIBILITY_PLAN.md)；当前证据状态见 [开发状态](docs/DEVELOPMENT_STATUS.md)。案例与评价材料仍为 AI 草案。
+**当前状态：P2.4进行中，T4技术真实往返已核对；负责人委托的[五问辅助回答](docs/progress/P2.4-T4-assisted-answers.md)已完成，本人体验仍未取证。E1已开始：5个开发样本、基线配置、白名单与哈希核对及20份输入包已准备，实际读隔离待核验，E2未运行。** 入口见[E1准备说明](docs/evaluation/e1/README.md)。阶段性“已交付”表示初稿可以查看，不代表用户满意或最终完成。新T4运行的keep漏判与历史improved的归因限制已明确记录，不能据模型复查宣称专家能力。P3.2/P5.2a及当前能力范围见[开发状态](docs/DEVELOPMENT_STATUS.md)，案例与评价材料仍为AI草案。
 
 ## 运行（核心 Python 无第三方包依赖）
 
@@ -16,6 +16,8 @@ py -3.14 -m mentis demo-routing   # 确定性的资源选择与缺口分流演�
 py -3.14 -m mentis diagnose --page runtime/demo/event_page_v1.html --fixture tests/fixtures/mock_diagnosis_response.json
 py -3.14 -m mentis observe-page --page runtime/demo/event_page_v1.html  # 本机浏览器双视口截图
 py -3.14 -m mentis guide-revise --baseline runtime/collab/<运行ID>      # P3.2 指导修订循环（真实运行加 --real）
+py -3.14 -m mentis eval-check     # E1冻结核对；prepared_not_ready明确表示隔离仍待验证
+py -3.14 -m mentis eval-prepare --out runtime/evaluation/my-e1-preview # 离线制作输入包，已有内容拒绝覆盖
 ```
 
 ## 协作运行（P2.3：真实执行器 + 真实截图）
@@ -33,7 +35,7 @@ py -3.14 -m mentis collab-resume --state runtime/collab/<运行ID>/state.json --
 py -3.14 -m mentis collab-resume --state runtime/collab/<运行ID>/state.json --revoke
 ```
 
-执行器在**隔离 Git 工作区**（`runtime/collab/<运行ID>/workspace/`，只含 brief 与素材，不含任何秘密）内工作；产物与双视口截图在 `runtime/collab/<运行ID>/`，`report.md` 提供看结果/看变化/看依据三个入口。**阶段性交付（PROJECT_PLAN §7）：DELIVERED 表示"初稿做好，可以查看"、结构层硬要求检查通过，不表示最终任务完成或用户满意**；反馈修订前会自动把旧版产物快照到 `versions/` 供前后对照。brief 中每条约束/偏好标注来源：用户选定（user_selected）/ 系统约束（system，如隔离与无网络预置规则）/ Mentis 自主推导（agent_selected）/ 暂定（provisional）。**交付前专业评审（T4 补修，当前优先级）**：结构检查通过后，Mentis 以渲染测量+双视口截图+真实模型诊断按领域标准评审工作稿；候选逐条审查（采纳/驳回/保持现状/待用户，理由留档 `professional-review.json`）；成立问题在预算内转成修订指令（位置/证据/保留项/复检办法）委托 Codex 并独立复检；合格不改但留依据；回归不交付、测量不可信不判通过、预算耗尽如实留档。执行器超时会进入 unknown 并保留写锁，需人工核对产物后用 `collab-resume --confirm-outcome completed` 确认；委托从不自动重发。执行器反问（QUESTIONS.md）先由 Mentis 分流：素材可答与常规专业问题自主回答，只有用户独有事实/取舍/许可才请求决定。没有货币硬上限；只记录调用次数、时长与可取得的 token 用量。
+执行器在**隔离 Git 工作区**（`runtime/collab/<运行ID>/workspace/`，只含 brief 与素材，不含任何秘密）内工作；产物与双视口截图在 `runtime/collab/<运行ID>/`，`report.md` 提供看结果/看变化/看依据三个入口。**阶段性交付（PROJECT_PLAN §7）：DELIVERED 表示"初稿做好，可以查看"、结构层硬要求检查通过，不表示最终任务完成或用户满意**；反馈修订前会自动把旧版产物快照到 `versions/` 供前后对照。brief 中每条约束/偏好标注来源：用户选定（user_selected）/ 系统约束（system，如隔离与无网络预置规则）/ Mentis 自主推导（agent_selected）/ 暂定（provisional）。**交付前专业评审（T4 补修，当前优先级）**：结构检查通过后，Mentis 以渲染测量+双视口截图+真实模型诊断按领域标准评审工作稿；候选逐条审查（采纳/驳回/保持现状/待用户，理由留档 `professional-review.json`）；成立问题在预算内转成修订指令（位置/证据/保留项/复检办法）委托 Codex 并重新观察复检（诊断与复查为同源模型）；合格不改但留依据；回归不交付、测量不可信不判通过、预算耗尽如实留档。执行器超时会进入 unknown 并保留写锁，需人工核对产物后用 `collab-resume --confirm-outcome completed` 确认；委托从不自动重发。执行器反问（QUESTIONS.md）先由 Mentis 分流：素材可答与常规专业问题自主回答，只有用户独有事实/取舍/许可才请求决定。没有货币硬上限；只记录调用次数、时长与可取得的 token 用量。
 
 ## 指导修订循环（P3.2：诊断 → 修改指令 → 修订 → 复检）
 
@@ -92,7 +94,7 @@ py -3.14 -m mentis conversation --run runtime/collab/20260929_084347-5f82  # 本
 py -3.14 -m unittest discover -s tests -v
 ```
 
-当前 151 项：入口、契约不变量、能力资源与分流、P2.2 网关/观察/诊断、P3.1 Adapter 与截图边界、P2.3 协作循环（含 v1→反馈→v2 修订路径核验：原目标/硬约束/旧版产物快照/修改依据保留）、P3.2 指导修订循环（合格不改、回归拒收、决策分流/暂停、失败轮核对续办、unknown 产物核对、状态恢复；验收修复：测量不可信判未知、保留项逐段与表单逐字段核对、复查绑定当前产物——均先复现误判后验证修复）、P5.2a 现场会话与逐字反馈归档、P2.4-T1 追踪写入与事后回放（seq/哈希/不回填）、P2.4-T2 逐行流与实时旁观、P2.4-T3 故障与隐私加固（敏感输出隐去、追踪写失败不粉饰、截断/限额不判成功、续接多 attempt 时间线、撤回落trace、现场会话异常收尾、导出白名单与旧记录兼容）、T4 补充（unknown 不崩溃回归、失败子项消息、核对确认事件、终态未入流的 session.json 交叉引用、公开回复全文归档与交流视图）、**T4 交付前专业评审**（有据触发修订、不成立/保持现状不触发、合格不改留依据、无截图不冒充视觉验证、测量不可信判 UNVERIFIED、回归不交付、预算耗尽留档、修订 unknown 停止、保留决定暂停修订、"保留当前"措辞防回归）。Mock HTTP 响应只验证请求格式、用量采集与记录边界；真实调用证据另见阶段报告。
+当前 169 项：入口、契约不变量、能力资源与分流、P2.2 网关/观察/诊断、P3.1 Adapter 与截图边界、P2.3 协作循环（含 v1→反馈→v2 修订路径核验：原目标/硬约束/旧版产物快照/修改依据保留）、P3.2 指导修订循环（合格不改、回归拒收、决策分流/暂停、失败轮核对续办、unknown 产物核对、状态恢复；验收修复：测量不可信判未知、保留项逐段与表单逐字段核对、复查绑定当前产物——均先复现误判后验证修复）、P5.2a 现场会话与逐字反馈归档、P2.4-T1 追踪写入与事后回放（seq/哈希/不回填）、P2.4-T2 逐行流与实时旁观、P2.4-T3 故障与隐私加固（敏感输出隐去、追踪写失败不粉饰、截断/限额不判成功、续接多 attempt 时间线、撤回落trace、现场会话异常收尾、导出白名单与旧记录兼容）、T4 补充（unknown 不崩溃回归、失败子项消息、核对确认事件、终态未入流的 session.json 交叉引用、公开回复全文归档与交流视图）、**T4 交付前专业评审**（有据触发修订、不成立/保持现状不触发、合格不改留依据、无截图不冒充视觉验证、测量不可信判 UNVERIFIED、回归不交付、预算耗尽留档、修订 unknown 停止、保留决定暂停修订、"保留当前"措辞防回归）。Mock HTTP 响应只验证请求格式、用量采集与记录边界；真实调用证据另见阶段报告。
 
 ## 目录
 

@@ -1,0 +1,2 @@
+# E1 manifests hash exact input bytes; checkout must preserve frozen files.
+docs/evaluation/e1/** -text whitespace=trailing-space,space-before-tab,cr-at-eol

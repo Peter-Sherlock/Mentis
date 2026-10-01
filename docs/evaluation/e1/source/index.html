@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'none'; base-uri 'none'">
+  <title>周六手冲入门工作坊 · 拾光咖啡</title>
+  <style>
+    :root {
+      --paper: #f7f3eb;
+      --card: #fffdf8;
+      --ink: #302e27;
+      --muted: #6f6a5f;
+      --line: #ded7c9;
+      --green: #475a45;
+      --green-dark: #354634;
+      --warm: #90563f;
+      --peach: #eddfcf;
+      --error: #a44335;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input { font: inherit; }
+    a { color: inherit; }
+    .container { width: min(100% - 48px, 1120px); margin-inline: auto; }
+    .skip-link {
+      position: absolute;
+      left: 12px;
+      top: -60px;
+      z-index: 10;
+      padding: 8px 14px;
+      background: var(--green);
+      color: white;
+      border-radius: 8px;
+    }
+    .skip-link:focus { top: 12px; }
+    .site-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding-block: 24px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 11px;
+      text-decoration: none;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      white-space: nowrap;
+    }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 35px;
+      height: 35px;
+      border: 1.5px solid var(--green);
+      border-radius: 50%;
+      color: var(--green);
+      font-family: Georgia, serif;
+      font-size: 24px;
+      font-weight: 400;
+      line-height: 1;
+    }
+    .header-link {
+      border-bottom: 1px solid currentColor;
+      color: var(--green);
+      font-size: 14px;
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .header-link:hover { color: var(--warm); }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr);
+      min-height: 540px;
+      overflow: hidden;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      box-shadow: 0 14px 45px rgba(65, 52, 36, .045);
+    }
+    .hero-copy {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: center;
+      padding: clamp(36px, 6vw, 76px);
+      min-width: 0;
+    }
+    .eyebrow {
+      margin: 0 0 22px;
+      color: var(--warm);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .18em;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1, h2 {
+      font-family: "Songti SC", "STSong", "Noto Serif CJK SC", serif;
+      font-weight: 600;
+      letter-spacing: .025em;
+    }
+    h1 {
+      max-width: 9em;
+      margin-bottom: 24px;
+      font-size: clamp(40px, 4.2vw, 62px);
+      line-height: 1.28;
+      text-wrap: balance;
+    }
+    .hero-intro {
+      max-width: 24em;
+      margin-bottom: 32px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.9;
+    }
+    .primary-link, .submit-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      min-height: 48px;
+      padding: 11px 22px;
+      border: 1px solid var(--green);
+      border-radius: 8px;
+      background: var(--green);
+      color: #fffdf8;
+      font-size: 14px;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background .2s ease, transform .2s ease;
+    }
+    .primary-link:hover, .submit-button:hover {
+      background: var(--green-dark);
+      transform: translateY(-1px);
+    }
+    .primary-link svg { width: 17px; height: 17px; }
+    .hero-art {
+      display: grid;
+      place-items: center;
+      min-width: 0;
+      overflow: hidden;
+      background: #e9ddcb;
+    }
+    .hero-art svg { display: block; width: 100%; height: 100%; min-height: 450px; }
+    .details {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-top: 20px;
+      padding: 28px 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .detail { padding: 0 26px; border-left: 1px solid var(--line); min-width: 0; }
+    .detail:first-child { padding-left: 0; border-left: 0; }
+    .detail-label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .1em;
+    }
+    .detail strong {
+      display: block;
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+    .detail small { display: block; color: var(--muted); font-size: 13px; }
+    .section { padding-block: 104px; }
+    .section-tag {
+      display: block;
+      margin-bottom: 16px;
+      color: var(--warm);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .18em;
+    }
+    .section h2 { margin-bottom: 18px; font-size: clamp(31px, 3vw, 42px); line-height: 1.4; }
+    .about {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: clamp(40px, 10vw, 130px);
+      align-items: center;
+    }
+    .about-copy p { max-width: 32em; margin: 0; color: var(--muted); font-size: 16px; line-height: 2; }
+    .host-note {
+      position: relative;
+      padding: 36px 40px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: #f0e9dc;
+    }
+    .host-note::before {
+      content: "“";
+      position: absolute;
+      top: -17px;
+      left: 30px;
+      color: var(--warm);
+      font-family: Georgia, serif;
+      font-size: 64px;
+      line-height: 1;
+    }
+    .host-note p { margin: 4px 0 20px; font-family: "Songti SC", "STSong", serif; font-size: 24px; line-height: 1.7; }
+    .host-note span { color: var(--muted); font-size: 14px; }
+    .faq-wrap { border-top: 1px solid var(--line); }
+    .faq-head { margin-bottom: 36px; }
+    .faq-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .faq-card {
+      min-width: 0;
+      min-height: 174px;
+      padding: 26px 28px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--card);
+    }
+    .faq-card h3 { margin-bottom: 16px; font-size: 16px; font-weight: 700; }
+    .faq-card p { margin: 0; color: var(--muted); font-size: 15px; }
+    .signup-shell {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+      gap: clamp(32px, 7vw, 90px);
+      align-items: start;
+      padding: clamp(34px, 6vw, 72px);
+      border-radius: 24px;
+      background: #eae5d9;
+    }
+    .signup-copy p { max-width: 26em; margin-bottom: 26px; color: var(--muted); line-height: 1.9; }
+    .signup-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .signup-meta span {
+      padding: 5px 11px;
+      border: 1px solid #c7bdad;
+      border-radius: 999px;
+      color: var(--green);
+      font-size: 13px;
+    }
+    .form-panel {
+      padding: clamp(24px, 3vw, 36px);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--card);
+      box-shadow: 0 10px 30px rgba(65, 52, 36, .04);
+    }
+    .field { margin-bottom: 22px; }
+    .field label { display: block; margin-bottom: 9px; font-size: 14px; font-weight: 700; }
+    .required { margin-left: 3px; color: var(--error); }
+    .field input {
+      display: block;
+      width: 100%;
+      min-width: 0;
+      min-height: 49px;
+      padding: 11px 14px;
+      border: 1px solid #cfc6b9;
+      border-radius: 8px;
+      outline: none;
+      background: #fff;
+      color: var(--ink);
+      font-size: 15px;
+      transition: border-color .2s ease, box-shadow .2s ease;
+    }
+    .field input::placeholder { color: #898478; }
+    .field input:focus {
+      border-color: var(--green);
+      box-shadow: 0 0 0 3px rgba(71, 90, 69, .13);
+    }
+    .field input[aria-invalid="true"] { border-color: var(--error); }
+    .field-error { display: none; margin: 7px 0 0; color: var(--error); font-size: 13px; }
+    .field-error.visible { display: block; }
+    .submit-button { width: 100%; }
+    .form-note { margin: 14px 0 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
+    .form-status {
+      display: none;
+      margin: 18px 0 0;
+      padding: 13px 15px;
+      border-radius: 8px;
+      background: #e5eee2;
+      color: #294729;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+    .form-status.visible { display: block; }
+    .site-footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding-block: 32px 40px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .site-footer p { margin: 0; }
+    :focus-visible { outline: 3px solid var(--warm); outline-offset: 3px; }
+
+    @media (max-width: 850px) {
+      .hero { grid-template-columns: minmax(0, 1fr); }
+      .hero-copy { padding: 54px; }
+      .hero-art svg { height: 350px; min-height: 0; }
+      .details { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 22px; }
+      .detail:nth-child(3) { padding-left: 0; border-left: 0; }
+      .about { gap: 30px; }
+      .faq-grid { grid-template-columns: minmax(0, 1fr); }
+      .faq-card { min-height: 0; }
+    }
+    @media (max-width: 600px) {
+      .container { width: min(100% - 36px, 1120px); }
+      .site-header { padding-block: 18px; }
+      .brand { font-size: 14px; }
+      .brand-mark { width: 31px; height: 31px; font-size: 21px; }
+      .header-link { font-size: 13px; }
+      .hero { border-radius: 18px; }
+      .hero-copy { padding: 36px 28px 40px; }
+      .eyebrow { margin-bottom: 17px; font-size: 11px; }
+      h1 { margin-bottom: 17px; font-size: clamp(36px, 9.5vw, 46px); }
+      .hero-intro { margin-bottom: 24px; font-size: 15px; }
+      .hero-art svg { height: 260px; }
+      .details { margin-top: 12px; padding: 20px 0; gap: 21px 0; }
+      .detail { padding: 0 10px 0 14px; }
+      .detail strong { font-size: 14px; }
+      .detail small { font-size: 12px; }
+      .detail-label { font-size: 11px; }
+      .section { padding-block: 72px; }
+      .about { grid-template-columns: minmax(0, 1fr); gap: 38px; }
+      .host-note { padding: 30px 28px; }
+      .host-note p { font-size: 21px; }
+      .faq-head { margin-bottom: 24px; }
+      .faq-card { padding: 22px 24px; }
+      .signup-shell { grid-template-columns: minmax(0, 1fr); gap: 28px; padding: 28px 20px; border-radius: 18px; }
+      .form-panel { padding: 24px 20px; }
+      .site-footer { flex-direction: column; gap: 5px; padding-block: 26px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .primary-link, .submit-button, .field input { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到活动内容</a>
+  <header class="container site-header">
+    <a class="brand" href="#top" aria-label="拾光咖啡，回到顶部"><span class="brand-mark" aria-hidden="true">☼</span>拾光咖啡</a>
+    <a class="header-link" href="#signup">填写报名信息</a>
+  </header>
+
+  <main id="main">
+    <div class="container" id="top">
+      <section class="hero" aria-labelledby="event-title">
+        <div class="hero-copy">
+          <p class="eyebrow">拾光咖啡 · 梧桐街店</p>
+          <h1 id="event-title">周六手冲<br>入门工作坊</h1>
+          <p class="hero-intro">从磨豆开始，慢慢认识手冲咖啡。带上好奇心，来坐坐吧。</p>
+          <a class="primary-link" href="#signup">填写报名信息
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3 10h13m-5-5 5 5-5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </a>
+        </div>
+        <div class="hero-art" aria-hidden="true">
+          <svg viewBox="0 0 520 540" preserveAspectRatio="xMidYMid slice">
+            <defs>
+              <pattern id="grain" width="9" height="9" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".5" fill="#78644e" opacity=".16"/></pattern>
+              <linearGradient id="table" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#c89273"/><stop offset="1" stop-color="#b97b61"/></linearGradient>
+            </defs>
+            <rect width="520" height="540" fill="#e9ddcb"/>
+            <circle cx="372" cy="118" r="112" fill="#f6eee1" opacity=".52"/>
+            <path d="M0 420C146 384 337 410 520 364v176H0Z" fill="url(#table)"/>
+            <path d="M0 420C146 384 337 410 520 364" fill="none" stroke="#9b6957" stroke-width="3" opacity=".5"/>
+            <ellipse cx="268" cy="436" rx="172" ry="28" fill="#98684f" opacity=".17"/>
+            <!-- A simple hand-drawn kettle, dripper and cup. -->
+            <path d="M69 224c-12-59 33-106 94-105 50 0 79 33 74 91-3 30-23 53-54 59H119c-28-6-44-21-50-45Z" fill="#607464" stroke="#334f46" stroke-width="5" stroke-linejoin="round"/>
+            <path d="M106 119c10-23 51-30 81-15 10 5 15 11 16 16" fill="none" stroke="#334f46" stroke-width="7" stroke-linecap="round"/>
+            <path d="M76 185c-34-4-47 22-36 43 9 17 28 18 42 8" fill="none" stroke="#334f46" stroke-width="11" stroke-linecap="round"/>
+            <path d="M234 154c35 3 61-17 72-36-4 43-32 66-70 66" fill="#607464" stroke="#334f46" stroke-width="5" stroke-linejoin="round"/>
+            <path d="M281 153c28 27 42 58 40 94" fill="none" stroke="#9b6a44" stroke-width="5" stroke-linecap="round" stroke-dasharray="7 8"/>
+            <path d="M320 253c-9-8-13-17-12-28" fill="none" stroke="#9b6a44" stroke-width="4" stroke-linecap="round"/>
+            <path d="M238 277h172l-36 98H274Z" fill="#f9f1e5" stroke="#6d6255" stroke-width="5" stroke-linejoin="round"/>
+            <path d="M255 294h139" stroke="#ba9d80" stroke-width="4"/>
+            <path d="M272 326h105" stroke="#d7b79a" stroke-width="4"/>
+            <path d="M230 272h187" stroke="#6d6255" stroke-width="9" stroke-linecap="round"/>
+            <path d="M280 376h88l-10 26h-68Z" fill="#9d6348" stroke="#6c483a" stroke-width="4"/>
+            <path d="M258 400h132v23c0 21-18 38-40 38h-52c-22 0-40-17-40-38Z" fill="#fcf7ec" stroke="#6d6255" stroke-width="5"/>
+            <path d="M389 409h15c29 0 26 39-11 39h-15" fill="none" stroke="#6d6255" stroke-width="5" stroke-linecap="round"/>
+            <ellipse cx="324" cy="402" rx="65" ry="9" fill="#8a563f"/>
+            <path d="M298 187c-10-15-8-29 1-42m21 38c-6-12-3-24 4-33" fill="none" stroke="#fffaf0" stroke-width="4" stroke-linecap="round" opacity=".72"/>
+            <path d="M91 378c-10-12-8-27 6-33 11 13 10 26-6 33Zm30 16c-12-8-14-22-3-31 13 8 17 20 3 31Z" fill="#6d8064"/>
+            <path d="M94 380c23-26 42-40 58-46" fill="none" stroke="#536e54" stroke-width="3" stroke-linecap="round"/>
+            <circle cx="397" cy="188" r="5" fill="#be8162"/><circle cx="416" cy="210" r="3" fill="#be8162"/>
+            <rect width="520" height="540" fill="url(#grain)"/>
+          </svg>
+        </div>
+      </section>
+
+      <section class="details" aria-label="活动基本信息">
+        <div class="detail"><span class="detail-label">日期时间</span><strong>2026-11-14 周六 14:00—16:00</strong></div>
+        <div class="detail"><span class="detail-label">地点</span><strong>拾光咖啡 · 梧桐街店</strong><small>梧桐街 12 号（演示地址）</small></div>
+        <div class="detail"><span class="detail-label">费用与人数</span><strong>¥99 / 人</strong><small>限 8 人</small></div>
+        <div class="detail"><span class="detail-label">讲师</span><strong>林小豆</strong><small>三年手冲教学经验</small></div>
+      </section>
+
+      <section class="section about" aria-labelledby="about-title">
+        <div class="about-copy">
+          <span class="section-tag">关于这次工作坊</span>
+          <h2 id="about-title">一起从磨豆开始</h2>
+          <p>零基础也可以来。课程从磨豆开始，什么都不用带，好奇心即可。</p>
+        </div>
+        <div class="host-note">
+          <p>慢慢来，先从一杯手冲咖啡开始。</p>
+          <span>讲师：林小豆 · 三年手冲教学经验</span>
+        </div>
+      </section>
+
+      <section class="section faq-wrap" aria-labelledby="faq-title">
+        <div class="faq-head">
+          <span class="section-tag">来之前</span>
+          <h2 id="faq-title">来之前，你可能想知道</h2>
+        </div>
+        <div class="faq-grid">
+          <article class="faq-card"><h3>需要带什么？</h3><p>什么都不用带，好奇心即可。</p></article>
+          <article class="faq-card"><h3>零基础可以吗？</h3><p>可以，课程从磨豆开始。</p></article>
+          <article class="faq-card"><h3>可以退款吗？</h3><p>活动前 48 小时可全额退款。</p></article>
+        </div>
+      </section>
+
+      <section class="section" id="signup" aria-labelledby="signup-title">
+        <div class="signup-shell">
+          <div class="signup-copy">
+            <span class="section-tag">本地报名演示</span>
+            <h2 id="signup-title">留个名字，<br>周六见。</h2>
+            <p>填写姓名和联系方式即可体验本地表单。这个页面只作演示，填写的信息不会发送或保存，也不会产生真实报名。</p>
+            <div class="signup-meta"><span>2026-11-14 周六 14:00—16:00</span><span>¥99 / 人</span></div>
+          </div>
+          <div class="form-panel">
+            <form id="signup-form" novalidate>
+              <div class="field">
+                <label for="name">姓名 <span class="required" aria-hidden="true">*</span></label>
+                <input id="name" name="name" type="text" autocomplete="name" placeholder="怎么称呼你？" required aria-describedby="name-error">
+                <p class="field-error" id="name-error">请填写姓名。</p>
+              </div>
+              <div class="field">
+                <label for="contact">联系方式 <span class="required" aria-hidden="true">*</span></label>
+                <input id="contact" name="contact" type="text" autocomplete="off" placeholder="请填写联系方式" required aria-describedby="contact-error">
+                <p class="field-error" id="contact-error">请填写联系方式。</p>
+              </div>
+              <button class="submit-button" type="submit">提交本地演示信息</button>
+              <p class="form-note">* 为必填项。本页无网络请求，不会发送或保存填写内容。</p>
+              <p class="form-status" id="form-status" role="status" aria-live="polite"></p>
+            </form>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="container site-footer">
+    <p>拾光咖啡 · 周六手冲入门工作坊</p>
+    <p>虚构活动 · 本地演示页面</p>
+  </footer>
+
+  <script>
+    (() => {
+      const form = document.getElementById('signup-form');
+      const status = document.getElementById('form-status');
+      const fields = [document.getElementById('name'), document.getElementById('contact')];
+
+      function validate(field) {
+        const empty = field.value.trim().length === 0;
+        const error = document.getElementById(field.id + '-error');
+        field.setAttribute('aria-invalid', String(empty));
+        error.classList.toggle('visible', empty);
+        return !empty;
+      }
+
+      fields.forEach((field) => {
+        field.addEventListener('input', () => {
+          if (field.getAttribute('aria-invalid') === 'true') validate(field);
+          status.classList.remove('visible');
+          status.textContent = '';
+        });
+      });
+
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const valid = fields.map(validate).every(Boolean);
+        if (!valid) {
+          fields.find((field) => field.getAttribute('aria-invalid') === 'true').focus();
+          return;
+        }
+        form.reset();
+        fields.forEach((field) => field.removeAttribute('aria-invalid'));
+        status.textContent = '本地演示已确认：表单校验通过。填写内容没有发送或保存，这不代表真实报名成功。';
+        status.classList.add('visible');
+      });
+    })();
+  </script>
+</body>
+</html>

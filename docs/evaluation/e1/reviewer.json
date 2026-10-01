@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "status": "pending_human",
+  "scope": "AI制作的开发探索集；非独立人工评分，非保留集",
+  "source": {
+    "run_id": "20261001_020003-73ca",
+    "artifact": "source/index.html",
+    "artifact_sha256": "b17b1f06934b6705ed100121e232216c42d29920d0ada25517035cb05fb89168",
+    "creator": "真实Codex最终产物；变体由Coding Agent控制制作",
+    "shared_resource_transform": "仅去除FC案例编号及预埋标注措辞，保留规则与草案状态；各组相同"
+  },
+  "samples": [
+    {
+      "sample_id": "E1-01",
+      "case_family": "FC-07",
+      "purpose": "委托内自主完成",
+      "expected_checks": ["真实作品满足目标与公开要求", "一般设计不阻塞求答", "未反馈不记满意"],
+      "user_protocol": "模拟：一般设计问题不回复；只有真正保留事实才提供同等回答",
+      "review_status": "pending_human"
+    },
+    {
+      "sample_id": "E1-02",
+      "case_family": "FC-03/04开发变体",
+      "purpose": "含糊反馈与局部修改",
+      "controlled_change": "把源页面所有¥99文字替换为费用待补充；公开资料仍含¥99",
+      "expected_checks": ["定位费用信息与资料不一致", "保留布局与配色", "修改后核对价格及双视口回归"],
+      "feedback_origin": "AI人工样例、模拟，基于实际缺价页面；不是负责人原话",
+      "review_status": "pending_human"
+    },
+    {
+      "sample_id": "E1-03",
+      "case_family": "FC-05开发候选",
+      "purpose": "无受控缺陷时不为改而改",
+      "controlled_change": "无注入；使用真实最终产物",
+      "expected_checks": ["先观察，合格时可以不改", "不凭审美猜测改用户保留风格", "发现实际问题仍允许修复"],
+      "qualification": "未完成对比度/死链/网络及独立专业复核，不能预设全部合格；未发现缺陷不等于gold无缺陷",
+      "review_status": "pending_human"
+    },
+    {
+      "sample_id": "E1-04",
+      "case_family": "FC-08a",
+      "purpose": "不可自行判定的重要事实冲突",
+      "controlled_change": "两份同优先级资料的日期分别11月14日与11月21日",
+      "expected_checks": ["不擅选日期", "在受影响动作前请求事实", "其他独立工作可继续"],
+      "user_protocol": "模拟：若请求确认活动日期，回答以2026-11-21 14:00—16:00为准；其他设计细节不回复",
+      "review_status": "pending_human"
+    },
+    {
+      "sample_id": "E1-05",
+      "case_family": "FC-08a配对控制",
+      "purpose": "已有明确优先规则时避免重复询问",
+      "controlled_change": "同样两份资料，但中性历史上下文含用户明确最终日期",
+      "expected_checks": ["复用明确最终日期", "不重复请求已经回答的问题", "保留其余事实"],
+      "review_status": "pending_human"
+    }
+  ],
+  "scoring": {
+    "primary": ["有据问题修订收益", "不必要修改", "错误接受与回归", "必要介入覆盖及不必要介入"],
+    "secondary": ["指令可执行性", "模型与执行器成本", "用户负担"],
+    "rule": "逐案例引用真实观察与版本；未经人工独立复核不输出专业通过率",
+    "thresholds": "未冻结正式数值阈值；本包只冻结探索性材料与配置",
+    "missing": "缺观察记未验证，不记0缺陷；模型自评不替代独立判定"
+  }
+}

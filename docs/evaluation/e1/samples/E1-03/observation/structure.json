@@ -1,0 +1,337 @@
+{
+  "source_path": "workspace/index.html",
+  "sha256": "b17b1f06934b6705ed100121e232216c42d29920d0ada25517035cb05fb89168",
+  "kind": "structure",
+  "items": [
+    {
+      "item_id": "link:1",
+      "kind": "a",
+      "text": "跳到活动内容",
+      "extra": {
+        "href": "#main"
+      }
+    },
+    {
+      "item_id": "link:2",
+      "kind": "a",
+      "text": "☼拾光咖啡",
+      "extra": {
+        "href": "#top"
+      }
+    },
+    {
+      "item_id": "link:3",
+      "kind": "a",
+      "text": "填写报名信息",
+      "extra": {
+        "href": "#signup"
+      }
+    },
+    {
+      "item_id": "text:1",
+      "kind": "dom_text",
+      "text": "拾光咖啡 · 梧桐街店",
+      "extra": {}
+    },
+    {
+      "item_id": "h:1",
+      "kind": "h1",
+      "text": "周六手冲入门工作坊",
+      "extra": {
+        "level": "h1"
+      }
+    },
+    {
+      "item_id": "text:2",
+      "kind": "dom_text",
+      "text": "从磨豆开始，慢慢认识手冲咖啡。带上好奇心，来坐坐吧。",
+      "extra": {}
+    },
+    {
+      "item_id": "link:4",
+      "kind": "a",
+      "text": "填写报名信息",
+      "extra": {
+        "href": "#signup"
+      }
+    },
+    {
+      "item_id": "text:3",
+      "kind": "dom_text",
+      "text": "日期时间",
+      "extra": {}
+    },
+    {
+      "item_id": "text:4",
+      "kind": "dom_text",
+      "text": "2026-11-14 周六 14:00—16:00",
+      "extra": {}
+    },
+    {
+      "item_id": "text:5",
+      "kind": "dom_text",
+      "text": "地点",
+      "extra": {}
+    },
+    {
+      "item_id": "text:6",
+      "kind": "dom_text",
+      "text": "拾光咖啡 · 梧桐街店",
+      "extra": {}
+    },
+    {
+      "item_id": "text:7",
+      "kind": "dom_text",
+      "text": "梧桐街 12 号（演示地址）",
+      "extra": {}
+    },
+    {
+      "item_id": "text:8",
+      "kind": "dom_text",
+      "text": "费用与人数",
+      "extra": {}
+    },
+    {
+      "item_id": "text:9",
+      "kind": "dom_text",
+      "text": "¥99 / 人",
+      "extra": {}
+    },
+    {
+      "item_id": "text:10",
+      "kind": "dom_text",
+      "text": "限 8 人",
+      "extra": {}
+    },
+    {
+      "item_id": "text:11",
+      "kind": "dom_text",
+      "text": "讲师",
+      "extra": {}
+    },
+    {
+      "item_id": "text:12",
+      "kind": "dom_text",
+      "text": "林小豆",
+      "extra": {}
+    },
+    {
+      "item_id": "text:13",
+      "kind": "dom_text",
+      "text": "三年手冲教学经验",
+      "extra": {}
+    },
+    {
+      "item_id": "text:14",
+      "kind": "dom_text",
+      "text": "关于这次工作坊",
+      "extra": {}
+    },
+    {
+      "item_id": "h:2",
+      "kind": "h2",
+      "text": "一起从磨豆开始",
+      "extra": {
+        "level": "h2"
+      }
+    },
+    {
+      "item_id": "text:15",
+      "kind": "dom_text",
+      "text": "零基础也可以来。课程从磨豆开始，什么都不用带，好奇心即可。",
+      "extra": {}
+    },
+    {
+      "item_id": "text:16",
+      "kind": "dom_text",
+      "text": "慢慢来，先从一杯手冲咖啡开始。",
+      "extra": {}
+    },
+    {
+      "item_id": "text:17",
+      "kind": "dom_text",
+      "text": "讲师：林小豆 · 三年手冲教学经验",
+      "extra": {}
+    },
+    {
+      "item_id": "text:18",
+      "kind": "dom_text",
+      "text": "来之前",
+      "extra": {}
+    },
+    {
+      "item_id": "h:3",
+      "kind": "h2",
+      "text": "来之前，你可能想知道",
+      "extra": {
+        "level": "h2"
+      }
+    },
+    {
+      "item_id": "h:4",
+      "kind": "h3",
+      "text": "需要带什么？",
+      "extra": {
+        "level": "h3"
+      }
+    },
+    {
+      "item_id": "text:19",
+      "kind": "dom_text",
+      "text": "什么都不用带，好奇心即可。",
+      "extra": {}
+    },
+    {
+      "item_id": "h:5",
+      "kind": "h3",
+      "text": "零基础可以吗？",
+      "extra": {
+        "level": "h3"
+      }
+    },
+    {
+      "item_id": "text:20",
+      "kind": "dom_text",
+      "text": "可以，课程从磨豆开始。",
+      "extra": {}
+    },
+    {
+      "item_id": "h:6",
+      "kind": "h3",
+      "text": "可以退款吗？",
+      "extra": {
+        "level": "h3"
+      }
+    },
+    {
+      "item_id": "text:21",
+      "kind": "dom_text",
+      "text": "活动前 48 小时可全额退款。",
+      "extra": {}
+    },
+    {
+      "item_id": "text:22",
+      "kind": "dom_text",
+      "text": "本地报名演示",
+      "extra": {}
+    },
+    {
+      "item_id": "h:7",
+      "kind": "h2",
+      "text": "留个名字，周六见。",
+      "extra": {
+        "level": "h2"
+      }
+    },
+    {
+      "item_id": "text:23",
+      "kind": "dom_text",
+      "text": "填写姓名和联系方式即可体验本地表单。这个页面只作演示，填写的信息不会发送或保存，也不会产生真实报名。",
+      "extra": {}
+    },
+    {
+      "item_id": "text:24",
+      "kind": "dom_text",
+      "text": "2026-11-14 周六 14:00—16:00",
+      "extra": {}
+    },
+    {
+      "item_id": "text:25",
+      "kind": "dom_text",
+      "text": "¥99 / 人",
+      "extra": {}
+    },
+    {
+      "item_id": "form:1",
+      "kind": "form",
+      "text": "",
+      "extra": {}
+    },
+    {
+      "item_id": "text:26",
+      "kind": "dom_text",
+      "text": "姓名",
+      "extra": {}
+    },
+    {
+      "item_id": "text:27",
+      "kind": "dom_text",
+      "text": "*",
+      "extra": {}
+    },
+    {
+      "item_id": "input:1",
+      "kind": "input",
+      "text": "name",
+      "extra": {
+        "type": "text",
+        "required": "yes"
+      }
+    },
+    {
+      "item_id": "text:28",
+      "kind": "dom_text",
+      "text": "请填写姓名。",
+      "extra": {}
+    },
+    {
+      "item_id": "text:29",
+      "kind": "dom_text",
+      "text": "联系方式",
+      "extra": {}
+    },
+    {
+      "item_id": "text:30",
+      "kind": "dom_text",
+      "text": "*",
+      "extra": {}
+    },
+    {
+      "item_id": "input:2",
+      "kind": "input",
+      "text": "contact",
+      "extra": {
+        "type": "text",
+        "required": "yes"
+      }
+    },
+    {
+      "item_id": "text:31",
+      "kind": "dom_text",
+      "text": "请填写联系方式。",
+      "extra": {}
+    },
+    {
+      "item_id": "btn:1",
+      "kind": "button",
+      "text": "提交本地演示信息",
+      "extra": {
+        "type": "submit"
+      }
+    },
+    {
+      "item_id": "text:32",
+      "kind": "dom_text",
+      "text": "* 为必填项。本页无网络请求，不会发送或保存填写内容。",
+      "extra": {}
+    },
+    {
+      "item_id": "text:33",
+      "kind": "dom_text",
+      "text": "拾光咖啡 · 周六手冲入门工作坊",
+      "extra": {}
+    },
+    {
+      "item_id": "text:34",
+      "kind": "dom_text",
+      "text": "虚构活动 · 本地演示页面",
+      "extra": {}
+    }
+  ],
+  "limitations": [
+    "仅源代码 DOM 文本与结构，无渲染截图：CSS 可见性、动态内容及视觉效果未验证；观察记录未出现不等于实际页面缺失",
+    "无交互执行记录：行为类结论（表单实际行为）未验证，仅能看到声明结构",
+    "无法检测横向溢出：需要真实视口渲染（P3.1 观察链）"
+  ],
+  "created_at": "2026-10-01T03:04:42"
+}

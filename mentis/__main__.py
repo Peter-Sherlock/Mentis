@@ -32,6 +32,8 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis field-feedback 查看作品后补记逐字反馈（绑定该运行的会话记录）
   python -m mentis trace           P2.4 事后回放 / --follow 实时旁观（只读）/ --export 导出白名单时间线
   python -m mentis conversation    本地交流视图：确切委托、Codex 公开回复与动作摘要（只读）
+  python -m mentis eval-check      E1 冻结清单核对（离线；不证明答案读隔离）
+  python -m mentis eval-prepare    E1 按白名单制作各组相同输入包（离线；拒绝覆盖）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -107,7 +109,35 @@ def main(argv=None) -> int:
                          "用户逐字反馈/密钥字段；历史运行导出材料清单+缺口，不回填）")
     conversation = sub.add_parser("conversation", help="本地交流视图（确切指令、公开回复与动作摘要；只读）")
     conversation.add_argument("--run", required=True, help="运行目录（runtime/collab/<ID> 或 runtime/guidance/<ID>）")
+    echeck = sub.add_parser("eval-check", help="E1 只读核对冻结源与输入白名单，不运行实验")
+    echeck.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
+    eprepare = sub.add_parser("eval-prepare", help="E1 离线输入导出；不调用模型，不证明答案读隔离")
+    eprepare.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
+    eprepare.add_argument("--out", required=True, help="全新输出目录，已有内容时拒绝覆盖")
     args = parser.parse_args(argv)
+
+    if args.command in ("eval-check", "eval-prepare"):
+        from mentis.evaluation import audit_suite, prepare_suite
+
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+        if args.command == "eval-check":
+            result = audit_suite(Path(args.suite))
+        else:
+            try:
+                report = prepare_suite(Path(args.suite), Path(args.out))
+            except (OSError, ValueError) as exc:
+                print(f"评测输入未导出：{exc}", file=sys.stderr)
+                return 2
+            result = {key: report[key] for key in ("status", "suite_id", "suite_sha256", "sample_count", "checks", "blocking_reasons", "exploratory_blocking_reasons", "formal_claim_limits", "scope")}
+            result["package_count"] = sum(len(row["arms"]) for row in report["packages"])
+            result["out"] = str(Path(args.out).resolve())
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        # Zero means frozen input validation/preparation succeeded; the status
+        # and runtime_answer_isolation check explicitly prohibit a ready claim.
+        return 1 if result["status"] == "invalid" else 0
 
     if args.command == "demo-contract":
         from mentis.demo_contract import run_demo
