@@ -142,3 +142,13 @@ Mentis 自身延迟目标：收到一行完整 CLI 事件后 2 秒内落盘可�
 - 新运行在 `item.completed/agent_message` 时把**公开回复全文**原样保存于本地私有 `trace/messages/<attempt>-<sha256>.md`，事件 `refs` 以 `role=executor_message` 和 SHA-256 关联；归档失败计入追踪写失败，不改变执行器终态。内部推理与原生命令输出不归档到此处。
 - `mentis conversation --run <目录>` 只读组合确切 prompt、可核验的公开回复、动作摘要和 Mentis 复检/收尾；`collab` 与 `guide-revise` 新运行另生成 `conversation.md` 并从报告“看依据”指向。此视图是本地私有材料，不进入 `trace --export` 白名单；不等同完整原生聊天记录。
 - 旧事件无全文引用时明确显示“仅存事件摘要，可能已截断”，不自动搜索私有 rollout，不回填原事件。T4 真实运行的原生 rollout 中可核对的五条对外回复另作一次性只读整理，来源和缺口见 `docs/progress/P2.4-T4.md`。
+
+## 16. V1 实现附录（2026-10-02，评估计划先行）
+
+按 ADR-008 第 1、4 条接入评估计划（EvaluationPlan）时序，新增两类 `source=mentis` 事件与一个 refs role：
+
+1. **新增 kind：`evaluation_plan.recorded`**：运行内首次生成评估计划并在**首次委托前**落盘时写入（`refs` 含 `role=plan` 的计划文件与 SHA-256；summary 记维度数、阻塞条数与模型实例化状态）。理由：ADR-008 要求评估标准先于委托冻结且可审计——"标准在看到产物前已存在"必须能从事件时间序核对，此前的 `goal.recorded`/`policy.set` 只记录目标与代决范围，不含判定标准。
+2. **新增 kind：`evaluation_plan.revised`**：brief 改版/目标变化等有原因的改版落盘新版本时写入（summary 记版本迁移、原因与受影响条目；refs 指向新版本文件）。旧版本文件不改写；旧尝试的评审记录以 `evaluation_plan: {version, sha256}` 绑定其当时版本。理由：计划修订必须"只在有原因时发生"且可审计，不改写历史。
+3. **新增 refs role：`plan`**（§2 role 枚举追加）：指向 `evaluation-plan/plan-v<N>.json` 及其 SHA-256。
+4. **先落盘后委托的强化**：`delegation.prepared` 事件 refs 现在同时含 `prompt` 与 `plan` 两个引用；计划落盘失败抛 `PlanPersistenceError`，该次委托不发起（执行器零调用），与 prompt 落盘失败同一纪律。委托文本尾部追加"本轮验收项"段（来自计划阻塞条目），归档哈希=实际发送文本。
+5. 不变量补充：评估计划事件与委托事件的先后关系是"标准先于执行"的证据；回放/旁观按既有 seq 顺序呈现，不需要新解析逻辑。

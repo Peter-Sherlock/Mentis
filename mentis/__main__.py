@@ -35,6 +35,7 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis eval-check      E1 冻结清单核对（离线；--isolation-evidence 接入真实隔离准入）
   python -m mentis eval-prepare    E1 按白名单制作各组相同输入包（离线；拒绝覆盖）
   python -m mentis eval-isolate    E1 答案读隔离：probe 开窗双端探测 / release 解除 / check 准入
+  python -m mentis eval-plan       P2.4-V1 评估计划先行：组装并打印某目标的评估计划（--real 调模型）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -125,7 +126,65 @@ def main(argv=None) -> int:
                       help="探测目标组目录（相对 prepared，如 input-001/M）")
     eiso.add_argument("--no-codex", action="store_true",
                       help="只探测 Mentis 环境端；准入要求 Codex 端证据时不得使用")
+    eplan = sub.add_parser("eval-plan",
+                           help="P2.4-V1 评估计划先行：为某目标组装并打印评估计划"
+                                "（默认离线组装；--real 调模型实例化领域规则）")
+    eplan.add_argument("--goal", required=True, help="本轮任务目标原话")
+    eplan.add_argument("--material", default="",
+                       help="任务素材文件路径（标注化“- 标签：值”格式）；任务实例层据此推导")
+    eplan.add_argument("--pilot", action="store_true",
+                       help="使用内置合成试点素材（拾光咖啡，虚构品牌）演示完整四层计划")
+    eplan.add_argument("--real", action="store_true",
+                       help="调用 DeepSeek 实例化领域规则（需凭据；发送目标/brief 条目/素材摘录/已加载规则；"
+                            "虚构来源条目会被拒收并留痕）")
+    eplan.add_argument("--out", default="", help="同时把计划 JSON 写入该路径（默认只打印）")
     args = parser.parse_args(argv)
+
+    if args.command == "eval-plan":
+        from mentis.capabilities.registry import load_registry
+        from mentis.capabilities.selection import select_for_task
+        from mentis.contracts import Brief
+        from mentis.evaluation_plan import build_evaluation_plan, render_plan_markdown
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        material_text = ""
+        if args.pilot:
+            from mentis.collab import COPY_DECK as material_text  # 合成素材（虚构品牌）
+        elif args.material:
+            material_text = Path(args.material).read_text(encoding="utf-8")
+        goal = args.goal
+        brief = Brief(brief_id="brief-cli", version=1, objective=goal,
+                      constraints=[], preferences=[],
+                      created_at=datetime.now().isoformat(timespec="seconds"))
+        resources = []
+        try:
+            _, resources = select_for_task(
+                load_registry(), task_label="评估计划",
+                task_keywords=["单页活动介绍页"],
+                decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
+                observation_capabilities={"structure_only": True, "screenshots": True,
+                                         "render_measurement": True},
+                can_execute=True)
+        except Exception:
+            resources = []
+        use_model = bool(args.real)
+        gateway = None
+        if use_model:
+            from mentis.models.gateway import ModelConfig, ModelGateway
+            gateway = ModelGateway(config=ModelConfig())
+        plan = build_evaluation_plan(
+            goal=goal, brief=brief, material_text=material_text,
+            resources=resources, gateway=gateway, use_model=use_model)
+        print(render_plan_markdown(plan))
+        if args.out:
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.out).write_bytes(plan.to_json_bytes())
+            print(f"[已写入] {Path(args.out).resolve()}")
+        mi = plan.model_instantiation
+        print(f"[摘要] 维度 {len(plan.entries)} 条（阻塞 {len(plan.blocking_entries())}）；"
+              f"模型实例化 {mi.get('status')}"
+              + (f"，用量 {mi.get('usage')}" if mi.get("usage") else ""))
+        return 0
 
     if args.command in ("eval-check", "eval-prepare", "eval-isolate"):
         from pathlib import Path as _Path

@@ -14,6 +14,7 @@
 - 不声称货币硬上限；只记录调用次数、时长与可取得的 token 用量。
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -26,6 +27,11 @@ from mentis.capabilities.routing import Gap, route_gap
 from mentis.capabilities.selection import select_for_task
 from mentis.contracts import AttemptStatus, DelegationPolicy, Disposition, Provenance, SourcedItem
 from mentis.diagnosis import DiagnosisBundle, render_bundle_markdown, run_diagnosis
+# V1：评估计划先行（ADR-008 第 1—5、9 条）——先落盘后委托，硬要求读计划
+from mentis.evaluation_plan import (EvaluationPlan, PlanPersistenceError, acceptance_block,
+                                    build_evaluation_plan, derive_task_facts,
+                                    execute_structural_check, render_plan_markdown,
+                                    revise_plan, SPEC_RENDER_OVERFLOW)
 from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskResult, CodexTaskSpec
 # T4 补修：交付前专业评审复用 guidance 的观察/诊断/指令/复检机制（提取为模块级函数），
 # 不另建平行流程。
@@ -80,7 +86,21 @@ def resolve_codex_executable() -> str:
     return shutil.which("codex") or "codex"
 
 
-def build_delegation_prompt(brief_text: str, direction: str, revision_note: str = "") -> str:
+def build_delegation_prompt(brief_text: str, direction: str, revision_note: str = "",
+                            facts: dict | None = None) -> str:
+    """构建委托指令；事实清单从评估计划的任务实例条目派生（V1 起不再硬编码试点值）。"""
+    if not facts:
+        facts = derive_task_facts(COPY_DECK)["needles"]
+    fact_parts = []
+    if facts.get("活动名称"):
+        fact_parts.append(f"活动名称（{facts['活动名称']}）")
+    if facts.get("日期时间"):
+        fact_parts.append(f"日期时间（{facts['日期时间']}）")
+    if facts.get("地点"):
+        fact_parts.append(f"地点（{facts['地点']}）")
+    if facts.get("价格"):
+        fact_parts.append(f"价格 {facts['价格']}")
+    fact_parts.append("报名表单（姓名与联系方式必填校验，提交后显示本地确认提示，不发送任何网络请求）")
     parts = [
         "在当前工作区创建 index.html：一个本地单页活动介绍页。",
         f"[目标] {brief_text}",
@@ -88,8 +108,7 @@ def build_delegation_prompt(brief_text: str, direction: str, revision_note: str 
         f"[风格方向] {direction}",
         "[硬要求] "
         "1) 单文件 index.html，可内嵌 CSS/JS，中文内容；"
-        "2) 必须包含活动名称、日期时间（2026-11-14 周六 14:00—16:00）、地点、价格 ¥99、"
-        "报名表单（姓名与联系方式必填校验，提交后显示本地确认提示，不发送任何网络请求）；"
+        f"2) 必须包含：{'、'.join(fact_parts)}；"
         "3) 桌面 1280 与移动 390 宽度都可用，无横向溢出；"
         "4) 图片只能用内联 SVG 或 CSS 图形，禁止外链与联网；"
         "5) 不要读取本工作区以外的文件，不要访问网络。",
@@ -145,6 +164,7 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.adapter = adapter or CodexCliAdapter(executable=resolve_codex_executable())
     obj.gateway = gateway if gateway is not None else ModelGateway(config=ModelConfig())
     obj.browser_capture = browser_capture
+    obj.material_text = meta.get("material_text") or COPY_DECK
     obj.codex_runs = [CodexRunSummary(**r) for r in meta["codex_runs"]]
     obj.question_routes = list(meta.get("question_routes", []))
     obj.thread_id = meta.get("thread_id", "")
@@ -157,6 +177,7 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.measure = measure_page
     obj.run_dir = state_path.parent if isinstance(state_path, Path) else Path(state_path).parent
     obj._finalized_emitted = False
+    obj.evaluation_plan = obj._load_latest_plan()  # V1：恢复已落盘的评估计划（不改写）
     obj.trace = TraceWriter(obj.run_dir, obj.run_id, executor_version=obj.adapter.cli_version)
     obj.trace.emit("mentis", "run.resumed",
                    f"从落盘状态恢复（进入时状态 {obj.status}）；既有事件续排，不重放历史委托",
@@ -168,7 +189,8 @@ class Collaboration:
     def __init__(self, goal: str, mode: str = "autonomous", direction: str = "",
                  interactive: bool = False, adapter=None, gateway=None,
                  browser_capture=None, max_repairs: int = 1, timeout_s: int = 420,
-                 use_model: bool = True, run_id: str = "", base_dir=None, measure=None):
+                 use_model: bool = True, run_id: str = "", base_dir=None, measure=None,
+                 material_text: str = ""):
         self.base_dir = Path(base_dir) if base_dir else COLLAB_DIR
         self.run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S") + "-" + os.urandom(2).hex()
         self.mode = mode
@@ -177,6 +199,8 @@ class Collaboration:
         self.timeout_s = timeout_s
         self.use_model = use_model
         self.measure = measure or measure_page  # 渲染测量（T4 补修：可注入替身）
+        # V1：任务素材可注入（评估计划任务实例层据此推导）；缺省为合成试点素材
+        self.material_text = material_text or COPY_DECK
         self._direction = direction
         self._last_answer = ""
         self.session = TaskSession(goal=goal)
@@ -197,6 +221,7 @@ class Collaboration:
         self._review_form_requirements: list = []
         self.run_dir = self.base_dir / self.run_id
         self._finalized_emitted = False
+        self.evaluation_plan: EvaluationPlan | None = None  # V1：首次委托前落盘
         # P2.4-T1：追踪写入器（契约 mentis-trace/1）；委托/复检/收尾点写入
         self.trace = TraceWriter(self.run_dir, self.run_id,
                                  executor_version=self.adapter.cli_version)
@@ -284,7 +309,7 @@ class Collaboration:
             + "\n".join(f"- {i.text}" for i in
                         self.session.current_brief.constraints + self.session.current_brief.preferences)
             + "\n", encoding="utf-8")
-        (ws / "input" / "copy.md").write_text(COPY_DECK, encoding="utf-8")
+        (ws / "input" / "copy.md").write_text(self.material_text, encoding="utf-8")
         expected = {".git", "brief.md", "input"}
         actual = {p.name for p in ws.iterdir()}
         if actual != expected:
@@ -300,10 +325,98 @@ class Collaboration:
             can_execute=True,
         )
 
+    # ---- 评估计划（V1：首次委托前落盘，硬要求读计划） ----
+
+    def _plan_resources(self) -> list:
+        """已加载的领域资源（评估计划领域层来源）；加载失败不阻塞计划组装。"""
+        try:
+            _, loaded = self.current_context()
+            return list(loaded)
+        except Exception:
+            return []
+
+    def _load_latest_plan(self) -> EvaluationPlan | None:
+        """从运行目录恢复最新版评估计划；文件哈希重算，不改写任何版本。"""
+        plan_dir = self.run_dir / "evaluation-plan"
+        plans = []
+        if plan_dir.is_dir():
+            for path in sorted(plan_dir.glob("plan-v*.json")):
+                try:
+                    plan = EvaluationPlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                    plan.sha256 = _sha256_file(path)
+                    plans.append(plan)
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue  # 损坏的计划文件跳过，不留痕改写
+        return max(plans, key=lambda p: p.version) if plans else None
+
+    def _plan_revision_reason(self, plan: EvaluationPlan) -> tuple:
+        if plan.goal != self.session.current_brief.objective:
+            return "goal_change", (f"目标变化：「{plan.goal[:40]}」→"
+                                   f"「{self.session.current_brief.objective[:40]}」")
+        return "brief_revision", (f"brief 改版：v{plan.brief_version}→"
+                                  f"v{self.session.current_brief.version}"
+                                  "（用户修正/新增偏好进入 brief，受影响条目随之更新）")
+
+    def _ensure_evaluation_plan(self) -> EvaluationPlan:
+        """确保存在与当前 brief 版本匹配的评估计划；先落盘后委托。
+
+        落盘失败抛 PlanPersistenceError——调用方（_dispatch_codex）在委托前停止，
+        执行器零调用。改版仅在有原因时发生（brief 改版/目标变化；ADR-008 第 5 条）。
+        """
+        current_v = self.session.current_brief.version
+        plan = self.evaluation_plan or self._load_latest_plan()
+        if (plan is not None and plan.brief_version == current_v
+                and plan.goal == self.session.current_brief.objective):
+            self.evaluation_plan = plan
+            return plan
+        use_model = bool(self.use_model and self.gateway is not None)
+        if plan is None:
+            new_plan = build_evaluation_plan(
+                goal=self.session.current_brief.objective,
+                brief=self.session.current_brief, material_text=self.material_text,
+                resources=self._plan_resources(), gateway=self.gateway,
+                use_model=use_model, notify=self.notify)
+            event_kind = "evaluation_plan.recorded"
+            summary = (f"评估计划 v{new_plan.version} 已落盘（首次委托前）："
+                       f"{len(new_plan.entries)} 个维度、阻塞 {len(new_plan.blocking_entries())} 条；"
+                       f"模型实例化 {new_plan.model_instantiation.get('status')}")
+        else:
+            reason_kind, detail = self._plan_revision_reason(plan)
+            new_plan = revise_plan(
+                previous=plan, brief=self.session.current_brief,
+                material_text=self.material_text, reason_kind=reason_kind, detail=detail,
+                resources=self._plan_resources(),
+                gateway=self.gateway, use_model=use_model, notify=self.notify)
+            event_kind = "evaluation_plan.revised"
+            summary = (f"评估计划改版 v{plan.version}→v{new_plan.version}（{reason_kind}）："
+                       f"{detail[:140]}；阻塞 {len(new_plan.blocking_entries())} 条")
+        plan_dir = self.run_dir / "evaluation-plan"
+        path = plan_dir / f"plan-v{new_plan.version}.json"
+        try:
+            plan_dir.mkdir(parents=True, exist_ok=True)
+            payload = new_plan.to_json_bytes()
+            path.write_bytes(payload)
+        except OSError as exc:
+            raise PlanPersistenceError(f"评估计划落盘失败，本次委托不发起：{exc}") from exc
+        new_plan.sha256 = hashlib.sha256(payload).hexdigest()
+        self.trace.emit("mentis", event_kind, summary, brief_version=current_v,
+                        refs=[{"path": str(path), "sha256": new_plan.sha256, "role": "plan"}])
+        self.notify(f"评估计划 v{new_plan.version} 已生成（先于委托落盘；"
+                    f"{len(new_plan.entries)} 个维度，每条来源见 evaluation-plan/）")
+        self.evaluation_plan = new_plan
+        return new_plan
+
+    def _plan_binding(self) -> dict:
+        plan = self.evaluation_plan
+        return {"version": plan.version if plan else None, "sha256": plan.sha256 if plan else ""}
+
     # ---- 委托与反问分流 ----
 
     def _dispatch_codex(self, action_key: str, prompt: str, resume: bool = False,
                         revision_id: str | None = None):
+        # V1：任何委托前先确保评估计划已落盘（失败→零调用）；验收项写入确切指令
+        plan = self._ensure_evaluation_plan()
+        prompt = prompt.rstrip() + "\n\n" + acceptance_block(plan)
         attempt = self.session.dispatch(action_key, "exec-workspace", revision_id=revision_id)
         brief_version = self.session.current_brief.version
         # 契约 §1：确切委托文本在实际调用前落盘；失败则不发起该次委托
@@ -320,10 +433,13 @@ class Collaboration:
                 workspace=str(self.workspace), status=AttemptStatus.FAILED,
                 error="追踪 prompt 落盘失败，未发起委托")
             return attempt, blocked
+        plan_ref = {"path": str(self.run_dir / "evaluation-plan" / f"plan-v{plan.version}.json"),
+                    "sha256": plan.sha256, "role": "plan"}
         self.trace.emit("mentis", "delegation.prepared",
-                        f"已归档确切指令并委托 {action_key}（文本见 refs；与实际发送同一对象）",
+                        f"已归档确切指令并委托 {action_key}（文本见 refs；与实际发送同一对象；"
+                        f"验收项来自评估计划 v{plan.version}）",
                         attempt_id=attempt.attempt_id, brief_version=brief_version,
-                        refs=[prompt_ref])
+                        refs=[prompt_ref, plan_ref])
         self.trace.record_delegation(attempt.attempt_id, brief_version, prompt_ref, action=action_key)
 
         def on_executor_event(event: dict, meta: dict):
@@ -505,40 +621,50 @@ class Collaboration:
         return structure, browser_obs
 
     def _expected_values(self) -> dict:
-        """从 brief 全版本取预期值（后版本覆盖先版本），避免用户改价后检查仍盯旧值。"""
-        expected = {"活动名称": "手冲", "日期时间": "2026-11-14", "地点": "梧桐街",
-                    "价格": "¥99", "报名方式": "报名"}
-        import re
+        """V1：预期值读评估计划的任务实例条目（来源可追溯）；无计划时从素材机械推导。
 
-        for b in self.session.briefs:
-            for item in b.constraints + b.preferences:
-                hits = re.findall(r"¥\s*(\d+)", item.text)
-                if hits:
-                    expected["价格"] = f"¥{hits[-1]}"  # “从 ¥99 改为 ¥129”取改后值
-        return expected
+        价格等被 brief 后版本修正的值在计划改版时随 derive_task_facts 更新
+        （“从 ¥99 改为 ¥129”取改后值）。
+        """
+        if self.evaluation_plan is not None:
+            needles = self.evaluation_plan.fact_needles()
+            if needles:
+                return needles
+        return derive_task_facts(self.material_text, self.session.briefs)["needles"]
 
     def hard_requirement_review(self, structure):
+        """V1：结构硬要求检查读评估计划中的确定性条目（不再读硬编码试点值）。
+
+        渲染测量类条目（溢出）在此如实标注“由专业评审段核对”，结构层不判。
+        """
         findings, blocking = [], []
         if structure is None:
             return ["index.html 不存在"], ["产物缺失"]
+        if self.evaluation_plan is None:
+            return ["评估计划缺失（委托前必须先落盘——不应出现的状态）"], ["评估计划缺失"]
+        plan = self.evaluation_plan
         text_blob = "\n".join(i.text for i in structure.items)
-        expected = self._expected_values()
-        for label, needle in expected.items():
-            if needle in text_blob:
-                findings.append(f"{label}：可见")
-            else:
-                findings.append(f"{label}：未在结构/正文文本中发现")
-                blocking.append(label)
-        inputs = [i for i in structure.items if i.kind in ("input", "textarea")]
-        if inputs:
-            findings.append(f"表单字段 {len(inputs)} 个")
-        else:
-            findings.append("未发现报名表单字段")
-            blocking.append("报名表单")
-        bad_alt = [i.item_id for i in structure.items
-                   if i.kind == "img" and i.extra.get("alt_present") == "no"]
-        if bad_alt:
-            findings.append(f"图片缺少 alt：{bad_alt}")
+        try:
+            html_text = (self.workspace / "index.html").read_text(encoding="utf-8",
+                                                                  errors="replace")
+        except OSError:
+            html_text = ""
+        executed = False
+        for entry in plan.entries:
+            spec = entry.check_spec or {}
+            if not spec:
+                continue
+            if spec.get("kind") == SPEC_RENDER_OVERFLOW:
+                findings.append(f"{entry.name}：由渲染测量在专业评审段核对（{entry.entry_id}）；"
+                                "结构层不判")
+                continue
+            entry_findings, entry_blocking, _ = execute_structural_check(
+                entry, text_blob, structure.items, html_text)
+            findings.extend(entry_findings)
+            blocking.extend(entry_blocking)
+            executed = True
+        if not executed:
+            findings.append("计划中没有结构阶段可执行的确定性条目（如实呈现，不冒充通过）")
         findings.append("结构层硬要求检查通过（视觉/交互未验证，见截图与 limitations）" if not blocking
                         else "存在阻塞项：未通过")
         return findings, blocking
@@ -556,7 +682,9 @@ class Collaboration:
             disposition=Disposition.REVISE if blocking else Disposition.ACCEPT)
         self.trace.emit("mentis", "review.recorded",
                         "结构硬要求检查：" + ("；".join(findings)[:300] if blocking else "通过")
-                        + f"（视觉/交互未验证；结论 {'不通过' if blocking else '通过'}）",
+                        + f"（视觉/交互未验证；结论 {'不通过' if blocking else '通过'}）"
+                        + (f"；依据评估计划 v{self.evaluation_plan.version}"
+                           if self.evaluation_plan else ""),
                         attempt_id=attempt.attempt_id,
                         brief_version=self.session.current_brief.version,
                         status="failed" if blocking else "ok")
@@ -566,6 +694,7 @@ class Collaboration:
             self.notify(f"自主修复第 {self.repairs_used} 轮（预算 {self.max_repairs}）")
             fix_prompt = build_delegation_prompt(
                 self._brief_text(), self._direction_text(),
+                facts=self._expected_values(),
                 revision_note="上轮结构检查未通过：" + "；".join(blocking)
                 + "。修正后确保 index.html 完整。")
             repair_attempt, result = self._dispatch_codex(
@@ -726,6 +855,7 @@ class Collaboration:
         result: dict = {"accept_attempt": None, "block_delivery": False, "status": None,
                         "delivery_note": "", "structure": None, "browser_obs": None}
         brief_version = self.session.current_brief.version
+        plan_version = self._plan_binding()["version"]
         if not (self.use_model and self.gateway.has_credentials()):
             self.last_professional_review = {"performed": False, "reason": "模型不可用"}
             self.notify("专业评审未执行（模型不可用）：初稿仅通过结构硬要求检查，"
@@ -816,6 +946,7 @@ class Collaboration:
         pending_check = [c for c in adjudication if c["decision"] == "pending"]
         review_doc = {
             "reviewed_artifact_sha256": pack.sha256,
+            "evaluation_plan": self._plan_binding(),
             "observation": {"images": pack.image_names,
                             "measurement_errors": [e for v in pack.measurement.viewports
                                                    for e in v.errors]},
@@ -831,7 +962,7 @@ class Collaboration:
                         f"专业评审候选审查：候选 {len(adjudication)} 条 → 采纳 {len(adopted)}、"
                         f"驳回 {len(rejected)}、保持现状 {len(keep)}、"
                         f"待用户/待查 {len(needs_decision) + len(pending_check)}"
-                        f"（审查针对产物 {pack.sha256[:12]}；依据见 refs）",
+                        f"（审查针对产物 {pack.sha256[:12]}；依据评估计划 v{plan_version}；依据见 refs）",
                         attempt_id=attempt.attempt_id, brief_version=brief_version,
                         status="ok" if adjudication or not bundle.valid_diagnoses else "unknown",
                         refs=[{"path": str(adjudication_path),
@@ -917,6 +1048,7 @@ class Collaboration:
         review_passed = not regression and not unresolved and not new_issues and not unknown
         verify_doc = {
             "reviewed_html_sha256": pack2.sha256,
+            "evaluation_plan": self._plan_binding(),
             "deterministic_findings": findings2,
             "preserved_regression": regression,
             "measurement_unknown": unknown,
@@ -954,7 +1086,7 @@ class Collaboration:
                         f"修订复检：保留项回归 {regression or '无'}；测量未知 {unknown or '无'}；"
                         f"模型复查已解决 {resolved or '无'}/未解决 {unresolved or '无'}/"
                         f"新问题 {new_issues or '无'}；判定 {verdict}"
-                        f"（复查绑定产物 {pack2.sha256[:12]}）",
+                        f"（复查绑定产物 {pack2.sha256[:12]}；依据评估计划 v{plan_version}）",
                         attempt_id=rev_attempt.attempt_id, brief_version=brief_version,
                         status="ok" if review_passed else "failed",
                         refs=[{"path": str(verify_path),
@@ -986,7 +1118,8 @@ class Collaboration:
     def _build_phase(self) -> str:
         attempt, result = self._dispatch_codex(
             "build-page",
-            build_delegation_prompt(self._brief_text(), self._direction_text()))
+            build_delegation_prompt(self._brief_text(), self._direction_text(),
+                                    facts=self._expected_values()))
         if result.status is AttemptStatus.UNKNOWN:
             self.status = "UNKNOWN"
             self.notify("执行器状态未知（超时）：锁已保留，需人工核对后处理；不自动重发")
@@ -1181,7 +1314,8 @@ class Collaboration:
             self._snapshot_current_artifact()
             attempt, result = self._dispatch_codex(
                 "rebuild-new-goal",
-                build_delegation_prompt(self._brief_text(), self._direction_text()))
+                build_delegation_prompt(self._brief_text(), self._direction_text(),
+                                        facts=self._expected_values()))
             if result.status is AttemptStatus.COMPLETED:
                 needs_user, attempt = self.route_executor_questions(attempt)
                 if needs_user:
@@ -1267,6 +1401,7 @@ class Collaboration:
                 f"revision-b{self.session.current_brief.version}",
                 build_delegation_prompt(
                     self._brief_text(), self._direction_text(),
+                    facts=self._expected_values(),
                     revision_note=f"用户明确修正：{feedback}。保留未被告知改变的部分。"),
                 resume=True, revision_id=revision.revision_id,
             )
@@ -1332,6 +1467,8 @@ class Collaboration:
             "timeout_s": self.timeout_s, "max_repairs": self.max_repairs,
             "applied_answers": self.applied_answers,
             "delivered": delivered,
+            "evaluation_plan": self._plan_binding(),
+            "material_text": self.material_text,
             "codex_runs": [r.__dict__ for r in self.codex_runs],
             "question_routes": self.question_routes,
             "model_usage": self.gateway.usage_summary() if self.gateway else {},
@@ -1408,6 +1545,23 @@ class Collaboration:
                 lines.append(f"- 修订前快照：`{snap.resolve()}`（旧版产物本体，可与当前版本对照）")
         lines.append("")
         lines.append("## 看依据")
+        if self.evaluation_plan is not None:
+            plan = self.evaluation_plan
+            lines.append(f"- 评估计划：v{plan.version}（sha256 前 12 位 {(plan.sha256 or '—')[:12]}，"
+                         f"全文 `evaluation-plan/plan-v{plan.version}.json`）——"
+                         "判定标准在首次委托前落盘；改版历史在同目录 plan-v*.json")
+            for e in plan.entries:
+                blocking_label = "阻塞" if e.blocking else "不阻塞"
+                tags = ("、agent_selected" + ("、provisional" if e.provisional else "")
+                        if e.agent_selected else "")
+                lines.append(f"  - {e.entry_id} {e.name}（{e.category}｜{e.check_method}｜"
+                             f"{blocking_label}）来源：{'；'.join(e.source_refs)[:120]}{tags}")
+            mi = plan.model_instantiation
+            if mi.get("rejected"):
+                lines.append(f"  - 模型实例化拒收 {len(mi['rejected'])} 条（虚构来源等，"
+                             "留痕见计划文件 model_instantiation.rejected）")
+        else:
+            lines.append("- 评估计划：未生成（本轮未发生委托）")
         if getattr(self, "_conversation_ready", False):
             lines.append(f"- Mentis 与 Codex 的可见交流：`{(self.run_dir / 'conversation.md').resolve()}`"
                          "（确切委托、公开回复与动作摘要；本地私有，不含内部推理）")

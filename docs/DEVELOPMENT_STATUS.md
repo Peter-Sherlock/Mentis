@@ -4,17 +4,17 @@
 
 | 字段 | 当前值 |
 | --- | --- |
-| 最近更新 | 2026-10-02（规划修订 V0：评估计划先行与可验证性分级，ADR-008；开发计划 v0.3.2；纯文档） |
-| 当前里程碑 | P3.2 已完成；P5.2a partial；P2.4 in_progress——T0—T3 completed；T4 partial（辅助回答已整理，本人体验未取证）；E1 partial（隔离基础设施已按审查补修并核验；公平运行器未建），E2未开始 |
-| 当前优先级 | **评估先行（负责人 2026-10-02 指示调整开发计划，[ADR-008](decisions/ADR-008.md)）**：首次委托前形成评估计划（四层来源，每维度写明检查方式），候选按可验证性路由，模型复检改盲比，improved 判定分级。此前确认的“交付前专业自审”链路保留，并按计划执行 |
-| 当前工作 | **P2.4-E1 隔离补修完成**（[E1记录](progress/P2.4-E1.md)）：ACL 窗口改为可恢复事务（原 DACL 存档+deny 排练+逐项核验恢复，24/24 精确）；stdin 共享截止时间+发送状态四分类（未完整送达必 unknown 保锁）+进程树杀；确定性双端探针替代模型标记（四类结果区分，仅 denied 计通过，覆盖 git 历史副本与旧导出）；证据/准入 v2 强绑定（原始记录重验，--no-codex 只产调试）。真实核验：双端 76/76 denied、准入 11 项过、释放后失效 |
-| 当前状态 | **T4 partial / E1 partial（隔离基础设施就绪）**：证据 schema v2 在 `runtime/evaluation/e1-isolation-probe/isolation/`；deny 不防对抗性绕过（属主可自行改 ACL）与金丝雀非保证的措辞已更正；8 个锁死临时目录另列恢复方案。T4 体验仍留空；E2 未开始 |
-| 下一执行工作包 | **P2.4-V1 评估计划先行**（开发指令见 [V0 记录](progress/P2.4-V0.md) 末节）→ V2 可验证性路由与盲比复检 → E1 收尾（公平运行器 M 与 B-1）→ E2。V1/V2 排在运行器前的理由见开发计划 P2.4 |
-| 当前请求范围 | 负责人指示调整开发计划并给出下一步 prompt；本轮仅修改文档，已完成。V1 待下一轮执行 |
+| 最近更新 | 2026-10-02（**V1 评估计划先行完成**：四层来源版本化计划先落盘后委托、硬要求读计划、模型实例化真实核验；见 [V1 记录](progress/P2.4-V1.md)） |
+| 当前里程碑 | P3.2 已完成；P5.2a partial；P2.4 in_progress——T0—T3 completed；**V1 completed**；T4 partial（辅助回答已整理，本人体验未取证）；E1 partial（隔离基础设施已按审查补修并核验；公平运行器未建），E2未开始 |
+| 当前优先级 | **评估先行（ADR-008）**：V1 已实现——计划先于委托落盘入 trace、硬要求检查读计划、模型实例化领域规则（provisional 不阻塞）。下一步 V2：候选按可验证性路由、盲比复检、判定分级 |
+| 当前工作 | **P2.4-V1 完成**（[V1记录](progress/P2.4-V1.md)）：`mentis/evaluation_plan.py`（内核/用户/领域/任务实例四层组装，维度含含义/来源/观察/检查方式四分/通过线/阻塞/处置；模型实例化虚构来源拒收留痕、无凭据降级）；collab 首次委托前落盘 `evaluation-plan/plan-vN.json`、哈希入 trace（新 kind×2 + role=plan，契约 §16）、落盘失败零调用、验收项入指令、brief 改版有原因改版且旧文件不改写；硬要求检查读计划（咖啡试点回归不变+异事实夹具可判定）。真实 DeepSeek 计划生成 2 次（合计 3,976 tokens，无 Codex）逐条核对来源通过 |
+| 当前状态 | **T4 partial / E1 partial（隔离基础设施就绪）/ V1 completed**：证据 schema v2 在 `runtime/evaluation/e1-isolation-probe/isolation/`；deny 不防对抗性绕过（属主可自行改 ACL）与金丝雀非保证的措辞已更正；8 个锁死临时目录另列恢复方案。guide-revise 未接入评估计划（V2 待补）。T4 体验仍留空；E2 未开始 |
+| 下一执行工作包 | **P2.4-V2 可验证性路由与盲比复检**（ADR-008 第 6—8 条；含 guide-revise 接入与历史运行 `20261001_020003-73ca` 新规则重判对照）→ E1 收尾（公平运行器 M 与 B-1）→ E2 |
+| 当前请求范围 | 负责人指令执行 P2.4-V1「评估计划先行」只做这一步；已完成并提交。V2 待下一轮授权 |
 | 默认交互决定 | 自主委托、重要节点介入；共同设计可选（ADR-002 selected）；阶段性"已交付"表示初稿可看，不表示最终任务完成或用户满意；**交付前专业自审为当前优先级** |
 | 首产品试点 | 小型网页界面与交互，ADR-006 **proposed**；不与默认交互决定混淆 |
 | 原任务族 | 文档问答保留为工程回归草案 |
-| Git / 业务代码 | 本地无远程；`00444fd` 之上新增隔离补修提交 |
+| Git / 业务代码 | 本地无远程；`b3380d6` 之上新增 V0 文档合并（`544e9ac`，自 worktree 分支快进）与 V1 实现提交 |
 | 主模型 | DeepSeek V4.1 Flash（ADR-007）；已实测接受图像输入 |
 | 真实模型 / 执行器 | Codex 0.158.0（prompt 经 stdin；共享截止时间+树杀+发送状态门控）；指导修订闭环已接通；中断恢复依赖账号配额 |
 
@@ -50,14 +50,14 @@
 | P2.3 | **completed** | 协作循环 + 三次真实端到端（自主交付 / 待决不越权+撤回 / 反馈→v2 真实修订→产物核验）；70 项检查通过；同步 600 秒窗口为架构性限制（超时走 unknown→核对路径）。其记录中"Run A v1 移动端截断"已被 P3.2 更正为截图采集假象 |
 | P3.2 | **completed（含 2026-09-29 验收修复）** | 真实指导链**单案例**改善成立（价格/人数进移动首屏，模型带图复查+截图+diff 三证）；渲染测量（真实 390/1280 溢出/裁剪/表单声明）与图像诊断接入；**更正：P2.3/P3.1"移动端截断"是无头 Chrome 500px 最小窗宽造成的截图裁剪假象**（真实 390 布局无溢出，采集已修复）；验收修复：测量不可信→未知不判通过、保留项逐段与表单逐字段核对、复查结论绑定当前产物版本（均配先复现后通过的测试），保存产物复核维持 improved；待决路径仅证明暂停未委托（请求必要性未证明）；一次执行器中断如实 FAILED 后核对续办；一次复检误判透明更正；改善为单案例，效果结论属 P2.4 |
 | P5.2a | **partial（2026-09-29 T0 核对后维持）** | 入口与记录机制就绪（99 项检查）；T0 核对范围=runtime/field 全部 10 目录、45 个 20260929 collab 目录、四个真实运行 user_feedback、Codex 本机会话日志——均为冒烟残留或非 Mentis 活动，无真实使用材料；用户报告与本工作区证据不符，不排除材料在本工作区之外；不补造 |
-| P2.4 | **in_progress（T0—T3 completed；T4 partial；E1 partial——隔离基础设施就绪）** | T0—T3追踪与旁观完成；T4真实往返与[辅助五问](progress/P2.4-T4-assisted-answers.md)已核对，本人体验留空；[E1](progress/P2.4-E1.md)材料冻结、**读隔离按审查补修后双端实测**（事务化 deny 窗口、确定性探针 76/76 拒读含 git 历史、准入 v2 强绑定、24/24 事务恢复，195 项离线检查通过）；E2 运行器未开始。历史improved不作专业价值结论 |
+| P2.4 | **in_progress（T0—T3 completed；V1 completed；T4 partial；E1 partial——隔离基础设施就绪）** | T0—T3追踪与旁观完成；**[V1 评估计划先行](progress/P2.4-V1.md)完成**（版本化计划先落盘后委托、硬要求读计划、模型实例化真实核验，214 项离线检查通过）；T4真实往返与[辅助五问](progress/P2.4-T4-assisted-answers.md)已核对，本人体验留空；[E1](progress/P2.4-E1.md)材料冻结、**读隔离按审查补修后双端实测**（事务化 deny 窗口、确定性探针 76/76 拒读含 git 历史、准入 v2 强绑定、24/24 事务恢复）；E2 运行器未开始。历史improved不作专业价值结论 |
 | P1.3 / P1.4 / P3.3—P3.4 / P4 / P5 | not_started | 无持久化存储或第二执行器证据 |
 
 文档设计完成、用户授权实施、人工专业复核、实际运行及效果成立分别记录。前轮“待用户再次批准”的状态不成为每次文档修改的固定门槛；本轮不把用户授权调整规划当成案例人工专业复核。
 
 ## 3. 下一步与体验主线
 
-当前体验入口（P5.2a）：**`py -3.14 -m mentis field-start --label <标签> --goal "<你的原话目标>"`** —— 自然语言目标 → 自主委托 → 三入口 → 当场逐字反馈（[使用指南](field-session-guide.md)）。负责人本轮授权由Agent整理[五问辅助回答](progress/P2.4-T4-assisted-answers.md)，并继续E1；这不是独立理解测试，页面满意度/过程体验仍未补造。当前可亲自执行 `py -3.14 -m mentis eval-check`（冻结核对，读隔离按证据判定）；隔离核验命令与预期输出见[E1记录](progress/P2.4-E1.md)与[E1 README](evaluation/e1/README.md)。
+当前体验入口（P5.2a）：**`py -3.14 -m mentis field-start --label <标签> --goal "<你的原话目标>"`** —— 自然语言目标 → 自主委托 → 三入口 → 当场逐字反馈（[使用指南](field-session-guide.md)）。负责人本轮授权由Agent整理[五问辅助回答](progress/P2.4-T4-assisted-answers.md)，并继续E1；这不是独立理解测试，页面满意度/过程体验仍未补造。当前可亲自执行 `py -3.14 -m mentis eval-check`（冻结核对，读隔离按证据判定）、`py -3.14 -m mentis eval-plan --goal "为拾光咖啡工作坊制作活动介绍页" --pilot`（V1：组装并查看某目标的评估计划，每条来源可追溯；加 `--real` 调模型并产生真实费用）；隔离核验命令与预期输出见[E1记录](progress/P2.4-E1.md)与[E1 README](evaluation/e1/README.md)。
 
 体验主线当前位置：**给出目标 → 自主产出首稿 → 自行检查修订 → 查看结果与依据** 已由系统真实走通（P2.3/P3.2 各有真实运行）；P5.2a 检查的是**项目负责人本人**能否走通这条路并低负担表达反馈——入口已交到负责人手里，等待真实操作记录。
 
@@ -129,3 +129,5 @@ P2.4-T4 交流可见性补修（2026-09-29）：负责人指出“可是我根�
 P2.4-T4 交付前专业评审补修轮（2026-10-01；用户指令"完成'交付前专业评审与指导修订'的补修"）：①**实现**——collab `_finalize` 在结构硬要求通过后进入 `_professional_review`：`_observe_full`（结构+渲染测量 measure_page+双视口截图，引用绑定页面快照副本）→ 真实模型诊断（领域规则草案+截图图像输入；无截图时提示词禁止声称看过画面）→ `_adjudicate_candidates` 逐条采纳/驳回/保持现状/待用户（理由留档 professional-review.json，绑定被审产物哈希，注记同源模型独立性未建立）→ 采纳项经 `compose_revision_instruction`（位置/证据/目的/方向/保留项/复检办法）先落盘后委托（同 thread）→ `_observe_full` 重观察 + `deterministic_checks`（保留项/表单/溢出/网络声明）+ `run_model_review`（绑定当前产物哈希，不采信 Codex 自查）→ improved 交付 / 遗留如实交付 / regression 不交付（快照保留）/ unverified 不判通过 / unknown 停止待核对 / 预算耗尽留档不执行。guidance 的 `deterministic_checks`/`run_model_review` 提取为模块级函数（原方法薄包装），无平行流程；不改权限规则。②**离线回归** 9 项（tests/test_collab_review.py）覆盖用户要求的全部情形，全量 **151 项通过**；runtime/collab 5 目录、field 0（零泄漏）。③**真实核验**（独立新会话 `20261001_020003-73ca`；T4 历史运行 36 条事件与作品复核原样）：构建 unknown（turn.completed+失败子项，新错误消息如实）→人工核对 confirm-outcome→结构阻塞（日期格式）→repair-1 真实修复→**真实评审**（deepseek-flash+图像；候选 2：采纳 1/保持现状 1；决策请求 2 分流为保守自主决定）→review-fix-2 真实修订（diff 1 行：暖色加深）→复检（回归无/测量可信双视口 0px/复查 resolved=[d1] 绑定 b17b1f06）→**DELIVERED improved**。用量：Codex 386,258/556,766/985,936 input（缓存 351,872/516,736/932,992）、15,327/18,765/22,364 output；DeepSeek 2 次 6,151+1,344 tokens。④**真实运行暴露并处置**：keep 提示词漏判"保留当前"措辞（已修+防回归测试；该次近维持现状修订的记录保留不回改）；观察引用绑定演化产物令回放误报（已修为快照副本；该运行 `当前核验：未通过` 为已知显示问题的如实呈现，integrity 完整）；决策请求分流精度列为观察项（本轮自主决定保守、未越权）。⑤**T4 维持 partial**：五问独立回答与体验原话仍只能由负责人提供；不启动 E1。本轮真实调用：Codex×3、DeepSeek×2；离线测试全为 Mock/Fake（tests/test_collab_review.py 等另册标注）。
 
 P2.4-V0 规划修订轮（2026-10-02；纯文档，零模型/执行器调用，无新增可运行功能）：负责人读了两篇 Anthropic 文章（multi-agent coordination patterns、harness design for long-running apps），讨论了“评估与生成一样难”和“专家切换时的评判基准”，随后指示调整开发计划。①新增 [ADR-008](decisions/ADR-008.md)，状态 selected（方向）：首次委托前评估计划落盘；四层来源（内核/用户/领域资源/任务实例），推导条目标 provisional、不阻塞交付；每个维度写明检查方式（deterministic/pairwise_blind/user_judgment/unverifiable）；只有前两类候选可以自主修订；盲比复检正反两序，不一致记 unknown；判定分级。②开发计划 v0.3.2：P2.4 内部顺序改为 T0—T4 → E1 准备 → **V1 → V2** → E1 收尾 → E2，22 包与依赖不变；P2.4 退出条件、P5.1 消融、迁移说明和交接句同步更新。③PROJECT_PLAN 新增 §16.7，§23 与附录 D 各补一处；DOMAIN_STRATEGY §7 第 5 步补充。④依据的代码事实：`_expected_values` 硬编码试点值，`_adjudicate_candidates` 默认 adopt，`run_model_review` 非盲且与诊断同源，`20261001_020003-73ca` 中“暖色加深”被同源复查判为 improved。详见 [V0 记录](progress/P2.4-V0.md)，其末节是 V1 开发指令。本轮没有改变 T4 partial、E1 partial、E2 not_started；V1/V2 not_started。
+
+P2.4-V1 轮检查（2026-10-02）：按 [V0 记录](progress/P2.4-V0.md) 末节开发指令实现评估计划先行（[ADR-008](decisions/ADR-008.md) 第 1—5、9 条；第 6—8 条属 V2 未动）。①**组装**——`mentis/evaluation_plan.py`：内核（约束保留/无回归/未验证不宣称，忠实于意图由任务实例落实）/用户（brief 条目沿用 Provenance/source_ref）/领域（web_pilot 硬约束逐条+建议与假设聚合，带 id@版本）/任务实例（标注化素材机械提取活动事实与表单要求，价格随 brief 修正更新）四层来源，每维度写含义/类别/观察/检查方式四分/通过线/阻塞/处置，阻塞=硬要求∧确定性∧非 provisional；已被任务实例落实的领域规则不重复成条（试点 9—13 条）。②**时序**——collab 首次委托前计划落盘 `evaluation-plan/plan-vN.json`，哈希入 trace（新增 `evaluation_plan.recorded`/`.revised` 事件与 role=plan，契约 §16），委托事件 refs 同时含 prompt 与 plan，指令尾部携带计划派生验收项；落盘失败抛 PlanPersistenceError 零调用（有测试）；brief 改版仅在有原因时改版出新文件（旧文件字节不变、新旧评审各自绑定，有测试）。③**硬要求读计划**——`hard_requirement_review`/`_expected_values` 删除"手冲/2026-11-14/梧桐街/¥99"硬编码，改读计划任务实例条目；委托 prompt 事实清单同步计划派生（消除改价后指令仍含旧价的漂移）；咖啡试点判定回归不变，异事实夹具（书店 ¥45/2027-01-09）三向判定正确（均有测试）。④**模型实例化**——现有网关把领域规则实例化为本任务条目；source_refs 逐项校验（仅已加载规则 id 或原话摘录），虚构来源拒收留痕，模型自称 deterministic 降级 unverifiable，条目一律 provisional 不阻塞；无凭据/调用失败降级纯确定性组装并标注。⑤**用户可见**——计划生成即 notify_progress（不阻塞、无新审批）；report"看依据"逐条列维度来源；CLI `eval-plan`（默认离线，--pilot 用合成素材，--real 调模型）。⑥**真实核验**——DeepSeek `deepseek-flash` 生成试点计划 **2 次**（第 1 次 1,943 tokens 成功后发现模型把 disposition 误填为标签，加处置回退修复后为使证据与代码一致重新生成第 2 次 2,033 tokens；非失败重试，原因如实记录）：两次均未调用 Codex；4 条模型条目来源逐条核对全部真实（IH-1/2/3/4/6、BI-2、VE-2/3、素材原话），检查方式成立、无实现层面过度规定；拒收路径本轮仅离线 Mock 证据。⑦**离线回归** 214 项全过（新增 19 项；模型响应全为 Mock 标注；两处既有测试适配已记录）；runtime 零泄漏（collab 5 历史/真实目录、field 0）。guide-revise 未接入评估计划（V2 待补）；E1 冻结字节、T4 历史运行、权限/预算规则未动。本轮真实调用：DeepSeek×2（计划生成）、Codex×0。

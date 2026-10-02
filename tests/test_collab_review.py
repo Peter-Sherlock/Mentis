@@ -234,7 +234,10 @@ class ProfessionalReviewTests(unittest.TestCase):
         adapter = ReviewAdapter()
         collab = self.make(gateway, adapter, browser_capture=failing_capture)
         self.assertEqual(collab.run(), "DELIVERED")
-        self.assertIn("本次诊断未收到任何截图", gateway.calls[0]["prompt"])
+        # V1 起 calls[0] 是评估计划实例化调用；诊断调用按其独有的无截图声明定位
+        diagnosis_calls = [c for c in gateway.calls
+                           if "本次诊断未收到任何截图" in c["prompt"]]
+        self.assertTrue(diagnosis_calls, "诊断调用应在 prompt 中声明未收到截图")
         self.assertTrue(collab.last_professional_review["unverified_visual"])
         report = (collab.run_dir / "report.md").read_text(encoding="utf-8")
         self.assertIn("无截图输入，视觉维度未验证", report)

@@ -120,7 +120,22 @@ def page_png(width: int, height: int) -> bytes:
 
 
 class FakeGateway:
-    """假模型：按队列返回固定响应；记录收到的输入与图像。"""
+    """假模型：按队列返回固定响应；记录收到的输入与图像。
+
+    V1 起 collab 首次委托前会多一次"评估计划实例化"模型调用；该调用按 system
+    提示词识别并返回固定 Mock 响应（不消耗脚本队列），其余调用仍按队列弹出。
+    """
+
+    PLAN_INSTANTIATION_RESPONSE = json.dumps({"entries": [
+        {"name": "价格与报名入口在移动端首屏可见（Mock 实例化）",
+         "meaning": "首屏回答这是什么/怎么参加（Mock 固定响应，非真实模型）",
+         "category": "professional_advice",
+         "source_refs": ["IH-4", "web-visual-expression@0.1-draft VE-2"],
+         "observation": "双视口截图与结构观察",
+         "check_method": "pairwise_blind",
+         "pass_line": "移动端首屏可见价格与报名入口；修订轮前后盲比一致",
+         "disposition": "暂定条目：不阻塞交付，不单独触发修订"},
+    ]}, ensure_ascii=False)
 
     def __init__(self, responses: list):
         self.responses = list(responses)
@@ -135,7 +150,11 @@ class FakeGateway:
 
     def complete(self, system, user_prompt, json_mode=True, mock=False, images=None):
         self.calls.append({"prompt": user_prompt, "images": [n for n, _ in (images or [])]})
-        text = self.responses.pop(0) if self.responses else "{}"
+        if "评估计划实例化助手" in system:
+            # Mock 固定响应：来源引用仅用已加载规则 id；标注于计划 model_instantiation.mock
+            text = self.PLAN_INSTANTIATION_RESPONSE
+        else:
+            text = self.responses.pop(0) if self.responses else "{}"
         import hashlib
 
         # 与真实网关同格式：名称;sha256 前 12 位（绑定检查依赖该格式）
