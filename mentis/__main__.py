@@ -36,6 +36,7 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis eval-prepare    E1 按白名单制作各组相同输入包（离线；拒绝覆盖）
   python -m mentis eval-isolate    E1 答案读隔离：probe 开窗双端探测 / release 解除 / check 准入
   python -m mentis eval-plan       P2.4-V1 评估计划先行：组装并打印某目标的评估计划（--real 调模型）
+  python -m mentis eval-run        E1 公平运行器：隔离窗口内运行单个臂（M 或基线组；需先 eval-isolate probe）
 路线与状态见 docs/DEVELOPMENT_STATUS.md。
 """
 
@@ -138,7 +139,31 @@ def main(argv=None) -> int:
                        help="调用 DeepSeek 实例化领域规则（需凭据；发送目标/brief 条目/素材摘录/已加载规则；"
                             "虚构来源条目会被拒收并留痕）")
     eplan.add_argument("--out", default="", help="同时把计划 JSON 写入该路径（默认只打印）")
+    erun = sub.add_parser("eval-run",
+                          help="E1 公平运行器：在隔离窗口内运行单个臂（M=评估计划+盲比流程；"
+                               "B-1 等基线=方法提示词驱动的执行器循环）")
+    erun.add_argument("--prepared", required=True, help="eval-prepare 输出的目录")
+    erun.add_argument("--arm", required=True, help="目标组（相对 prepared，如 input-002/B-1）")
+    erun.add_argument("--evidence", required=True, help="当前窗口的隔离证据 JSON")
+    erun.add_argument("--suite-sha", required=True, help="冻结 suite sha256（准入绑定）")
+    erun.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="冻结清单路径")
+    erun.add_argument("--out", default="runtime/evaluation/e1-runs", help="运行记录根目录")
     args = parser.parse_args(argv)
+
+    if args.command == "eval-run":
+        from mentis.eval_runner import AdmissionError, FairRun
+        from mentis.eval_isolation import IsolationError
+
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        try:
+            manifest = FairRun(args.prepared, args.arm, args.out, args.suite_sha,
+                               args.evidence, suite_path=args.suite).run()
+        except (AdmissionError, IsolationError) as exc:
+            print(f"运行未启动：{exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0 if manifest["artifact"]["exists"] else 1
 
     if args.command == "eval-plan":
         from mentis.capabilities.registry import load_registry
