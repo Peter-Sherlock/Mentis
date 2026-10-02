@@ -27,11 +27,14 @@ from mentis.capabilities.routing import Gap, route_gap
 from mentis.capabilities.selection import select_for_task
 from mentis.contracts import AttemptStatus, DelegationPolicy, Disposition, Provenance, SourcedItem
 from mentis.diagnosis import DiagnosisBundle, render_bundle_markdown, run_diagnosis
+# V2：可验证性路由与盲比复检（ADR-008 第 6—8 条）
+from mentis.eval_review import (ROUTE_ADOPT, grade_revision, map_candidate_to_dimension,
+                                route_by_verifiability, run_blind_review)
 # V1：评估计划先行（ADR-008 第 1—5、9 条）——先落盘后委托，硬要求读计划
 from mentis.evaluation_plan import (EvaluationPlan, PlanPersistenceError, acceptance_block,
                                     build_evaluation_plan, derive_task_facts,
-                                    execute_structural_check, render_plan_markdown,
-                                    revise_plan, SPEC_RENDER_OVERFLOW)
+                                    execute_structural_check, load_latest_plan,
+                                    render_plan_markdown, revise_plan, SPEC_RENDER_OVERFLOW)
 from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskResult, CodexTaskSpec
 # T4 补修：交付前专业评审复用 guidance 的观察/诊断/指令/复检机制（提取为模块级函数），
 # 不另建平行流程。
@@ -173,6 +176,8 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.status = meta.get("status", "created")
     obj.last_diagnosis = None
     obj.last_professional_review = {}
+    obj.last_dimension_verdicts = []
+    obj._blind_rng = None
     obj._review_form_requirements = []
     obj.measure = measure_page
     obj.run_dir = state_path.parent if isinstance(state_path, Path) else Path(state_path).parent
@@ -218,6 +223,8 @@ class Collaboration:
         self.status = "created"
         self.last_diagnosis = None
         self.last_professional_review: dict = {}
+        self.last_dimension_verdicts: list = []  # V2：逐维度盲比判定（报告"看结果"）
+        self._blind_rng = None  # V2：盲比 A/B 随机源；测试可注入种子（生产默认真随机）
         self._review_form_requirements: list = []
         self.run_dir = self.base_dir / self.run_id
         self._finalized_emitted = False
@@ -337,17 +344,7 @@ class Collaboration:
 
     def _load_latest_plan(self) -> EvaluationPlan | None:
         """从运行目录恢复最新版评估计划；文件哈希重算，不改写任何版本。"""
-        plan_dir = self.run_dir / "evaluation-plan"
-        plans = []
-        if plan_dir.is_dir():
-            for path in sorted(plan_dir.glob("plan-v*.json")):
-                try:
-                    plan = EvaluationPlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
-                    plan.sha256 = _sha256_file(path)
-                    plans.append(plan)
-                except (OSError, ValueError, TypeError, KeyError):
-                    continue  # 损坏的计划文件跳过，不留痕改写
-        return max(plans, key=lambda p: p.version) if plans else None
+        return load_latest_plan(self.run_dir)
 
     def _plan_revision_reason(self, plan: EvaluationPlan) -> tuple:
         if plan.goal != self.session.current_brief.objective:
@@ -796,11 +793,14 @@ class Collaboration:
 
     def _adjudicate_candidates(self, bundle: DiagnosisBundle, pack: ObservationPack,
                                attempt_id: str | None) -> list:
-        """逐一审查诊断候选："字段合法、引用存在"不等于问题成立。
+        """逐一审查诊断候选："字段合法、引用存在"不等于问题成立（V2：可验证性路由）。
 
-        确定性核对 + 规则分流：保持现状类建议不进入修订任务；溢出主张对照可信
-        渲染测量数值；触及保留决定（变更意图+保留名词）转用户；其余可逆专业取舍
-        自主采纳。候选与审查依据同源模型，独立性未建立——复检以独立观察为准。
+        先走既有确定性核对与规则分流（保持现状/溢出对照测量/保留决定），其余候选
+        必须对应到评估计划维度并按其检查方式路由（ADR-008 第 6 条）：
+        deterministic/pairwise_blind → 自主修订；user_judgment → 非阻塞选项告知
+        用户，不自动修改；unverifiable → 不修订；对应不到维度 → 计划盲区，不
+        自动采纳。候选与审查依据同源模型，独立性未建立；映射是词面启发式，
+        命中与得分留档供审计。
         """
         keep_hints = ("保持现状", "保持当前", "保留当前", "无需修改", "维持现状", "保留现状",
                       "保持不变", "不建议修改", "无需改动", "无需调整")
@@ -810,9 +810,11 @@ class Collaboration:
         total_overflow = sum(v.overflow_px for v in trusted)
         total_offenders = sum(len(v.overflowing) for v in trusted)
         brief_version = self.session.current_brief.version
+        plan = self.evaluation_plan
         for idx, d in enumerate(bundle.valid_diagnoses, 1):
             no = f"d{idx}"
             joined = d.phenomenon + "｜" + d.interpretation + "｜" + "；".join(d.modification_candidates)
+            mapped_entry, match = (None, {"matched_by": "not_attempted", "score": 0.0})
             if any(h in joined for h in keep_hints):
                 decision, status = "keep_as_is", "ok"
                 reason = "候选建议为保持现状：不进入修订任务（不为增加交流轮数强行修改）"
@@ -828,11 +830,29 @@ class Collaboration:
                 decision, status = "needs_user", "pending"
                 reason = "触及用户保留决定（变更意图+保留事项）：修订暂停，等待用户决定（沉默≠批准）"
             else:
-                decision, status = "adopt", "ok"
-                reason = ("证据引用可解析且与观察记录不矛盾；可逆的专业取舍由 Mentis 自主处理"
-                          "（ADR-002）；候选与审查同源模型、独立性未建立——复检以独立观察为准")
+                mapped_entry, match = (map_candidate_to_dimension(joined, plan)
+                                       if plan else (None, {"matched_by": "no_plan",
+                                                            "score": 0.0}))
+                decision, basis = route_by_verifiability(mapped_entry)
+                match_note = (f"映射 {match.get('matched_by')}（得分 {match.get('score')}，"
+                              f"共享 {match.get('shared', [])[:4]}）" if match else "无映射")
+                if decision == ROUTE_ADOPT:
+                    status = "ok"
+                    reason = (f"{basis}；{match_note}；证据引用可解析且与观察记录不矛盾；"
+                              "候选与审查同源模型、独立性未建立——复检以盲比与独立观察为准")
+                elif decision == "user_option":
+                    status = "pending"
+                    reason = f"{basis}；{match_note}"
+                elif decision == "skip_unverifiable":
+                    status = "unknown"
+                    reason = f"{basis}；{match_note}"
+                else:
+                    status = "unknown"
+                    reason = (f"{basis}；{match_note}；可按计划修订程序（standard_error/"
+                              "new_blind_spot）提出，不自行动（ADR-008 第 5/6 条）")
             records.append({"no": no, "severity": d.severity, "phenomenon": d.phenomenon,
                             "evidence_refs": list(d.evidence_refs),
+                            "dimension": mapped_entry.entry_id if mapped_entry else "",
                             "decision": decision, "reason": reason})
             self.trace.emit("mentis", "decision.routed",
                             f"候选审查 {no}「{d.phenomenon[:60]}」→ {decision}；理由：{reason[:130]}",
@@ -944,14 +964,25 @@ class Collaboration:
         keep = [c for c in adjudication if c["decision"] == "keep_as_is"]
         needs_decision = [c for c in adjudication if c["decision"] == "needs_user"]
         pending_check = [c for c in adjudication if c["decision"] == "pending"]
+        user_options = [c for c in adjudication if c["decision"] == "user_option"]
+        skip_unverifiable = [c for c in adjudication if c["decision"] == "skip_unverifiable"]
+        blind_spots = [c for c in adjudication if c["decision"] == "plan_blind_spot"]
         review_doc = {
             "reviewed_artifact_sha256": pack.sha256,
             "evaluation_plan": self._plan_binding(),
             "observation": {"images": pack.image_names,
                             "measurement_errors": [e for v in pack.measurement.viewports
                                                    for e in v.errors]},
-            "source_note": (f"候选来自模型诊断（{origin}）；审查=Mentis 确定性核对与规则分流；"
-                            "与诊断同源模型，独立性未建立——修订后复检以独立观察为准"),
+            "source_note": (f"候选来自模型诊断（{origin}）；审查=Mentis 确定性核对、规则分流与"
+                            "按计划检查方式的**可验证性路由**（ADR-008 第 6 条：仅 "
+                            "deterministic/pairwise_blind 维度可自主修订；user_judgment 以"
+                            "非阻塞选项告知；unverifiable 不修订；对应不到维度=计划盲区不采纳）；"
+                            "与诊断同源模型，独立性未建立——修订后复检改为盲比（正反两序）"),
+            "routing": {"adopt": len(adopted), "user_option": len(user_options),
+                        "skip_unverifiable": len(skip_unverifiable),
+                        "plan_blind_spot": len(blind_spots), "keep_as_is": len(keep),
+                        "reject": len(rejected), "needs_user": len(needs_decision),
+                        "pending": len(pending_check)},
             "candidates": adjudication,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -960,7 +991,8 @@ class Collaboration:
             json.dumps(review_doc, ensure_ascii=False, indent=2), encoding="utf-8")
         self.trace.emit("mentis", "review.recorded",
                         f"专业评审候选审查：候选 {len(adjudication)} 条 → 采纳 {len(adopted)}、"
-                        f"驳回 {len(rejected)}、保持现状 {len(keep)}、"
+                        f"用户选项 {len(user_options)}、不修订（不可验证）{len(skip_unverifiable)}、"
+                        f"计划盲区 {len(blind_spots)}、驳回 {len(rejected)}、保持现状 {len(keep)}、"
                         f"待用户/待查 {len(needs_decision) + len(pending_check)}"
                         f"（审查针对产物 {pack.sha256[:12]}；依据评估计划 v{plan_version}；依据见 refs）",
                         attempt_id=attempt.attempt_id, brief_version=brief_version,
@@ -970,9 +1002,17 @@ class Collaboration:
         self.last_professional_review = {
             "performed": True, "origin": origin, "candidates": len(adjudication),
             "adopted": len(adopted), "rejected": len(rejected), "keep": len(keep),
+            "user_options": len(user_options), "skip_unverifiable": len(skip_unverifiable),
+            "blind_spots": len(blind_spots),
             "needs_user": len(needs_decision) + len(pending_check), "verdict": None,
             "unverified_visual": not images,
         }
+        if user_options or blind_spots or skip_unverifiable:
+            # 非阻塞告知（ADR-008 第 9 条）：不等待回复、不自动修改、不新增审批
+            self.notify(f"专业评审：{len(user_options)} 条审美/偏好类候选已作为**选项**留给你"
+                        "（用户判断维度，不自动修改；可随时以反馈覆盖）；"
+                        f"{len(skip_unverifiable)} 条当前无法验证、{len(blind_spots)} 条对应不到"
+                        "计划维度（计划盲区）——均只留档不修订")
         if pending_user or needs_decision:
             self.notify("专业评审：存在等待你的决定——修订暂停（沉默≠批准）；"
                         "初稿按当前版本处理，其余成立问题已留档")
@@ -986,10 +1026,11 @@ class Collaboration:
             return result
         if not adopted:
             # 合格不改：必须留下接受依据，不为增加交流轮数强行修改
-            self.notify(f"专业评审：{len(adjudication)} 条候选审查完毕、采纳 0——合格不改，"
-                        "接受依据已留档（professional-review.json）")
+            self.notify(f"专业评审：{len(adjudication)} 条候选审查完毕、自主修订 0 条"
+                        "——合格不改，接受依据已留档（professional-review.json）")
             result["delivery_note"] = (f"专业评审（{origin}）：候选 {len(adjudication)} 条、"
-                                       "采纳 0——合格不改（接受依据见评审记录）")
+                                       "自主修订 0——合格不改（接受依据见评审记录；"
+                                       f"用户选项 {len(user_options)} 条已留档）")
             return result
         if self.repairs_used >= self.max_repairs:
             self.notify(f"专业评审发现 {len(adopted)} 条成立问题，但修订预算已用尽"
@@ -1032,7 +1073,8 @@ class Collaboration:
             result.update(block_delivery=True, status="FAILED",
                           delivery_note="专业评审修订执行失败")
             return result
-        # 修订完成 → 重新观察并复检（目标问题/保留项/回归/新问题；不采信 Codex 自查）
+        # 修订完成 → 重新观察并**盲比复检**（V2/ADR-008 第 7 条：A/B 随机、只给计划标准、
+        # 正反两序、不一致记 unknown；不再给诊断清单问"问题是否仍存在"）
         pack2, images2, browser_obs2 = self._observe_full(
             "professional-verify", rev_attempt.attempt_id)
         result["structure"], result["browser_obs"] = pack2.structure, browser_obs2
@@ -1040,21 +1082,34 @@ class Collaboration:
             pack2, self._preserved_items(), self._review_form_requirements)
         if self.browser_capture is not None and not images2:
             unknown.append("复查截图缺失：视觉类解决声明无法核对（不作为通过依据）")
-        model_review_path = self.run_dir / "model-review-professional.json"
-        resolved, unresolved, new_issues = run_model_review(
-            self.gateway, self.session.current_brief.objective,
-            self.workspace / "index.html", filtered, defect_ids, pack2, images2,
-            model_review_path, use_model=self.use_model, notify=self.notify)
-        review_passed = not regression and not unresolved and not new_issues and not unknown
+        blind_path = self.run_dir / "blind-review-professional.json"
+        blind = run_blind_review(
+            self.gateway, self.evaluation_plan, pack, images, pack2, images2,
+            blind_path, use_model=self.use_model, notify=self.notify, rng=self._blind_rng,
+            before_html_sha256=pack.sha256, after_html_sha256=pack2.sha256)
+        artifact_changed = pack.sha256 != pack2.sha256
+        verdict, verdict_basis = grade_revision(
+            regression, unknown, artifact_changed, blind,
+            targeted_dimensions=[c.get("dimension", "") for c in adopted])
+        # 验收门与判定分级解耦（V2）：接受=确定性健康（无回归、观察可信）；
+        # 盲比只决定“改善声明”——changed_unverified/no_change/unknown 一律不宣称改善
+        review_passed = not regression and not unknown
         verify_doc = {
             "reviewed_html_sha256": pack2.sha256,
+            "reviewed_before_sha256": pack.sha256,
             "evaluation_plan": self._plan_binding(),
             "deterministic_findings": findings2,
             "preserved_regression": regression,
             "measurement_unknown": unknown,
-            "model_review": {"resolved": resolved, "unresolved": unresolved,
-                             "new_issues": new_issues,
-                             "detail": str(model_review_path)},
+            "artifact_changed": artifact_changed,
+            "blind_review": {"overall": blind["overall"], "consistent": blind["consistent"],
+                             "per_dimension": blind["per_dimension"],
+                             "assignment": {k: {"x_is": v.get("x_is"), "y_is": v.get("y_is")}
+                                            for k, v in blind["orders"].items()},
+                             "usage_total": blind["usage_total"], "mock": blind["mock"],
+                             "note": blind.get("note", ""),
+                             "detail": str(blind_path)},
+            "verdict": verdict, "verdict_basis": verdict_basis,
             "measurement_v2": {v.name: {"overflow_px": v.overflow_px,
                                         "overflowing": len(v.overflowing),
                                         "clipped": len(v.clipped_text),
@@ -1067,30 +1122,33 @@ class Collaboration:
             json.dumps(verify_doc, ensure_ascii=False, indent=2), encoding="utf-8")
         self.session.record_review(
             rev_attempt.attempt_id, findings=findings2 + [
-                f"模型复查：已解决 {resolved or '无'}；未解决 {unresolved or '无'}；"
-                f"新问题 {new_issues or '无'}"] + [f"测量未知：{u}" for u in unknown],
+                f"盲比复检（ADR-008 第 7 条）：两序{'一致' if blind['consistent'] else '不一致'}，"
+                f"总体 {blind['overall']}；逐维度 "
+                + "；".join(f"{k}={v}" for k, v in blind["per_dimension"].items())[:160]
+            ] + [f"测量未知：{u}" for u in unknown],
             passed=review_passed,
             disposition=Disposition.ACCEPT if review_passed else Disposition.REVISE)
-        if regression:
-            verdict = "regression"
-        elif unknown:
-            verdict = "unverified"
-        elif resolved and not unresolved and not new_issues:
-            verdict = "improved"
-        elif not unresolved and not new_issues:
-            verdict = "not_improved"
-        else:
-            verdict = "partially_improved"
         self.last_professional_review["verdict"] = verdict
+        self.last_professional_review["blind"] = {
+            "overall": blind["overall"], "consistent": blind["consistent"],
+            "mock": blind["mock"], "usage_total": blind["usage_total"]}
+        self.last_dimension_verdicts = [
+            {"entry_id": e.entry_id, "name": e.name,
+             "verdict": blind["per_dimension"].get(e.entry_id, "unknown")}
+            for e in self.evaluation_plan.blind_review_standards()]
         self.trace.emit("mentis", "review.recorded",
                         f"修订复检：保留项回归 {regression or '无'}；测量未知 {unknown or '无'}；"
-                        f"模型复查已解决 {resolved or '无'}/未解决 {unresolved or '无'}/"
-                        f"新问题 {new_issues or '无'}；判定 {verdict}"
+                        f"盲比两序{'一致' if blind['consistent'] else '不一致'}"
+                        f"（总体 {blind['overall']}，逐维度 "
+                        + "；".join(f"{k}={v}" for k, v in blind["per_dimension"].items())[:120]
+                        + f"）；判定 {verdict}——{verdict_basis[:80]}"
                         f"（复查绑定产物 {pack2.sha256[:12]}；依据评估计划 v{plan_version}）",
                         attempt_id=rev_attempt.attempt_id, brief_version=brief_version,
                         status="ok" if review_passed else "failed",
                         refs=[{"path": str(verify_path),
-                               "sha256": _sha256_file(verify_path), "role": "review"}])
+                               "sha256": _sha256_file(verify_path), "role": "review"},
+                              {"path": str(blind_path),
+                               "sha256": _sha256_file(blind_path), "role": "review"}])
         if verdict == "regression":
             self.notify("修订复检发现回归：" + "；".join(regression)[:150]
                         + "；不交付该修订版（修订前快照在 versions/）")
@@ -1098,19 +1156,18 @@ class Collaboration:
                           delivery_note="专业评审修订造成回归：不交付（快照保留修订前版本）")
             return result
         if verdict == "unverified":
-            self.notify("修订后复检存在未知（测量不可信/缺截图/缺记录）：不判通过也不判失败；"
+            self.notify("修订后复检观察不可信（测量不可信/缺截图/缺记录）：不判通过也不判失败；"
                         "需先核对观察链")
             result.update(block_delivery=True, status="UNVERIFIED",
-                          delivery_note="修订后复检存在未知：不判通过（见复检记录）")
+                          delivery_note="修订后复检观察不可信：不判通过（见复检记录）")
             return result
         result["accept_attempt"] = rev_attempt
         if verdict == "improved":
-            result["delivery_note"] = (f"专业评审：采纳 {len(adopted)} 条成立问题→修订→复检通过"
-                                       f"（已解决 {resolved}）")
+            result["delivery_note"] = (f"专业评审：采纳 {len(adopted)} 条成立问题→修订→"
+                                       f"盲比两序一致改善（判定依据：{verdict_basis[:60]}）")
         else:
-            leftover = "；".join(unresolved + new_issues)[:150] or "（无明确遗留）"
-            result["delivery_note"] = (f"专业评审修订后复检判定 {verdict}；遗留问题：{leftover}"
-                                       "（修订预算已用尽，如实交付，不为遗留问题冒充已解决）")
+            result["delivery_note"] = (f"专业评审修订后判定 {verdict}——{verdict_basis[:90]}"
+                                       "；如实交付，不宣称改善（依据见 professional-verify.json）")
         return result
 
     # ---- 主流程 ----
@@ -1190,13 +1247,23 @@ class Collaboration:
             pass
 
     def _codex_processes_since(self, since_iso: str) -> list:
-        """列出晚于 since 启动的 codex 进程（判断是否仍有执行器在写入）。"""
+        """列出晚于 since 启动的 codex 委托进程（判断是否仍有执行器在写入）。
+
+        V2 精度修正（真实运行观察到）：IDE 常驻的 `codex.exe app-server` 与
+        computer-use 辅助进程以 codex 之名长期存在，但不是任务委托写入者；
+        按命令行排除，避免存活门控被无关进程误触发而永远无法人工核对确认。
+        其余 codex 进程（如 `codex.exe exec …`）仍一律视为潜在写入者。
+        """
         import subprocess
 
         script = (
-            "Get-Process codex -ErrorAction SilentlyContinue | "
-            "Where-Object { $_.StartTime -gt [datetime]::Parse('%s') } | "
-            "Select-Object Id,StartTime | ConvertTo-Json -Compress" % since_iso.replace("T", " ")
+            "$since = Get-Date('%s'); "
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'codex*' "
+            "-and $_.CreationDate -and $_.CreationDate -gt $since "
+            "-and $_.CommandLine -and $_.CommandLine -notmatch 'app-server' "
+            "-and $_.CommandLine -notmatch 'computer-use' } | "
+            "Select-Object ProcessId,CreationDate | ConvertTo-Json -Compress"
+            % since_iso.replace("T", " ")
         )
         proc = subprocess.run(["powershell", "-NoProfile", "-Command", script],
                               capture_output=True, text=True, timeout=30)
@@ -1506,12 +1573,22 @@ class Collaboration:
         if pr.get("performed"):
             lines.append(
                 f"- 交付前专业评审：已执行（{pr.get('origin')}）；候选 {pr.get('candidates')} 条 → "
-                f"采纳 {pr.get('adopted')}、驳回 {pr.get('rejected')}、保持现状 {pr.get('keep')}、"
+                f"自主修订 {pr.get('adopted')}、驳回 {pr.get('rejected')}、保持现状 {pr.get('keep')}、"
+                f"用户选项 {pr.get('user_options', 0)}、不可验证 {pr.get('skip_unverifiable', 0)}、"
+                f"计划盲区 {pr.get('blind_spots', 0)}、"
                 f"待用户/待查 {pr.get('needs_user')}"
-                + (f"；修订复检判定 **{pr.get('verdict')}**" if pr.get("verdict") else "")
+                + (f"；修订复检判定 **{pr.get('verdict')}**（盲比两序"
+                   f"{'一致' if (pr.get('blind') or {}).get('consistent') else '不一致/未执行'}）"
+                   if pr.get("verdict") else "")
                 + ("；**无截图输入，视觉维度未验证**" if pr.get("unverified_visual") else ""))
             if pr.get("note"):
                 lines.append(f"- 评审结论：{pr['note']}")
+            # V2：逐维度判定（ADR-008 第 9 条——"看结果"逐维度列出判定）
+            for dv in (self.last_dimension_verdicts or []):
+                label = {"after_better": "改善", "before_better": "变差", "equal": "相当",
+                         "unknown": "无法判定"}.get(dv["verdict"], dv["verdict"])
+                lines.append(f"  - 维度 {dv['entry_id']} {dv['name'][:28]}：**{label}**"
+                             "（盲比正反两序判定；unknown=两序不一致或无法判）")
         else:
             lines.append(f"- 交付前专业评审：**未执行**（{pr.get('reason', '未运行')}）"
                          "——不宣称领域标准评审通过")
@@ -1576,10 +1653,10 @@ class Collaboration:
                 state = "已回答（" + (ix.answer_source or "") + "）" if ix.answer_source else "**未回答（沉默≠批准）**"
                 lines.append(f"- 请求决定：{ix.message[:60]}（阻塞 {ix.blocking_action}）——{state}")
         lines.append(f"- 模型用量：{meta['model_usage']}")
-        for name, label in (("professional-review.json", "专业评审候选审查（采纳/驳回/保持现状+理由）"),
+        for name, label in (("professional-review.json", "专业评审候选审查（可验证性路由+理由）"),
                             ("diagnosis-professional.md", "专业评审诊断（真实模型/Mock，含证据引用）"),
-                            ("model-review-professional.json", "修订后模型复查（绑定产物哈希）"),
-                            ("professional-verify.json", "修订后确定性复检（保留项/回归/测量）")):
+                            ("blind-review-professional.json", "修订后盲比复检（A/B 随机、正反两序、逐维度判定）"),
+                            ("professional-verify.json", "修订后确定性复检（保留项/回归/测量/判定分级）")):
             evidence = self.run_dir / name
             if evidence.is_file():
                 lines.append(f"- {label}：`{evidence.resolve()}`")

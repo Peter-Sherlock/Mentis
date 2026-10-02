@@ -24,11 +24,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from mentis.capabilities.registry import load_registry
 from mentis.capabilities.routing import Gap, route_gap
 from mentis.capabilities.selection import select_for_task
 from mentis.contracts import (AttemptStatus, DelegationPolicy, Disposition, Provenance,
                               SourcedItem)
 from mentis.diagnosis import (DiagnosisBundle, render_bundle_markdown, run_diagnosis)
+# V2：guide-revise 接入评估计划 + 盲比复检（ADR-008 第 1/4/7/8 条）
+from mentis.eval_review import grade_revision, run_blind_review
+from mentis.evaluation_plan import PlanPersistenceError, acceptance_block, build_evaluation_plan
 from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskSpec
 from mentis.models.gateway import ModelConfig, ModelGateway
 from mentis.observation import ObservationRecord, observe_structure
@@ -267,6 +271,8 @@ class GuidanceCycle:
         self._goal = ""
         self._workspace_ready = False
         self._finalized_emitted = False
+        self.evaluation_plan = None  # V2：修订委托前落盘的评估计划
+        self._blind_rng = None       # V2：盲比 A/B 随机源；测试可注入种子
         self.trace = TraceWriter(self.run_dir, self.run_id,
                                  executor_version=self.adapter.cli_version)
 
@@ -306,6 +312,7 @@ class GuidanceCycle:
     def _run_impl(self) -> str:
         self._notify(f"P3.2 指导修订循环开始；基线 {self.baseline_dir}")
         self._freeze_and_setup()
+        self._ensure_evaluation_plan()  # V2：修订委托前先落盘评估计划
         extra_problems: list[str] = []
         for round_no in range(1, self.max_rounds + 1):
             record = RoundRecord(round_no=round_no)
@@ -336,6 +343,9 @@ class GuidanceCycle:
             record.instruction = compose_revision_instruction(
                 bundle, defect_ids, pack, self._preserved, self._constraints,
                 agent_decisions=agent_decisions, extra_problems=extra_problems)
+            # V2：指令尾部携带计划派生的本轮验收项（执行器可见）
+            record.instruction = record.instruction.rstrip() + "\n\n" + acceptance_block(
+                self.evaluation_plan)
             record.instruction_path = str(self.run_dir / f"instruction-{tag}.md")
             (self.run_dir / f"instruction-{tag}.md").write_text(
                 record.instruction, encoding="utf-8")
@@ -356,7 +366,8 @@ class GuidanceCycle:
                 self._notify("修订后工作区没有 index.html：按失败处理，不虚构产物")
                 self._persist()
                 return self.status
-            verdict = self._verify_round(record, tag, v2_html, bundle, defect_ids)
+            verdict = self._verify_round(record, tag, v2_html, bundle, defect_ids,
+                                         pack_before=pack, images_before=images)
             record.verdict = verdict
             self._notify(f"第 {round_no} 轮判定：{verdict}")
             if verdict == "improved":
@@ -386,9 +397,13 @@ class GuidanceCycle:
                                 else "未达成改善") + "）")
                 self._persist()
                 return self.status
-            # 预算内再修一轮：复检发现的回归/未解决项进入下一轮指令
+            # 预算内再修一轮：复检发现的回归/未达成维度进入下一轮指令
+            blind_dims = record.verification.get("blind_review", {}).get("per_dimension", {})
+            unmet_dims = [f"计划维度 {eid} 盲比判定 {v}（标准未达成）"
+                          for eid, v in blind_dims.items() if v in ("before_better", "unknown")]
             extra_problems = (
                 [f"回归：{r}" for r in record.verification.get("preserved_regression", [])]
+                + unmet_dims
                 + [f"上一轮诊断 {u} 未解决" for u in record.verification.get("model_unresolved", [])]
                 + [f"新问题：{n}" for n in record.verification.get("model_new_issues", [])])
         self.status = "EXHAUSTED"
@@ -723,9 +738,63 @@ class GuidanceCycle:
         self._notify("无终态事件且工作区无产物：按失败处理")
         return "failed"
 
+    def _ensure_evaluation_plan(self):
+        """V2：guide-revise 接入评估计划——首次修订委托前落盘（先落盘后委托）。
+
+        计划来源：冻结基线的目标/约束（session brief）+ 基线素材（workspace_input_copy.md）
+        + 已加载领域资源；模型实例化在 use_model 且有凭据时叠加（失败降级标注）。
+        落盘失败抛 PlanPersistenceError——修订委托不发起。
+        """
+        if getattr(self, "evaluation_plan", None) is not None:
+            return self.evaluation_plan
+        material_path = self._v1_dir / "source" / "workspace_input_copy.md"
+        material = ""
+        try:
+            material = material_path.read_text(encoding="utf-8") if material_path.is_file() else ""
+        except OSError:
+            material = ""
+        resources = []
+        try:
+            _, resources = select_for_task(
+                load_registry(), task_label="评估计划",
+                task_keywords=["单页活动介绍页"],
+                decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
+                observation_capabilities={"structure_only": True, "screenshots": True,
+                                         "render_measurement": True},
+                can_execute=True)
+        except Exception:
+            resources = []
+        plan = build_evaluation_plan(
+            goal=self._goal, brief=self.session.current_brief, material_text=material,
+            resources=resources, gateway=self.gateway,
+            use_model=bool(self.use_model and self.gateway is not None),
+            notify=self._notify)
+        path = self.run_dir / "evaluation-plan" / "plan-v1.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = plan.to_json_bytes()
+            path.write_bytes(payload)
+        except OSError as exc:
+            raise PlanPersistenceError(f"评估计划落盘失败，本次修订委托不发起：{exc}") from exc
+        import hashlib
+
+        plan.sha256 = hashlib.sha256(payload).hexdigest()
+        self.trace.emit("mentis", "evaluation_plan.recorded",
+                        f"评估计划 v1 已落盘（修订委托前）：{len(plan.entries)} 个维度、"
+                        f"阻塞 {len(plan.blocking_entries())} 条；"
+                        f"模型实例化 {plan.model_instantiation.get('status')}",
+                        brief_version=self.session.current_brief.version,
+                        refs=[{"path": str(path), "sha256": plan.sha256, "role": "plan"}])
+        self._notify(f"评估计划 v1 已生成（先于修订委托落盘；{len(plan.entries)} 个维度）")
+        self.evaluation_plan = plan
+        return plan
+
     def _verify_round(self, record: RoundRecord, tag: str, v2_html: Path,
-                      bundle: DiagnosisBundle, defect_ids: list) -> str:
-        """独立复检：确定性保留项/溢出检查 + 模型复查（可看 v2 截图）。
+                      bundle: DiagnosisBundle, defect_ids: list,
+                      pack_before: ObservationPack | None = None,
+                      images_before: list | None = None) -> str:
+        """独立复检（V2）：确定性保留项/溢出检查 + **盲比**（A/B 随机、只给计划标准、
+        正反两序、不一致记 unknown；不再给诊断清单问"问题是否仍存在"）。
 
         测量不可信、缺记录或缺复查截图 → unknown：不判通过，记为 unverified。
         """
@@ -733,15 +802,31 @@ class GuidanceCycle:
         findings, regression, unknown = self._deterministic_checks(pack2)
         if self.include_images and self.browser_capture is not None and not images2:
             unknown.append("复查截图缺失：视觉类解决声明无法核对（不作为通过依据）")
-        resolved, unresolved, new_issues = self._model_review(
-            v2_html, bundle, defect_ids, pack2, images2, tag, record)
+        blind_path = self.run_dir / f"blind-review-{tag}.json"
+        blind = run_blind_review(
+            self.gateway, self.evaluation_plan, pack_before, images_before or [],
+            pack2, images2, blind_path, use_model=self.use_model, notify=self._notify,
+            rng=getattr(self, "_blind_rng", None),
+            before_html_sha256=pack_before.sha256 if pack_before else "",
+            after_html_sha256=pack2.sha256)
+        artifact_changed = bool(pack_before) and pack_before.sha256 != pack2.sha256
+        verdict, verdict_basis = grade_revision(regression, unknown, artifact_changed, blind)
+        # 验收门与判定分级解耦（V2）：接受=确定性健康；盲比只决定“改善声明”
+        review_passed = not regression and not unknown
+        dim_text = "；".join(f"{k}={v}" for k, v in blind["per_dimension"].items())
         verification = {
             "deterministic_findings": findings,
             "preserved_regression": regression,
             "measurement_unknown": unknown,
-            "model_resolved": resolved,
-            "model_unresolved": unresolved,
-            "model_new_issues": new_issues,
+            "artifact_changed": artifact_changed,
+            "blind_review": {"overall": blind["overall"], "consistent": blind["consistent"],
+                             "per_dimension": blind["per_dimension"],
+                             "assignment": {k: {"x_is": v.get("x_is"), "y_is": v.get("y_is")}
+                                            for k, v in blind["orders"].items()},
+                             "usage_total": blind["usage_total"], "mock": blind["mock"],
+                             "note": blind.get("note", ""),
+                             "detail": str(blind_path)},
+            "verdict": verdict, "verdict_basis": verdict_basis,
             "measurement_v2": {v.name: {"overflow_px": v.overflow_px,
                                         "overflowing": len(v.overflowing),
                                         "clipped": len(v.clipped_text),
@@ -750,11 +835,10 @@ class GuidanceCycle:
                                for v in pack2.measurement.viewports},
         }
         record.verification = verification
-        review_passed = not regression and not unresolved and not new_issues and not unknown
         self.session.record_review(
             self.session.attempts[-1].attempt_id, findings=findings + [
-                f"模型复查：已解决 {resolved or '无'}；未解决 {unresolved or '无'}；"
-                f"新问题 {new_issues or '无'}"]
+                f"盲比复检（ADR-008 第 7 条）：两序{'一致' if blind['consistent'] else '不一致'}，"
+                f"总体 {blind['overall']}；逐维度 {dim_text[:160]}"]
                 + [f"测量未知：{u}" for u in unknown],
             passed=review_passed,
             disposition=Disposition.ACCEPT if review_passed else Disposition.REVISE)
@@ -762,38 +846,25 @@ class GuidanceCycle:
             json.dumps(verification, ensure_ascii=False, indent=2), encoding="utf-8")
         self.trace.emit("mentis", "review.recorded",
                         f"复检：保留项回归 {regression or '无'}；测量未知 {unknown or '无'}；"
-                        f"模型复查已解决 {resolved or '无'}/未解决 {unresolved or '无'}/"
-                        f"新问题 {new_issues or '无'}；结论 {'通过' if review_passed else '不通过'}",
+                        f"盲比两序{'一致' if blind['consistent'] else '不一致'}"
+                        f"（总体 {blind['overall']}，逐维度 {dim_text[:120]}）；"
+                        f"判定 {verdict}——{verdict_basis[:80]}",
                         attempt_id=self.session.attempts[-1].attempt_id,
                         brief_version=self.session.current_brief.version,
                         status="ok" if review_passed else "failed",
                         refs=[{"path": str(self.run_dir / f"review-{tag}.md"),
                                "sha256": _sha256_file(self.run_dir / f"review-{tag}.md"),
-                               "role": "review"}])
+                               "role": "review"},
+                              {"path": str(blind_path),
+                               "sha256": _sha256_file(blind_path), "role": "review"}])
         record.review_path = str(self.run_dir / f"review-{tag}.md")
-        if regression:
-            return "regression"
-        if unknown:
-            return "unverified"
-        if not unresolved and not new_issues and resolved:
-            return "improved"
-        if not unresolved and not new_issues and not resolved:
-            # 无明确缺陷被确认解决：检查保留项完好 → 视为未改善（不标改善）
-            return "not_improved"
-        return "partially_improved"
+        return verdict
 
     def _deterministic_checks(self, pack: ObservationPack) -> tuple[list, list, list]:
         return deterministic_checks(pack, self._preserved, self._form_field_requirements)
 
-    def _model_review(self, v2_html: Path, bundle: DiagnosisBundle, defect_ids: list,
-                      pack2: ObservationPack, images2: list, tag: str,
-                      record: RoundRecord) -> tuple[list, list, list]:
-        out_path = self.run_dir / f"model-review-{tag}.json"
-        resolved, unresolved, new_issues = run_model_review(
-            self.gateway, self._goal, v2_html, bundle, defect_ids, pack2, images2,
-            out_path, use_model=self.use_model, notify=self._notify)
-        record.review_path = str(out_path)
-        return resolved, unresolved, new_issues
+    # V2：_model_review（非盲模型复查）已由 _verify_round 的盲比复检替代并移除；
+    # 模块级 run_model_review 保留供 --reverify 历史轮次透明更正使用（见该路径）。
 
     # ---- 工作区与版本 ----
 
@@ -893,6 +964,8 @@ class GuidanceCycle:
         (self.run_dir / f"instruction-{tag}.md").write_text(
             record.instruction, encoding="utf-8")
         self._notify(f"核对通过（无活跃写入者、产物在）：按预算续办第 {record.round_no} 轮")
+        # V2：续办前先观察当前部分产物作为本轮委托的"修改前"盲比基准
+        before_pack, before_images = self._observe(self._current_html(), f"{tag}-pre")
         outcome = self._delegate_revision(record, tag)
         if outcome in ("failed", "needs_human"):
             self.status = "FAILED" if outcome == "failed" else "NEEDS_HUMAN"
@@ -908,7 +981,8 @@ class GuidanceCycle:
         defect_ids = [f"d{i}" for i in range(1, len(bundle.valid_diagnoses) + 1)]
         if not bundle.valid_diagnoses:
             defect_ids = []
-        verdict = self._verify_round(record, tag, v2_html, bundle, defect_ids)
+        verdict = self._verify_round(record, tag, v2_html, bundle, defect_ids,
+                                     pack_before=before_pack, images_before=before_images)
         record.verdict = verdict
         if verdict == "improved":
             self._save_version(v2_html, "v2")
@@ -982,6 +1056,7 @@ class GuidanceCycle:
             Path(last_round.instruction_path).write_text(
                 last_round.instruction, encoding="utf-8")
             self._last_bundle = (bundle, defect_ids)
+            self._resume_before = (pack, images)  # V2：盲比需要修改前观察
         self._notify("决定已回答：继续被暂停的修订委托")
         outcome = self._delegate_revision(last_round, f"round{last_round.round_no}b")
         if outcome in ("failed", "needs_human"):
@@ -1000,7 +1075,9 @@ class GuidanceCycle:
                 self.run_dir / f"diagnosis-round{last_round.round_no}.md")
             defect_ids = [f"d{i}" for i in range(1, len(bundle.valid_diagnoses) + 1)]
         verdict = self._verify_round(last_round, f"round{last_round.round_no}b", v2_html,
-                                     bundle, defect_ids)
+                                     bundle, defect_ids,
+                                     pack_before=getattr(self, "_resume_before", (None, None))[0],
+                                     images_before=getattr(self, "_resume_before", (None, []))[1])
         last_round.verdict = verdict
         if verdict == "improved":
             self._save_version(v2_html, "v2")
@@ -1048,21 +1125,95 @@ class GuidanceCycle:
         findings, regression, unknown = self._deterministic_checks(pack2)
         resolved, unresolved, new_issues = [], [], []
         review_file = self.run_dir / f"model-review-round{last.round_no}.json"
-        bound, bind_note = self._review_binding_status(last, v2_html, review_file)
-        if bound:
+        blind_file = self.run_dir / f"blind-review-round{last.round_no}.json"
+        blind_for_grading = None
+        if blind_file.is_file():
+            # V2 轮次：优先复用已绑定的盲比判定（不新增模型调用）；不符则不复用
             try:
-                prior = json.loads(review_file.read_text(encoding="utf-8"))
-                data = json.loads(prior.get("response", "{}"))
-                resolved = [r for r in data.get("resolved", []) if str(r).strip()]
-                unresolved = [r for r in data.get("unresolved", []) if str(r).strip()]
-                new_issues = [str(x) for x in data.get("new_issues", []) if str(x).strip()]
-            except (json.JSONDecodeError, ValueError) as exc:
-                unresolved = ["review-unreadable"]
-                bind_note = f"{bind_note}；但复查响应不可解析（{exc}）：按未确认处理"
-        elif review_file.is_file():
-            unresolved = ["review-unbound"]
+                prior_blind = json.loads(blind_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                prior_blind = None
+            if (prior_blind
+                    and prior_blind.get("reviewed_after_sha256") == _sha256_file(v2_html)):
+                blind_for_grading = prior_blind
+                bind_note = (f"盲比复检绑定当前 v2（reviewed_after_sha256 前 12 位 "
+                             f"{str(prior_blind.get('reviewed_after_sha256'))[:12]}）；"
+                             "逐维度判定复用，不新增模型调用")
+            else:
+                unresolved = ["review-unbound"]
+                bind_note = "盲比复检文件与当前 v2 哈希不符：不复用旧判定，按未确认处理"
         else:
-            unresolved = ["review-missing"] if not last.verdict else ["review-unbound"]
+            bound, bind_note = self._review_binding_status(last, v2_html, review_file)
+            if bound:
+                try:
+                    prior = json.loads(review_file.read_text(encoding="utf-8"))
+                    data = json.loads(prior.get("response", "{}"))
+                    resolved = [r for r in data.get("resolved", []) if str(r).strip()]
+                    unresolved = [r for r in data.get("unresolved", []) if str(r).strip()]
+                    new_issues = [str(x) for x in data.get("new_issues", []) if str(x).strip()]
+                except (json.JSONDecodeError, ValueError) as exc:
+                    unresolved = ["review-unreadable"]
+                    bind_note = f"{bind_note}；但复查响应不可解析（{exc}）：按未确认处理"
+            elif review_file.is_file():
+                unresolved = ["review-unbound"]
+            else:
+                unresolved = ["review-missing"] if not last.verdict else ["review-unbound"]
+        if blind_for_grading is not None:
+            changed = (blind_for_grading.get("reviewed_before_sha256")
+                       != blind_for_grading.get("reviewed_after_sha256"))
+            verdict, verdict_basis = grade_revision(regression, unknown, changed,
+                                                    blind_for_grading)
+            verification = {
+                "deterministic_findings": findings,
+                "preserved_regression": regression,
+                "measurement_unknown": unknown,
+                "artifact_changed": changed,
+                "blind_review": {"overall": blind_for_grading.get("overall"),
+                                 "consistent": blind_for_grading.get("consistent"),
+                                 "per_dimension": blind_for_grading.get("per_dimension", {}),
+                                 "detail": str(blind_file), "reused": True},
+                "model_resolved": [], "model_unresolved": [], "model_new_issues": [],
+                "model_review_binding": bind_note,
+                "verdict": verdict, "verdict_basis": verdict_basis,
+                "measurement_v2": {v.name: {"overflow_px": v.overflow_px,
+                                            "overflowing": len(v.overflowing),
+                                            "clipped": len(v.clipped_text),
+                                            "inner_width": v.inner_width,
+                                            "errors": list(v.errors)}
+                                   for v in pack2.measurement.viewports},
+            }
+            last.verification = verification
+            review_passed = not regression and not unknown  # 验收门=确定性健康（V2 解耦）
+            prior_verdict = last.verdict or "（未复检）"
+            correction = "复核重检（结论维持）" if verdict == last.verdict else "复核更正"
+            last.notes.append(
+                f"{correction}：{prior_verdict} → {verdict}；"
+                f"依据：逐段保留项/逐字段必填/测量可信度检查 + 盲比绑定复用；{bind_note}")
+            last.verdict = verdict
+            self.verdict = verdict
+            self.session.record_review(
+                self.session.attempts[-1].attempt_id,
+                findings=findings + [f"测量未知：{u}" for u in unknown] + [bind_note],
+                passed=review_passed,
+                disposition=Disposition.ACCEPT if review_passed else Disposition.REVISE)
+            review_path = self.run_dir / f"review-round{last.round_no}-recheck{suffix}.md"
+            review_path.write_text(json.dumps(verification, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+            last.review_path = str(review_path)
+            self.trace.emit("mentis", "review.recorded",
+                            f"复核重检：保留项回归 {regression or '无'}；测量未知 {unknown or '无'}；"
+                            f"盲比绑定复用（总体 {blind_for_grading.get('overall')}，两序"
+                            f"{'一致' if blind_for_grading.get('consistent') else '不一致'}）；"
+                            f"判定 {verdict}——{verdict_basis[:60]}",
+                            attempt_id=self.session.attempts[-1].attempt_id,
+                            brief_version=self.session.current_brief.version,
+                            status="ok" if review_passed else "failed",
+                            refs=[{"path": str(review_path),
+                                   "sha256": _sha256_file(review_path), "role": "review"},
+                                  {"path": str(blind_file),
+                                   "sha256": _sha256_file(blind_file), "role": "review"}])
+            self._finish_reverify(verdict)
+            return self.status
         verification = {
             "deterministic_findings": findings,
             "preserved_regression": regression,
@@ -1114,8 +1265,13 @@ class GuidanceCycle:
                         attempt_id=self.session.attempts[-1].attempt_id,
                         brief_version=self.session.current_brief.version,
                         status="ok" if review_passed else "failed",
-                        refs=[{"path": str(review_path),
-                               "sha256": _sha256_file(review_path), "role": "review"}])
+                            refs=[{"path": str(review_path),
+                                   "sha256": _sha256_file(review_path), "role": "review"}])
+        self._finish_reverify(verdict)
+        return self.status
+
+    def _finish_reverify(self, verdict: str) -> None:
+        """复核收尾（盲比复用与旧绑定路径共用）：改善才接受，其余如实记状态。"""
         if verdict == "improved":
             self.status = "IMPROVED"
             try:
@@ -1128,7 +1284,6 @@ class GuidanceCycle:
             self.status = verdict.upper()
         self._notify(f"复核判定：{verdict}（历史判定与备注全部保留，可审计）")
         self._persist()
-        return self.status
 
     def _review_binding_status(self, last: RoundRecord, v2_html: Path,
                                review_file: Path) -> tuple[bool, str]:
@@ -1251,9 +1406,16 @@ class GuidanceCycle:
                          f"判定 {r.verdict or '（未复检）'}")
             if r.verification:
                 v = r.verification
-                lines.append(f"  - 保留项回归：{v['preserved_regression'] or '无'}；"
-                             f"模型复查已解决 {v['model_resolved'] or '无'}、"
-                             f"未解决 {v['model_unresolved'] or '无'}、新问题 {v['model_new_issues'] or '无'}")
+                lines.append(f"  - 保留项回归：{v['preserved_regression'] or '无'}")
+                if "blind_review" in v:
+                    b = v["blind_review"]
+                    lines.append(f"  - 盲比复检：两序{'一致' if b['consistent'] else '不一致'}，"
+                                 f"总体 {b['overall']}；逐维度 "
+                                 + "；".join(f"{k}={x}" for k, x in b["per_dimension"].items())
+                                 + f"；判定 {v.get('verdict')}（{v.get('verdict_basis', '')[:60]}）")
+                if v.get("model_resolved") is not None:  # 旧记录/--reverify 路径兼容
+                    lines.append(f"  - 模型复查已解决 {v['model_resolved'] or '无'}、"
+                                 f"未解决 {v['model_unresolved'] or '无'}、新问题 {v['model_new_issues'] or '无'}")
                 if v.get("measurement_unknown"):
                     lines.append(f"  - **测量未知（不作为通过依据）**：{'；'.join(v['measurement_unknown'])}")
                 if v.get("model_review_binding"):
@@ -1286,9 +1448,12 @@ class GuidanceCycle:
                 lines.append(f"- 执行器错误：{r.codex_error[:200]}")
             if r.review_path:
                 lines.append(f"- 复检：`{Path(r.review_path).resolve()}`")
+            blind_review = self.run_dir / f"blind-review-round{r.round_no}.json"
+            if blind_review.is_file():
+                lines.append(f"- 盲比复检（A/B 随机、正反两序）：`{blind_review.resolve()}`")
             model_review = self.run_dir / f"model-review-round{r.round_no}.json"
             if model_review.is_file():
-                lines.append(f"- 模型复查（含图像输入）：`{model_review.resolve()}`")
+                lines.append(f"- 模型复查（含图像输入；旧路径/--reverify）：`{model_review.resolve()}`")
             for note in r.notes:
                 lines.append(f"- 备注：{note}")
         for route in self.decision_routes:
@@ -1565,6 +1730,11 @@ def guidance_from_state(state_path: str | Path, adapter=None, gateway=None,
     obj.status = meta.get("status", "created")
     obj.verdict = meta.get("verdict", "")
     obj.workspace = Path(meta["workspace"])
+    # V2：恢复已落盘的评估计划与盲比随机源（计划不改写；哈希按文件重算）
+    from mentis.evaluation_plan import load_latest_plan
+
+    obj.evaluation_plan = load_latest_plan(obj.run_dir)
+    obj._blind_rng = None
     obj._preserved = [tuple(x) for x in meta.get("preserved_items", [])]
     obj._dropped_preserved = [tuple(x) for x in meta.get("preserved_dropped", [])]
     obj._goal = meta.get("goal", "")

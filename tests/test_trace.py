@@ -18,11 +18,13 @@ from mentis.trace import (TraceArchiveError, TraceWriter, load_events,
 
 try:
     from tests.test_collab import FakeAdapter, make_collab, stub_capture
-    from tests.test_guidance import (DIAGNOSIS_OVERFLOW, DIAGNOSIS_NEEDS_USER, FakeGateway, REVIEW_RESOLVED,
+    from tests.test_guidance import (BLIND_AFTER_X, BLIND_AFTER_Y, _FixedCoin,
+                                     DIAGNOSIS_OVERFLOW, DIAGNOSIS_NEEDS_USER, FakeGateway,
                                      file_aware_measure, make_baseline)
 except ImportError:
     from test_collab import FakeAdapter, make_collab, stub_capture
-    from test_guidance import (DIAGNOSIS_OVERFLOW, DIAGNOSIS_NEEDS_USER, FakeGateway, REVIEW_RESOLVED,
+    from test_guidance import (BLIND_AFTER_X, BLIND_AFTER_Y, _FixedCoin,
+                               DIAGNOSIS_OVERFLOW, DIAGNOSIS_NEEDS_USER, FakeGateway,
                                file_aware_measure, make_baseline)
 
 
@@ -260,7 +262,7 @@ class TraceIntegrationTests(unittest.TestCase):
         from mentis.guidance import GuidanceCycle
 
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         try:
             from tests.test_guidance import stub_capture as g_capture
         except ImportError:
@@ -270,6 +272,7 @@ class TraceIntegrationTests(unittest.TestCase):
             adapter=RecordingGuidanceAdapter(behavior={"first": "fixed"}), gateway=gateway,
             browser_capture=g_capture, measure=file_aware_measure,
             use_model=True, include_images=True, timeout_s=60, max_rounds=1)
+        cycle._blind_rng = _FixedCoin()  # 盲比 A/B 指派固定（Mock 响应语义匹配）
         self.assertEqual(cycle.run(), "IMPROVED")
         events = load_events(cycle.run_dir)
         kinds = [e["kind"] for e in events]
@@ -291,7 +294,7 @@ class TraceIntegrationTests(unittest.TestCase):
         cycle = GuidanceCycle(
             baseline_dir=make_baseline(self.root), run_dir=self.root / "decision-run",
             adapter=RecordingGuidanceAdapter(behavior={"first": "fixed"}),
-            gateway=FakeGateway([DIAGNOSIS_NEEDS_USER, REVIEW_RESOLVED]),
+            gateway=FakeGateway([DIAGNOSIS_NEEDS_USER, BLIND_AFTER_X, BLIND_AFTER_Y]),
             browser_capture=g_capture, measure=file_aware_measure,
             use_model=True, include_images=True, timeout_s=60, max_rounds=1)
         self.assertEqual(cycle.run(), "NEEDS_DECISION")

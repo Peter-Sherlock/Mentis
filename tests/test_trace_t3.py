@@ -19,13 +19,15 @@ from mentis.trace_export import export_timeline
 try:
     from tests.test_collab import FakeAdapter, make_collab, stub_capture
     from tests.test_trace import RecordingAdapter
-    from tests.test_guidance import (DIAGNOSIS_OVERFLOW, FakeGateway, REVIEW_RESOLVED,
+    from tests.test_guidance import (BLIND_AFTER_X, BLIND_AFTER_Y, _FixedCoin,
+                                     DIAGNOSIS_OVERFLOW, FakeGateway,
                                      file_aware_measure, make_baseline)
     from tests.test_trace_stream import ScriptedStream
 except ImportError:  # discover -s tests 以顶层模块导入
     from test_collab import FakeAdapter, make_collab, stub_capture
     from test_trace import RecordingAdapter
-    from test_guidance import (DIAGNOSIS_OVERFLOW, FakeGateway, REVIEW_RESOLVED,
+    from test_guidance import (BLIND_AFTER_X, BLIND_AFTER_Y, _FixedCoin,
+                               DIAGNOSIS_OVERFLOW, FakeGateway,
                                file_aware_measure, make_baseline)
     from test_trace_stream import ScriptedStream
 
@@ -352,7 +354,7 @@ class ExceptionFinalizeTests(unittest.TestCase):
         cycle = GuidanceCycle(
             baseline_dir=make_baseline(self.root), run_dir=self.root / "err-run",
             adapter=ExplodingGuidanceAdapter(behavior={"first": "fixed"}),
-            gateway=FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED]),
+            gateway=FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y]),
             browser_capture=g_capture, measure=file_aware_measure,
             use_model=True, include_images=True, timeout_s=60, max_rounds=1)
         with self.assertRaises(RuntimeError):

@@ -22,16 +22,16 @@ from mentis.render_measurement import RenderMeasurement, ViewportMeasurement
 
 try:
     from tests.test_collab import GOOD_PAGE, BAD_PAGE
-    from tests.test_guidance import (DIAGNOSIS_GENERIC, DIAGNOSIS_NEEDS_USER,
+    from tests.test_guidance import (BLIND_AFTER_X, BLIND_AFTER_Y, _FixedCoin,
+                                     DIAGNOSIS_GENERIC, DIAGNOSIS_NEEDS_USER,
                                      DIAGNOSIS_OVERFLOW, DIAGNOSIS_QUALIFIED,
-                                     FakeGateway, REVIEW_RESOLVED, file_aware_measure,
-                                     stub_capture)
+                                     FakeGateway, file_aware_measure, stub_capture)
 except ImportError:  # discover -s tests 以顶层模块导入
     from test_collab import GOOD_PAGE, BAD_PAGE
-    from test_guidance import (DIAGNOSIS_GENERIC, DIAGNOSIS_NEEDS_USER,
+    from test_guidance import (BLIND_AFTER_X, BLIND_AFTER_Y, _FixedCoin,
+                               DIAGNOSIS_GENERIC, DIAGNOSIS_NEEDS_USER,
                                DIAGNOSIS_OVERFLOW, DIAGNOSIS_QUALIFIED,
-                               FakeGateway, REVIEW_RESOLVED, file_aware_measure,
-                               stub_capture)
+                               FakeGateway, file_aware_measure, stub_capture)
 
 GOAL = "为拾光咖啡工作坊制作活动介绍页"
 V2_MARKER = "<!-- review-fix-applied -->"
@@ -115,17 +115,19 @@ class ProfessionalReviewTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
 
     def make(self, gateway, adapter, measure=None, browser_capture=stub_capture, **kw):
-        return Collaboration(
+        collab = Collaboration(
             goal=GOAL, adapter=adapter, gateway=gateway,
             browser_capture=browser_capture, measure=measure or file_aware_measure,
             use_model=True, base_dir=self.root / "collab", **kw)
+        collab._blind_rng = _FixedCoin()  # 盲比 A/B 指派固定（Mock 响应语义匹配）
+        return collab
 
     def test_evidence_backed_candidate_triggers_revision_and_reverify(self):
         """有据候选 → 采纳 → 修订指令（证据/保留/约束/复检办法）→ 复检 improved → 交付。"""
         from mentis.trace import load_events
 
         adapter = ReviewAdapter()
-        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED]), adapter)
+        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y]), adapter)
         self.assertEqual(collab.run(), "DELIVERED")
         self.assertEqual(len(adapter.prompts), 2)  # 构建 + 专业评审修订
         instruction = adapter.prompts[1]
@@ -144,13 +146,17 @@ class ProfessionalReviewTests(unittest.TestCase):
         self.assertEqual(review_doc["candidates"][0]["decision"], "adopt")
         self.assertTrue(review_doc["reviewed_artifact_sha256"])
         self.assertIn("同源模型", review_doc["source_note"])  # 独立性未建立如实记录
-        # 复检绑定当前产物版本；判定 improved
+        # 复检绑定当前产物版本；盲比两序一致 → 判定 improved（V2：不再由非盲复查授予）
         verify_doc = json.loads((collab.run_dir / "professional-verify.json")
                                 .read_text(encoding="utf-8"))
-        self.assertEqual(verify_doc["model_review"]["resolved"], ["d1"])
-        model_review = json.loads((collab.run_dir / "model-review-professional.json")
-                                  .read_text(encoding="utf-8"))
-        self.assertEqual(model_review["reviewed_html_sha256"], verify_doc["reviewed_html_sha256"])
+        self.assertTrue(verify_doc["artifact_changed"])
+        self.assertEqual(verify_doc["blind_review"]["overall"], "after_better")
+        self.assertTrue(verify_doc["blind_review"]["consistent"])
+        self.assertEqual(verify_doc["verdict"], "improved")
+        blind_doc = json.loads((collab.run_dir / "blind-review-professional.json")
+                               .read_text(encoding="utf-8"))
+        self.assertEqual(blind_doc["reviewed_after_sha256"], verify_doc["reviewed_html_sha256"])
+        self.assertTrue(blind_doc["mock"])  # Mock 标注
         self.assertEqual(collab.last_professional_review["verdict"], "improved")
         # 修改依据可追溯：revision 记录 + 旧版产物快照
         revision = collab.session.revisions[-1]
@@ -184,7 +190,7 @@ class ProfessionalReviewTests(unittest.TestCase):
         self.assertEqual(decisions["d2"], "keep_as_is")   # 保持现状不进入修订任务
         self.assertIn("不为增加交流轮数强行修改", review_doc["candidates"][1]["reason"])
         report = (collab.run_dir / "report.md").read_text(encoding="utf-8")
-        self.assertIn("采纳 0", report)
+        self.assertIn("自主修订 0", report)
         self.assertIn("合格不改", report)  # 接受依据=审查记录
 
     def test_keep_current_wording_variants_not_revised(self):
@@ -245,7 +251,7 @@ class ProfessionalReviewTests(unittest.TestCase):
     def test_untrusted_measurement_yields_unverified_not_pass(self):
         """测量不可信：修订后复检判 UNVERIFIED——不自动判通过、不交付。"""
         adapter = ReviewAdapter(revision_page=GOOD_PAGE + V2_MARKER)
-        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED]), adapter,
+        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y]), adapter,
                            measure=broken_measure)
         self.assertEqual(collab.run(), "UNVERIFIED")
         self.assertFalse(collab.session.attempts[-1].accepted)  # 不接受
@@ -258,7 +264,7 @@ class ProfessionalReviewTests(unittest.TestCase):
     def test_revision_regression_not_delivered_snapshot_kept(self):
         """修订造成保留项回归：不交付、不接受；修订前快照保留。"""
         adapter = ReviewAdapter(revision_page=BAD_PAGE)  # 缺价格 → 保留项回归
-        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED]), adapter)
+        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y]), adapter)
         self.assertEqual(collab.run(), "NOT_DELIVERED")
         self.assertFalse(collab.session.attempts[-1].accepted)
         verify_doc = json.loads((collab.run_dir / "professional-verify.json")
@@ -275,12 +281,12 @@ class ProfessionalReviewTests(unittest.TestCase):
         self.assertEqual(len(adapter.prompts), 1)  # 未委托修订
         report = (collab.run_dir / "report.md").read_text(encoding="utf-8")
         self.assertIn("预算已用尽" if "预算已用尽" in report else "预算耗尽", report)
-        self.assertIn("采纳 1", report)  # 成立问题被识别但未执行
+        self.assertIn("自主修订 1", report)  # 成立问题被识别但未执行
 
     def test_revision_unknown_stops_without_retry_or_accept(self):
         """修订执行 unknown：不判通过、不自动重发、不接受；需人工核对。"""
         adapter = ReviewAdapter(revision_status=AttemptStatus.UNKNOWN)
-        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED]), adapter)
+        collab = self.make(FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y]), adapter)
         self.assertEqual(collab.run(), "UNKNOWN")
         self.assertEqual(len(adapter.prompts), 2)  # 只委托一次，不自动重发
         self.assertFalse(collab.session.attempts[-1].accepted)

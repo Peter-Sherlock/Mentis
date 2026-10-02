@@ -9,6 +9,7 @@
 """
 
 import json
+import random
 import struct
 import tempfile
 import unittest
@@ -87,11 +88,13 @@ DIAGNOSIS_NEEDS_USER = json.dumps({
 
 DIAGNOSIS_GENERIC = json.dumps({
     "diagnoses": [{
-        "phenomenon": "结构层确认的问题（引用结构条目，不依赖测量）",
+        # V2：候选需可对应到评估计划维度才可自主修订（ADR-008 第 6 条）；
+        # 夹具显式引用维度 id T1（结构观察阶段可确定性核对的维度）。
+        "phenomenon": "页面正文缺少价格信息（对应计划维度 T1 任务关键事实完整呈现）",
         "evidence_refs": ["h:1"],
         "severity": "blocking",
-        "interpretation": "标题区块存在需修正的问题",
-        "modification_candidates": ["修正该问题"],
+        "interpretation": "素材要求的关键事实未在产物中呈现",
+        "modification_candidates": ["补齐该事实呈现"],
     }],
     "next_action": "agent_decide",
     "decision_requests": [],
@@ -100,6 +103,16 @@ DIAGNOSIS_GENERIC = json.dumps({
 REVIEW_RESOLVED = json.dumps({
     "resolved": ["d1"], "unresolved": [], "new_issues": [], "summary": "已解决",
 }, ensure_ascii=False)
+
+# V2 盲比复检的 Mock 响应（FakeGateway 按序弹出；标注见 blind-review-*.json 的 mock 字段）。
+# 约定 _blind_rng = random.Random(42)：before_first=False → order1 X=after/Y=before，order2 相反。
+# 两序一致判 after_better → improved。
+BLIND_AFTER_X = json.dumps({"overall": "X_better", "dimensions": [
+    {"entry_id": "T1", "verdict": "X_better", "reason": "Mock：版本X 更符合计划标准"}]},
+    ensure_ascii=False)
+BLIND_AFTER_Y = json.dumps({"overall": "Y_better", "dimensions": [
+    {"entry_id": "T1", "verdict": "Y_better", "reason": "Mock：版本Y 更符合计划标准"}]},
+    ensure_ascii=False)
 
 DIAGNOSIS_MISSING_PRICE = json.dumps({
     "diagnoses": [{
@@ -273,6 +286,17 @@ def make_baseline(root: Path, page: str = DEFECT_PAGE) -> Path:
     return baseline
 
 
+class _FixedCoin:
+    """盲比指派替身：每次 random() 恒 0.9 → before_first=False（order1 X=after）。
+
+    配合 BLIND_AFTER_X/BLIND_AFTER_Y 两序一致判 after_better；跨多轮 verify 不漂移。
+    """
+
+    @staticmethod
+    def random():
+        return 0.9
+
+
 class GuidanceTestBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -286,8 +310,10 @@ class GuidanceTestBase(unittest.TestCase):
     def cycle(self, baseline, gateway, adapter=None, **kw):
         merged = dict(self.cycle_kwargs)
         merged.update(kw)
-        return GuidanceCycle(baseline_dir=baseline, run_dir=self.root / "run",
-                             adapter=adapter, gateway=gateway, **merged)
+        cycle = GuidanceCycle(baseline_dir=baseline, run_dir=self.root / "run",
+                              adapter=adapter, gateway=gateway, **merged)
+        cycle._blind_rng = _FixedCoin()  # 盲比 A/B 指派固定（Mock 语义见常量注释）
+        return cycle
 
 
 class FreezeAndMaterialTests(GuidanceTestBase):
@@ -377,7 +403,7 @@ class AcceptanceFixTests(GuidanceTestBase):
                 v.clipped_text = []
             return m
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
                            measure=broken_measure)
         status = cycle.run()
@@ -398,7 +424,7 @@ class AcceptanceFixTests(GuidanceTestBase):
                     v.inner_width = 500  # Windows 无头最小窗宽钳制的模拟
             return m
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
                            measure=clamped_measure)
         self.assertEqual(cycle.run(), "UNVERIFIED")
@@ -410,7 +436,7 @@ class AcceptanceFixTests(GuidanceTestBase):
         def failing_capture(index, out_dir):
             raise RuntimeError("chrome exploded")
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_GENERIC, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
                            browser_capture=failing_capture)
         self.assertEqual(cycle.run(), "UNVERIFIED")
@@ -421,7 +447,7 @@ class AcceptanceFixTests(GuidanceTestBase):
         """② 复现旧误判：讲师姓名在、经验段被删 → 旧工具（只查姓名）判改善。
         修复后：逐段核对 → 经验段缺失 = 回归。"""
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "keep-name"}),
                            max_rounds=1)
         status = cycle.run()
@@ -434,7 +460,7 @@ class AcceptanceFixTests(GuidanceTestBase):
         """② 复现旧误判：contact 丢失 required（name 仍必填）→ 旧工具"至少一个必填"放过。
         修复后：逐字段核对 → contact 必填要求丢失 = 回归。"""
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "drop-required"}),
                            max_rounds=1)
         status = cycle.run()
@@ -447,7 +473,7 @@ class AcceptanceFixTests(GuidanceTestBase):
         """③ 复现旧误判：v2 在复查后被改动，旧 reverify 仍复用旧复查结论判改善。
         修复后：绑定不符 → 不复用 → UNVERIFIED。"""
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
                            max_rounds=1)
         self.assertEqual(cycle.run(), "IMPROVED")
@@ -469,16 +495,27 @@ class AcceptanceFixTests(GuidanceTestBase):
         self.assertIs(latest.disposition, _Disposition.REVISE)
 
     def test_reverify_legacy_binding_via_screenshots(self):
-        """③ legacy 记录（无直接哈希）：截图指纹 + 当轮测量 sha256 与现存 v2 一致 → 可复用。"""
+        """③ legacy 记录（无直接哈希）：截图指纹 + 当轮测量 sha256 与现存 v2 一致 → 可复用。
+
+        V2 主流程写 blind-review-*.json（优先复用）；本测试构造**旧格式** model-review
+        记录并移除盲比文件，专门覆盖 legacy 间接绑定路径。
+        """
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
                            max_rounds=1)
         self.assertEqual(cycle.run(), "IMPROVED")
+        import hashlib
+
+        verify_dir = cycle.run_dir / "observation-round1-verify"
+        refs = [f"{p.name};{hashlib.sha256(p.read_bytes()).hexdigest()[:12]}"
+                for p in sorted(verify_dir.glob("*.png"))]
         review_file = cycle.run_dir / "model-review-round1.json"
-        data = json.loads(review_file.read_text(encoding="utf-8"))
-        data.pop("reviewed_html_sha256")  # 模拟本轮修复之前的记录格式
-        review_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        review_file.write_text(json.dumps({
+            "ok": True, "mock": True, "response": REVIEW_RESOLVED, "image_refs": refs,
+            # 无 reviewed_html_sha256 字段：模拟本轮修复之前的记录格式
+        }, ensure_ascii=False), encoding="utf-8")
+        (cycle.run_dir / "blind-review-round1.json").unlink()  # 只测 legacy 间接绑定路径
         status = cycle.reverify()
         self.assertEqual(status, "IMPROVED")
         review = json.loads(
@@ -488,7 +525,7 @@ class AcceptanceFixTests(GuidanceTestBase):
     def test_reverify_keeps_history_files(self):
         """复核文件按序号保留：第二次 reverify 不覆盖第一次的更正记录。"""
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}),
                            max_rounds=1)
         self.assertEqual(cycle.run(), "IMPROVED")
@@ -503,7 +540,7 @@ class AcceptanceFixTests(GuidanceTestBase):
 class GuidanceLoopTests(GuidanceTestBase):
     def test_full_improvement_loop(self):
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FakeAdapter(behavior={"first": "fixed"})
         cycle = self.cycle(baseline, gateway, adapter)
         status = cycle.run()
@@ -517,8 +554,11 @@ class GuidanceLoopTests(GuidanceTestBase):
         self.assertIn("ov:mobile:1", instruction)
         self.assertIn("¥99", instruction)
         # 诊断确实收到双视口截图（图像输入声明进入诊断提示）
-        self.assertIn("[图像输入]", gateway.calls[0]["prompt"])
-        self.assertEqual(gateway.calls[0]["images"], ["desktop.png", "mobile.png"])
+        # 诊断确实收到双视口截图（图像输入声明进入诊断提示）；calls[0] 是计划实例化（Mock）
+        diagnosis_calls = [c for c in gateway.calls if c["images"]]
+        self.assertTrue(diagnosis_calls)
+        self.assertIn("[图像输入]", diagnosis_calls[0]["prompt"])
+        self.assertEqual(diagnosis_calls[0]["images"], ["desktop.png", "mobile.png"])
         report = (cycle.run_dir / "report.md").read_text(encoding="utf-8")
         for section in ("看结果", "看变化", "看依据"):
             self.assertIn(section, report)
@@ -541,7 +581,7 @@ class GuidanceLoopTests(GuidanceTestBase):
 
     def test_regression_rejected_not_marked_improvement(self):
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FakeAdapter(behavior={"first": "regression"})
         cycle = self.cycle(baseline, gateway, adapter, max_rounds=1)
         status = cycle.run()
@@ -553,8 +593,8 @@ class GuidanceLoopTests(GuidanceTestBase):
 
     def test_second_round_runs_within_budget(self):
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED,
-                               DIAGNOSIS_MISSING_PRICE, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y,
+                               DIAGNOSIS_MISSING_PRICE, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FakeAdapter(behavior={"first": "regression", "second": "fixed"})
         cycle = self.cycle(baseline, gateway, adapter, max_rounds=2)
         status = cycle.run()
@@ -567,7 +607,7 @@ class GuidanceLoopTests(GuidanceTestBase):
 
     def test_decision_request_pauses_then_resume_completes(self):
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_NEEDS_USER, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_NEEDS_USER, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FakeAdapter(behavior={"first": "fixed"})
         cycle = self.cycle(baseline, gateway, adapter)
         status = cycle.run()
@@ -601,7 +641,7 @@ class GuidanceLoopTests(GuidanceTestBase):
             }],
         }, ensure_ascii=False)
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([preference_request, REVIEW_RESOLVED])
+        gateway = FakeGateway([preference_request, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FakeAdapter(behavior={"first": "fixed"})
         cycle = self.cycle(baseline, gateway, adapter)
         status = cycle.run()
@@ -619,7 +659,7 @@ class GuidanceLoopTests(GuidanceTestBase):
 
     def test_unknown_reconciled_from_artifacts(self):
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         from mentis.contracts import AttemptStatus
 
         adapter = FakeAdapter(behavior={"first": "fixed"}, status=AttemptStatus.UNKNOWN)
@@ -654,7 +694,7 @@ class GuidanceLoopTests(GuidanceTestBase):
     def test_failed_round_retried_after_review(self):
         """失败轮：核对（无活跃写入者）后续办，计入预算；不盲目重试。"""
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FailingThenFixedAdapter(behavior={"second": "fixed"})
         cycle = self.cycle(baseline, gateway, adapter, max_rounds=2)
         self.assertEqual(cycle.run(), "FAILED")  # 第一轮如实失败
@@ -666,6 +706,7 @@ class GuidanceLoopTests(GuidanceTestBase):
             restored = guidance_from_state(
                 cycle.run_dir / "state.json", adapter=adapter, gateway=gateway,
                 browser_capture=stub_capture, measure=file_aware_measure)
+            restored._blind_rng = _FixedCoin()  # 盲比 A/B 指派固定
             status = restored.resume(retry=True)
         finally:
             guidance_module.codex_processes_since = original
@@ -691,6 +732,7 @@ class GuidanceLoopTests(GuidanceTestBase):
             restored = guidance_from_state(
                 cycle.run_dir / "state.json", adapter=adapter, gateway=gateway,
                 browser_capture=stub_capture, measure=file_aware_measure)
+            restored._blind_rng = _FixedCoin()  # 盲比 A/B 指派固定
             status = restored.resume(retry=True)
         finally:
             guidance_module.codex_processes_since = original
@@ -704,7 +746,7 @@ class GuidanceLoopTests(GuidanceTestBase):
         freeze_baseline(baseline, run_dir)
         items = dict(preserved_items(run_dir / "v1"))
         self.assertEqual(items.get("讲师"), "林小豆，三年手冲教学经验")  # 素材整句
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         cycle = self.cycle(baseline, gateway, FakeAdapter(behavior={"first": "fixed"}))
         self.assertEqual(cycle.run(), "IMPROVED")  # 校准后不误报
         import json as _json
@@ -717,7 +759,7 @@ class GuidanceLoopTests(GuidanceTestBase):
     def test_reverify_corrects_false_regression(self):
         """复现真实误判：过严核对串造成假回归 → reverify 修正工具后透明更正。"""
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FakeAdapter(behavior={"first": "fixed"})
         cycle = self.cycle(baseline, gateway, adapter, max_rounds=1)
         original = guidance_module.preserved_items
@@ -744,7 +786,7 @@ class GuidanceLoopTests(GuidanceTestBase):
 
     def test_state_roundtrip_and_resume_ready(self):
         baseline = make_baseline(self.root)
-        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, REVIEW_RESOLVED])
+        gateway = FakeGateway([DIAGNOSIS_OVERFLOW, BLIND_AFTER_X, BLIND_AFTER_Y])
         adapter = FakeAdapter(behavior={"first": "fixed"})
         cycle = self.cycle(baseline, gateway, adapter)
         cycle.run()

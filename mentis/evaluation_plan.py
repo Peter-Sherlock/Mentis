@@ -26,6 +26,7 @@ from datetime import datetime
 import hashlib
 import json
 import re
+from pathlib import Path
 import uuid
 
 PLAN_SCHEMA = "mentis-eval-plan/1"
@@ -88,6 +89,7 @@ class PlanEntry:
     check_spec: dict = field(default_factory=dict)  # 可执行确定性检查；无则为 {}
     derived_by: str = "deterministic_assembly"
     note: str = ""
+    search_text: str = ""       # 候选→维度映射的检索文本（聚合条目含被聚合规则原文）
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -165,6 +167,17 @@ class EvaluationPlan:
             if e.check_spec.get("kind") == SPEC_FORM_FIELDS:
                 return list(e.check_spec.get("required_named", []))
         return []
+
+    def blind_review_standards(self) -> list:
+        """盲比复检可用的标准条目：排除 hypothesis（不作为依据）与 unverifiable（无从判）。"""
+        return [e for e in self.entries
+                if e.check_method in ("deterministic", "pairwise_blind", "user_judgment")
+                and e.category != "hypothesis"]
+
+    def search_blob(self, entry: "PlanEntry") -> str:
+        text = entry.search_text or "；".join(
+            [entry.name, entry.meaning, entry.pass_line, entry.observation, *entry.source_refs])
+        return text
 
 
 # ---- 任务素材事实推导（任务实例层；标注化素材格式，机械提取不发明） ----
@@ -308,6 +321,7 @@ def build_domain_entries(resources, realized_rule_ids=()) -> list:
     """
     entries = []
     hypotheses, advice = [], []
+    hypothesis_texts, advice_texts = [], []
     index = 0
     for resource in resources or []:
         rid = f"{resource.meta.id}@{resource.meta.version}"
@@ -315,9 +329,11 @@ def build_domain_entries(resources, realized_rule_ids=()) -> list:
             ref = f"{rid} {rule.rule_id}"
             if rule.tag == "hypothesis":
                 hypotheses.append(ref)
+                hypothesis_texts.append(rule.text)
                 continue
             if rule.tag in ("guideline", "preference"):
                 advice.append(ref)
+                advice_texts.append(rule.text)
                 continue
             if rule.rule_id in realized_rule_ids:
                 continue  # 已由任务实例条目落实（来源在其 source_refs 中）
@@ -353,6 +369,7 @@ def build_domain_entries(resources, realized_rule_ids=()) -> list:
             pass_line="作为专业依据呈现，不阻塞交付；用户选定后转为保留项",
             blocking=False, priority=3,
             disposition="等待用户反馈或专业评审引用；不自动修改",
+            search_text="；".join(advice_texts),
         ))
     if hypotheses:
         entries.append(PlanEntry(
@@ -364,6 +381,7 @@ def build_domain_entries(resources, realized_rule_ids=()) -> list:
             pass_line="不阻塞交付，也不作为修改依据（ADR-008 第 2 条）",
             blocking=False, priority=3,
             disposition="仅在获得案例证据后按计划修订程序转为可用标准",
+            search_text="；".join(hypothesis_texts),
         ))
     return entries
 
@@ -590,7 +608,8 @@ _OUT_OF_SCOPE = [
     "真实点击/表单提交与网络行为（静态观察不可得，运行时行为如实标注未验证）。",
     "部署表现、SEO、无障碍全面审计、跨浏览器兼容。",
     "用户满意度（由用户逐字反馈另行记录，不写入本计划）。",
-    "候选采纳路由与盲比复检（属 P2.4-V2，本计划只记录检查方式）。",
+    "协商式 sprint contract（执行器先提案）；盲比使用同源模型，不建立独立性"
+    "（V2 起候选路由与盲比复检已实现，见 eval_review.py）。",
 ]
 
 
@@ -668,6 +687,23 @@ def revise_plan(previous: EvaluationPlan, brief, material_text, reason_kind: str
     }
     new_plan.supersedes_sha256 = previous.sha256
     return new_plan
+
+
+# ---- 落盘与恢复 ----
+
+def load_latest_plan(run_dir) -> "EvaluationPlan | None":
+    """从运行目录恢复最新版本化计划；哈希按当前文件字节重算，不改写任何版本。"""
+    plan_dir = Path(run_dir) / "evaluation-plan"
+    plans = []
+    if plan_dir.is_dir():
+        for path in sorted(plan_dir.glob("plan-v*.json")):
+            try:
+                plan = EvaluationPlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                plan.sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+                plans.append(plan)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue  # 损坏的计划文件跳过，不留痕改写
+    return max(plans, key=lambda p: p.version) if plans else None
 
 
 # ---- 视图 ----
