@@ -131,6 +131,22 @@ class ManifestTests(IsolationFixture):
         self.assertIn(past.resolve(), protected)
         self.assertIn(export.resolve(), protected)
 
+    def test_target_arm_own_run_dir_is_not_protected_for_continuation(self):
+        """续办真实运行发现（2026-10-04）：重开窗时本臂自己的运行目录被当历史
+        运行保护，续办无法写 runner-state。修复：目标臂的运行记录不进 deny 清单
+        （内容只含本臂输入与记录）；其他臂运行记录仍然保护。"""
+        own = self.prepared.parent / "e2-runs" / "20261004_063142-360e-input-001-M"
+        own.mkdir(parents=True)
+        (own / "run-manifest.json").write_text(
+            json.dumps({"schema_version": "mentis-eval-run/2", "arm": "input-001/M"}), encoding="utf-8")
+        other = self.prepared.parent / "e2-runs" / "20261004_063142-9999-input-001-B-1"
+        other.mkdir(parents=True)
+        (other / "run-manifest.json").write_text(
+            json.dumps({"schema_version": "mentis-eval-run/2", "arm": "input-001/B-1"}), encoding="utf-8")
+        protected = iso.protected_manifest(self.suite_path, self.prepared, "input-001/M")
+        self.assertNotIn(own.resolve(), protected)
+        self.assertIn(other.resolve(), protected)
+
     def test_manifest_rejects_unknown_arm(self):
         with self.assertRaisesRegex(iso.IsolationError, "不在 prepare-report"):
             iso.protected_manifest(self.suite_path, self.prepared, "input-009/Z")

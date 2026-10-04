@@ -804,12 +804,16 @@ def protected_manifest(suite_path: Path, prepared_dir: Path, target_arm: str) ->
             continue
         protected.append(child.resolve())
     # 既有运行与评分导出含决定回答/样本身份，不能从父目录读回这些答案副本。
+    # 例外（2026-10-04 续办真实运行发现）：本臂自己的运行记录不保护——其工作区
+    # 就在运行目录内、续办必须可写，且内容只含本臂自己的输入与记录，无他组答案。
     for manifest in eval_root.glob("*/*/run-manifest.json"):
         try:
             record = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raise IsolationError(f"历史运行记录不可核对，拒绝开窗：{manifest}")
         if str(record.get("schema_version", "")).startswith("mentis-eval-run/"):
+            if record.get("arm") == target_arm:
+                continue
             protected.append(manifest.parent.resolve())
     for private_map in eval_root.glob("*/private-map.json"):
         protected.append(private_map.parent.resolve())
