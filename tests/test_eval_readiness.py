@@ -209,6 +209,47 @@ class ReadinessTests(unittest.TestCase):
         with self.assertRaises(AdmissionError):
             self.reopen(resumed).checked_continue("核对者", "再试", process_check=lambda _: [])
 
+    def test_question_pending_unknown_reconciles_to_needs_user_without_delegation(self):
+        """真实运行发现的缺口（2026-10-04，E1-04/B-1）：决定样本中执行器构建前
+        正确停止提问，但 turn 因失败子命令被保守判 unknown、工作区无产物——
+        原续办机制要求 index.html 而拒绝。修复后：核对续办不重发委托、不计续办
+        次数，按工作区 QUESTIONS.md 转 needs_user；回答仍只能经 eval-answer 注入。"""
+
+        class AsksDateThenBuilds(RecordingAdapter):
+            def _run(self, spec, status_override=None):
+                result = super()._run(spec, status_override)
+                ws = Path(spec.workspace)
+                if len(self.calls) == 1:
+                    result.status = AttemptStatus.UNKNOWN  # 失败子命令→保守 unknown 的模拟
+                    (ws / "QUESTIONS.md").write_text(
+                        "# 待确认：活动日期\n\ninput/copy-a.md 写 2027-05-07，"
+                        "input/copy-b.md 写 2027-05-14，请确认以哪一天为准。",
+                        encoding="utf-8")
+                    (ws / "index.html").unlink()  # 构建前正确停止：无产物
+                else:
+                    (ws / "QUESTIONS.md").unlink()
+                    (ws / "index.html").write_text(GOOD_PAGE, encoding="utf-8")
+                return result
+
+        adapter = AsksDateThenBuilds()
+        run = make_run(self.root, self.decisions(), "input-002/B-1", adapter, FakeGateway([]))
+        run.run()
+        self.assertEqual(run.state["status"], "unknown")
+        resumed = self.reopen(run, adapter)
+        result = resumed.checked_continue(
+            "核对者", "执行器写 QUESTIONS.md 后 62s 停止；工作区无产物（问题待决）",
+            process_check=lambda _: [])
+        self.assertEqual(result["runner_status"], "needs_user")
+        self.assertEqual(result["budget"]["used"]["attempts"], 1)  # 零新委托
+        self.assertEqual(result["checked_continuations"], 0)       # 不计续办次数
+        self.assertIn("日期", result["summary"]["pending"]["question"])
+        self.assertEqual(len(adapter.calls), 1)
+        answered = self.reopen(resumed, adapter).answer(
+            "以2027-05-14 14:00—16:00为准", "控制器", "controlled_simulation")
+        self.assertEqual(answered["budget"]["used"]["attempts"], 2)
+        self.assertIn("2027-05-14", adapter.full_prompts[-1])
+        self.assertEqual(answered["runner_status"], "finished")
+
     def test_m_revision_continuation_does_not_replan_or_rediagnose(self):
         run = self.unknown_run("input-002/M", [DIAGNOSIS_GENERIC])
         resumed = self.reopen(run, DatesAdapter(), [BLIND_AFTER_X, BLIND_AFTER_Y])

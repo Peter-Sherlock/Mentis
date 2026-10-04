@@ -861,10 +861,16 @@ class FairRun:
         if processes is None or processes:
             raise AdmissionError("未确认执行器已停止；拒绝解锁和续办")
         hashes = workspace_hashes(self.workspace)
-        if "index.html" not in hashes:
-            raise AdmissionError("作品缺失，无法核对续办")
-        if not artifact_complete and (not self.thread_id or self.budget.used["attempts"] >= self.budget.max_attempts):
+        questions_file = self.workspace / "QUESTIONS.md"
+        question_pending = (questions_file.is_file()
+                            and questions_file.read_text(encoding="utf-8").strip() != "")
+        if "index.html" not in hashes and not question_pending:
+            raise AdmissionError("作品缺失且无待决问题，无法核对续办")
+        if not artifact_complete and "index.html" in hashes and (
+                not self.thread_id or self.budget.used["attempts"] >= self.budget.max_attempts):
             raise AdmissionError("缺少原会话或委托预算耗尽，不能续办")
+        if artifact_complete and "index.html" not in hashes:
+            raise AdmissionError("artifact-complete 核对需要工作区已有作品")
         check = {"checked_by": checked_by, "basis": basis,
                  "checked_at": datetime.now().astimezone().isoformat(),
                  "processes": processes, "workspace_hashes": hashes,
@@ -878,7 +884,6 @@ class FairRun:
             self._restore_pack(self.state["checkpoint"]["before"])
         self._archive_previous()
         self.state["checks"].append(check)
-        self.state["checked_continuations"] += int(not artifact_complete)
         self.trace.emit("user", "executor.reconciled", f"核对者 {checked_by}；{basis[:120]}", status="ok")
         if artifact_complete:
             self.state["reconciliation_closed"] = True
@@ -886,6 +891,25 @@ class FairRun:
             summary.update(verdict="unknown", artifact_state="unknown_artifact_checked",
                            verdict_basis="人工核对作品已包含预期修改；原执行状态仍 unknown，未续办")
             return self._finish(summary, iso)
+        if "index.html" not in hashes:
+            # 问题待决核对（2026-10-04 真实运行发现的覆盖缺口）：决定样本中执行器
+            # 在构建前正确停止提问，但 turn 终态可能因失败子命令被保守判 unknown，
+            # 而基线循环只在 completed 上检查 QUESTIONS.md。此分支不重发委托、
+            # 不计续办次数：按工作区 QUESTIONS.md 走 needs_user（与基线循环
+            # completed 分支同语义），回答仍只能经 eval-answer 注入。
+            question = questions_file.read_text(encoding="utf-8")
+            if stage != "baseline" or not any(word in question for word in ("日期", "时间")):
+                raise AdmissionError("无产物且非日期类待决问题：续办机制不处理该状态")
+            seq = self.budget.used["attempts"]
+            write_json(self.run_dir / f"questions-{seq:03d}.json",
+                       {"question": question, "source": "executor",
+                        "attempt": pending.get("executor_attempt_id", "")})
+            self.state.setdefault("questions", []).append(question)
+            self._save_state()
+            material = self._materials(self.state["meta"])
+            return self._finish(
+                self._request_decision(material["pending"], question, "baseline-answer"), iso)
+        self.state["checked_continuations"] += 1
         self._save_state()
         try:
             unlock = getattr(self.adapter, "release_reconciled_lock", None)
