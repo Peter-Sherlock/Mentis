@@ -26,10 +26,9 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
         cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=600)
     try:
-        payload = json.loads(proc.stdout.strip().splitlines()[-1]
-                             if proc.stdout.strip() else "{}")
-    except (json.JSONDecodeError, IndexError):
-        payload = {"ok": False, "problems": [proc.stdout[-200:] + proc.stderr[-200:]]}
+        payload = json.loads(proc.stdout.strip()) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        payload = {"ok": False, "problems": [(proc.stdout[-200:] + proc.stderr[-200:])]}
     print(f"[{datetime.now().isoformat(timespec='seconds')}] attempt {attempt} "
           f"ok={payload.get('ok')} codex={payload.get('codex_status')} "
           f"problems={str(payload.get('problems'))[:160]}", flush=True)
