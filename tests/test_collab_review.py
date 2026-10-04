@@ -12,13 +12,16 @@
 
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from mentis.collab import Collaboration
 from mentis.contracts import AttemptStatus
-from mentis.render_measurement import RenderMeasurement, ViewportMeasurement
+from mentis.render_measurement import (RenderMeasurement, ViewportMeasurement,
+                                       measure_page)
 
 try:
     from tests.test_collab import GOOD_PAGE, BAD_PAGE
@@ -260,6 +263,28 @@ class ProfessionalReviewTests(unittest.TestCase):
         self.assertTrue(verify_doc["measurement_unknown"])
         report = (collab.run_dir / "report.md").read_text(encoding="utf-8")
         self.assertIn("UNVERIFIED", report)
+
+    def test_real_abnormal_browser_exit_yields_unverified(self):
+        """审计场景真进程复现（2026-10-03）：受限 shell 中浏览器异常退出 →
+        修订后复检观察不可信 → UNVERIFIED。这是"观察不可信则不验收"按设计
+        生效，不是误判；修复方向是让浏览器能跑（环境），不是放宽判定。"""
+        def real_failing_measure(page, out_dir):
+            # python.exe 充当必然异常退出的"浏览器"（真实子进程，零 Mock）
+            return measure_page(page, out_dir, browser=sys.executable, timeout_s=15)
+
+        adapter = ReviewAdapter(revision_page=GOOD_PAGE + V2_MARKER)
+        collab = self.make(
+            FakeGateway([DIAGNOSIS_GENERIC, BLIND_AFTER_X, BLIND_AFTER_Y]), adapter,
+            measure=real_failing_measure)
+        self.assertEqual(collab.run(), "UNVERIFIED")
+        self.assertFalse(collab.session.attempts[-1].accepted)
+        verify_doc = json.loads((collab.run_dir / "professional-verify.json")
+                                .read_text(encoding="utf-8"))
+        self.assertTrue(verify_doc["measurement_unknown"])
+        viewport_errors = [e for vp in verify_doc["measurement_v2"].values()
+                           for e in vp["errors"]]
+        self.assertTrue(any("退出码" in e for e in viewport_errors),
+                        "真进程异常退出应逐视口记账错误")
 
     def test_revision_regression_not_delivered_snapshot_kept(self):
         """修订造成保留项回归：不交付、不接受；修订前快照保留。"""

@@ -274,6 +274,21 @@ def _parse_report(dump: str) -> dict:
     return json.loads(html_mod.unescape(match.group(1)))
 
 
+_VERSION_PATTERN = re.compile(r"\d+(\.\d+)+")
+
+
+def extract_browser_version(stdout: str, returncode: int) -> str:
+    """只在 stdout 确实像版本号时采信，否则 unknown。
+
+    Windows 上 chrome.exe --version 曾打印界面提示（如"已在现有的浏览器会话中
+    打开。"）且退出码 0——把这类文本当版本号会污染测量记录（2026-10-03 复现）。
+    """
+    text = (stdout or "").strip()
+    if returncode == 0 and text and _VERSION_PATTERN.search(text):
+        return text
+    return "unknown"
+
+
 def measure_viewport(page: Path, name: str, width: int, height: int, out_dir: Path,
                      executable: Path, timeout_s: int, runner) -> ViewportMeasurement:
     result = ViewportMeasurement(name=name, width=width, height=height)
@@ -304,6 +319,11 @@ def measure_viewport(page: Path, name: str, width: int, height: int, out_dir: Pa
         return result
     except (ValueError, json.JSONDecodeError) as exc:
         result.errors.append(f"测量报告解析失败: {exc}")
+        return result
+    except OSError as exc:
+        # 浏览器进程无法创建（权限受限/可执行文件缺失）：逐视口记账，
+        # 不让观察链崩溃——下游按"测量不可信"处理，不冒充零溢出通过。
+        result.errors.append(f"浏览器无法启动: {type(exc).__name__}: {exc}")
         return result
     finally:
         shutil.rmtree(profile, ignore_errors=True)
@@ -355,7 +375,7 @@ def measure_page(page: str | Path, output_dir: str | Path, browser: str | Path |
     try:
         version_proc = run([str(executable), "--version"], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=10)
-        version = version_proc.stdout.strip() if version_proc.returncode == 0 else "unknown"
+        version = extract_browser_version(version_proc.stdout, version_proc.returncode)
     except (OSError, subprocess.TimeoutExpired):
         version = "unknown"
     record = RenderMeasurement(

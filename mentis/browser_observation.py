@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+from mentis.render_measurement import extract_browser_version
+
 
 VIEWPORTS = {"desktop": (1280, 800), "mobile": (390, 844)}
 # Windows 无界面 Chrome 有 500px 最小窗口宽度（实测 2026-09-28，Chrome 154）：
@@ -84,7 +86,7 @@ def capture_local_html(page: str | Path, output_dir: str | Path,
     try:
         version_proc = run([str(executable), "--version"], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=10)
-        version = version_proc.stdout.strip() if version_proc.returncode == 0 else "unknown"
+        version = extract_browser_version(version_proc.stdout, version_proc.returncode)
     except (OSError, subprocess.TimeoutExpired):
         version = "unknown"
     record = BrowserObservation(
