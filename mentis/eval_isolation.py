@@ -840,21 +840,35 @@ def verification_targets(protected: list[Path]) -> list[dict]:
     return targets
 
 
-def _codex_processes_since(since_iso: str) -> list[dict] | None:
+def _codex_processes_since(since_iso: str, scope: str = "") -> list[dict] | None:
     """核对执行器是否仍存活（PowerShell CIM 按创建时间过滤）。
 
     返回 None 表示查询失败——调用方必须按"可能存活"处理（保守保留窗口）。
+    匹配语义（2026-10-04 精确化，修复 IDE/MCP 辅助进程误报）：
+    - codex 名进程：除已知 IDE 常驻（app-server/computer-use/cua_node）外一律视为
+      潜在写入者（受测执行器本体是 codex.exe，不得漏判）；
+    - node 名进程：仅在命令行引用 scope（本运行的工作区/运行目录）时视为潜在
+      写入者；会话工具的无关 MCP server（如 ./mcp/server.mjs）与受测工作区无关，
+      不再阻塞释放。scope 为空时保持旧行为（任何 node 都算，保守）。
     """
     try:
         since_iso = datetime.fromisoformat(since_iso).isoformat()
     except ValueError:
         return None
+    if scope:
+        if "'" in scope:
+            return None  # scope 路径含单引号无法安全内插，按"查询失败"保守处理
+        node_clause = ("-or ($_.Name -match 'node' "
+                       "-and $_.CommandLine -match [regex]::Escape('" + scope + "'))")
+    else:
+        node_clause = "-or $_.Name -match 'node'"
     script = (f"$since = Get-Date('{since_iso}'); "
               "Get-CimInstance Win32_Process | Where-Object { "
               "$_.ProcessId -ne $PID "
               "-and $_.CreationDate -and $_.CreationDate -gt $since "
-              "-and $_.Name -match 'node|codex' "
-              "-and $_.CommandLine -notmatch 'app-server|computer-use' } | "
+              "-and (($_.Name -match 'codex' "
+              "-and $_.CommandLine -notmatch 'app-server|computer-use|cua_node') "
+              + node_clause + ") } | "
               "Select-Object ProcessId,Name,CreationDate,CommandLine | "
               "ConvertTo-Json -Depth 3")
     try:
@@ -962,7 +976,7 @@ def run_probe_flow(suite_path: Path, prepared_dir: Path, target_arm: str,
                         "window_released": False})
         return outcome
     except Exception as exc:  # 探测/写证据异常：先核对执行器存活再决定是否恢复
-        alive = _codex_processes_since(log["created_at"])
+        alive = _codex_processes_since(log["created_at"], scope=str(workspace))
         if alive is None or alive:
             return {"ok": False, "debug": False, "evidence": None,
                     "problems": [f"探测异常且执行器可能仍存活（{(alive or []) and len(alive)} 进程"
@@ -1037,7 +1051,7 @@ def _post_failure(log: dict, adapter, probe_dir: Path) -> dict:
 
     存活查询失败（None）按"可能存活"保守处理——窗口与锁保留。
     """
-    alive = _codex_processes_since(log["created_at"])
+    alive = _codex_processes_since(log["created_at"], scope=str(probe_dir))
     if alive is None or alive:
         return {"ok": False, "debug": False, "evidence": None,
                 "window_kept": True, "alive_processes": alive or [],
@@ -1412,7 +1426,7 @@ def eval_isolate_cli(args) -> dict:
                         lock.read_text(encoding="utf-8")).get("window_dir", "")
                 except (OSError, json.JSONDecodeError):
                     pass
-        alive = _codex_processes_since(log["created_at"])
+        alive = _codex_processes_since(log["created_at"], scope=str(isolation_dir))
         if alive is None or alive:
             return {"ok": False, "window_id": log["window_id"], "window_kept": True,
                     "alive_processes": alive or [], "next": "未确认执行器停止；不恢复答案读取权限"}

@@ -409,6 +409,38 @@ class ProbeTests(IsolationFixture):
                       ("T1", "junction")], "")
         self.assertEqual(problems, [], problems)
 
+    @unittest.skipUnless(NT, "CIM 进程查询仅在 Windows 验证")
+    def test_alive_check_scope_excludes_unrelated_node_process(self):
+        """存活门控精确化：node 进程命令行引用 scope 才算写入者；无关 node 不计。"""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("本机无 node.exe，无法做真实进程演练")
+        import time as _time
+        scope_dir = self.root / "run-ws"
+        scope_dir.mkdir(exist_ok=True)
+        since = datetime.now().astimezone().isoformat()
+        _time.sleep(0.2)
+        unrelated = subprocess.Popen(
+            [node, "-e", "setTimeout(()=>process.exit(0), 15000)"],
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        related = subprocess.Popen(
+            [node, "-e", f"setTimeout(()=>process.exit(0), 15000)  /* {scope_dir} */"],
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        self.addCleanup(unrelated.kill)
+        self.addCleanup(related.kill)
+        try:
+            with_scope = iso._codex_processes_since(since, scope=str(scope_dir))
+            self.assertIsNotNone(with_scope)
+            pids = {row["pid"] for row in with_scope}
+            self.assertIn(related.pid, pids, "引用 scope 的 node 必须计入")
+            self.assertNotIn(unrelated.pid, pids, "无关 node 不得计入")
+            without_scope = iso._codex_processes_since(since)
+            self.assertIsNotNone(without_scope)
+            pids2 = {row["pid"] for row in without_scope}
+            self.assertIn(unrelated.pid, pids2, "无 scope 时保持保守旧行为")
+        finally:
+            unrelated.kill(); related.kill()
+
     def _other_drive(self) -> str | None:
         for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
             if Path(f"{letter}:\\").exists() and Path(letter + ":\\").drive != Path.cwd().drive:

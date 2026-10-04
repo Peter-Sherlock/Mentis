@@ -851,7 +851,13 @@ class FairRun:
         from mentis.eval_isolation import _codex_processes_since
 
         pending = self.state["pending"]
-        processes = (process_check or _codex_processes_since)(pending["started_at"])
+        if process_check is not None:
+            processes = process_check(pending["started_at"])
+        else:
+            # 真实查询带 scope：node 名进程仅在本运行路径上出现才算写入者
+            # （会话工具的无关 MCP server 不阻塞续办）；测试替身保持单参签名。
+            processes = _codex_processes_since(pending["started_at"],
+                                               scope=str(self.run_dir))
         if processes is None or processes:
             raise AdmissionError("未确认执行器已停止；拒绝解锁和续办")
         hashes = workspace_hashes(self.workspace)
