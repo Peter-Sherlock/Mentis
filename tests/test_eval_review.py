@@ -25,10 +25,10 @@ from mentis.evaluation_plan import build_evaluation_plan
 
 try:
     from tests.test_collab import GOOD_PAGE, FakeAdapter, stub_capture
-    from tests.test_guidance import DIAGNOSIS_GENERIC, FakeGateway, _FixedCoin
+    from tests.test_guidance import DIAGNOSIS_GENERIC, FakeGateway, _FixedCoin, file_aware_measure
 except ImportError:  # discover -s tests 以顶层模块导入
     from test_collab import GOOD_PAGE, FakeAdapter, stub_capture
-    from test_guidance import DIAGNOSIS_GENERIC, FakeGateway, _FixedCoin
+    from test_guidance import DIAGNOSIS_GENERIC, FakeGateway, _FixedCoin, file_aware_measure
 
 GOAL = "为拾光咖啡工作坊制作活动介绍页"
 
@@ -148,6 +148,7 @@ class CollabRoutingFlowTests(unittest.TestCase):
         self.base = Path(self._tmp.name)
 
     def make(self, responses, adapter=None, **kw):
+        kw.setdefault("measure", file_aware_measure)
         collab = Collaboration(
             goal=GOAL, adapter=adapter or FakeAdapter(behavior={"first": "good"}),
             gateway=FakeGateway(responses), browser_capture=stub_capture,

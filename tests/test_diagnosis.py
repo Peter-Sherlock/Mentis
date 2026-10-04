@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 import urllib.error
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -307,7 +308,11 @@ class CliTests(unittest.TestCase):
         )
 
     def test_no_credentials_exits_with_guidance(self):
-        result = self._run_cli("--page", "runtime/demo/event_page_v1.html")
+        # 临时工作树没有主检出的历史 runtime 演示文件；测试应自带页面。
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "page.html"
+            page.write_text("<h1>本地诊断夹具</h1>", encoding="utf-8")
+            result = self._run_cli("--page", str(page))
         if result.returncode == 0:
             self.fail("无凭据不应成功")
         self.assertIn("缺少凭据", result.stdout + result.stderr)

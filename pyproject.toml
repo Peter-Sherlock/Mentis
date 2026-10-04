@@ -1,6 +1,6 @@
 [project]
 name = "mentis"
-version = "0.6.0"
+version = "0.19.2"
 description = "Mentis：代表非专业用户与执行型 Agent 持续协作的代理（P3.1 执行器与产物观察）"
 requires-python = ">=3.10"
 

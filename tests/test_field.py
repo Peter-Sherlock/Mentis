@@ -13,8 +13,10 @@ from mentis.field import FieldSession, record_feedback, run_field_feedback, run_
 
 try:
     from tests.test_collab import FakeAdapter, stub_capture
+    from tests.test_guidance import file_aware_measure
 except ImportError:  # discover -s tests 以顶层模块导入
     from test_collab import FakeAdapter, stub_capture
+    from test_guidance import file_aware_measure
 
 
 def make_factory(adapter, design: bool = False, base_dir=None):
@@ -25,7 +27,7 @@ def make_factory(adapter, design: bool = False, base_dir=None):
             goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）",
             mode="design" if design else "autonomous",
             adapter=adapter, gateway=None, browser_capture=stub_capture,
-            use_model=False, interactive=False, base_dir=base_dir)
+            measure=file_aware_measure, use_model=False, interactive=False, base_dir=base_dir)
     return factory
 
 

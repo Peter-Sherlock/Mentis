@@ -371,7 +371,7 @@ class ExceptionFinalizeTests(unittest.TestCase):
         def factory():
             collab = Collaboration(
                 goal="为拾光咖啡工作坊制作活动介绍页（机制冒烟）", adapter=FakeAdapter(),
-                gateway=None, browser_capture=stub_capture, use_model=False,
+                gateway=None, browser_capture=stub_capture, measure=file_aware_measure, use_model=False,
                 interactive=False, base_dir=self.root / "collab")
 
             def boom():

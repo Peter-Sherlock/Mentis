@@ -53,6 +53,7 @@ class CallRecord:
     error: str = ""
     mock: bool = False        # Mock 调用必须显式标注
     image_refs: list = field(default_factory=list)  # ["名称;sha256前12位"]，不含图像本体
+    http_attempted: bool = False  # 实际进入 HTTP 传输；缺凭据/输入拒收/注入替身不计
 
 
 class GatewayError(RuntimeError):
@@ -66,6 +67,7 @@ class ModelGateway:
         self._transport = transport if transport is not None else self._http_transport
         self.force_mock = False  # fixture 模式下由调用方置 True，记录必须标注 Mock
         self.calls: list[CallRecord] = []
+        self._http_attempts = 0
 
     @property
     def api_key(self) -> str:
@@ -116,6 +118,7 @@ class ModelGateway:
                 self.calls.append(record)
                 return record
         started = time.monotonic()
+        attempts_before = self._http_attempts
         try:
             if images:
                 result = self._transport(system, user_prompt, json_mode, images)
@@ -140,6 +143,7 @@ class ModelGateway:
         except Exception as exc:  # 异常消息可能含请求内容或凭据；只记录类型
             record.error = type(exc).__name__
         record.latency_ms = int((time.monotonic() - started) * 1000)
+        record.http_attempted = self._http_attempts > attempts_before
         self.calls.append(record)
         return record
 
@@ -190,6 +194,7 @@ class ModelGateway:
             method="POST",
         )
         try:
+            self._http_attempts += 1
             with urllib.request.urlopen(req, timeout=self.config.timeout_s) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:

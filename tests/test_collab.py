@@ -83,10 +83,14 @@ def stub_capture(index, out_dir):
 
 
 def make_collab(**kw):
+    try:
+        from tests.test_guidance import file_aware_measure
+    except ImportError:
+        from test_guidance import file_aware_measure
     defaults = dict(
         goal="为拾光咖啡工作坊制作活动介绍页",
         adapter=FakeAdapter(), gateway=None, browser_capture=stub_capture,
-        use_model=False, interactive=False,
+        measure=file_aware_measure, use_model=False, interactive=False,
     )
     defaults.update(kw)
     return Collaboration(**defaults)

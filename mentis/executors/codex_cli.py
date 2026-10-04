@@ -482,6 +482,22 @@ class CodexCliAdapter:
                        "created_at": datetime.now().isoformat(timespec="seconds")}, out)
         return path
 
+    def release_reconciled_lock(self, root: Path, started_at: str, expected_attempt_id: str) -> None:
+        """调用方已完成停写核对；只删除该工作区的旧锁，拒绝较新的写入者锁。"""
+        root = Path(root).resolve()
+        digest = hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest()[:20]
+        path = self.lock_dir / f"{digest}.lock"
+        if not path.exists():
+            return
+        lock = json.loads(path.read_text(encoding="utf-8"))
+        created = datetime.fromisoformat(lock["created_at"]).astimezone()
+        started = datetime.fromisoformat(started_at).astimezone()
+        # 适配器加锁稍晚于运行器记开始时间，允许同一次委托的秒级偏差。
+        if (Path(lock["workspace"]).resolve() != root or (created - started).total_seconds() > 5
+                or not expected_attempt_id or lock["attempt_id"] != expected_attempt_id):
+            raise ExecutorBusy("工作区写入锁不属于已核对的旧委托")
+        path.unlink()
+
     @staticmethod
     def collect_artifacts(root: Path) -> list[str]:
         """列出当前 Git 脏文件；调用者需比较委托前后基线，不能仅凭列表归因。"""

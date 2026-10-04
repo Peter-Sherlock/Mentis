@@ -27,10 +27,10 @@ from mentis.observation import observe_structure
 
 try:
     from tests.test_collab import BAD_PAGE, GOOD_PAGE, FakeAdapter, stub_capture
-    from tests.test_guidance import FakeGateway
+    from tests.test_guidance import FakeGateway, file_aware_measure
 except ImportError:  # discover -s tests 以顶层模块导入
     from test_collab import BAD_PAGE, GOOD_PAGE, FakeAdapter, stub_capture
-    from test_guidance import FakeGateway
+    from test_guidance import FakeGateway, file_aware_measure
 
 GOAL = "为拾光咖啡工作坊制作活动介绍页"
 
@@ -194,7 +194,7 @@ class HardRequirementReadsPlanTests(unittest.TestCase):
 
     def make(self, material=COPY_DECK, **kw):
         defaults = dict(goal=GOAL, adapter=FakeAdapter(), gateway=None,
-                        browser_capture=stub_capture, use_model=False,
+                        browser_capture=stub_capture, measure=file_aware_measure, use_model=False,
                         interactive=False, base_dir=self.base, material_text=material)
         defaults.update(kw)
         return Collaboration(**defaults)
@@ -261,7 +261,7 @@ class OrderingAndRevisionTests(unittest.TestCase):
 
     def make(self, **kw):
         defaults = dict(goal=GOAL, adapter=FakeAdapter(), gateway=None,
-                        browser_capture=stub_capture, use_model=False,
+                        browser_capture=stub_capture, measure=file_aware_measure, use_model=False,
                         interactive=False, base_dir=self.base)
         defaults.update(kw)
         return Collaboration(**defaults)

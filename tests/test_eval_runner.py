@@ -186,9 +186,9 @@ class RunnerTests(unittest.TestCase):
             manifest = run.run()
         summary = manifest["summary"]
         self.assertEqual(summary["verdict"], "improved")
-        # 模型预算：诊断 1 次 + 盲比复查 1 次（盲比内部两序请求计 1 次复查预算）
+        # 计划实例化 + 诊断 + 盲比复查各1单位；两序盲比分开记录实际请求。
         self.assertEqual(manifest["budget"]["used"],
-                         {"attempts": 1, "revisions": 1, "model_calls": 2})
+                         {"attempts": 1, "revisions": 1, "model_calls": 3})
         self.assertTrue(summary["blind"]["consistent"])
         # 计划先于委托（事件序）
         from mentis.trace import load_events
@@ -200,7 +200,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((run.run_dir / "blind-review.json").is_file())
 
     def test_mentis_arm_qualified_no_change_zero_dispatch(self):
-        """M 臂合格不改：零委托、零修订；模型调用仅诊断 1 次。"""
+        """M 臂合格不改：零委托、零修订；计划与诊断各1单位。"""
         prepared = make_prepared(self.root)
         adapter = FakeAdapter(behavior={"first": "good"})
         run = make_run(self.root, prepared, "input-002/M", adapter,
@@ -208,11 +208,11 @@ class RunnerTests(unittest.TestCase):
         with self.patch_admission(PASSING_ISO):
             manifest = run.run()
         self.assertEqual(manifest["budget"]["used"]["attempts"], 0)
-        self.assertEqual(manifest["budget"]["used"]["model_calls"], 1)
+        self.assertEqual(manifest["budget"]["used"]["model_calls"], 2)
         self.assertEqual(manifest["summary"]["verdict"], "no_change")
 
     def test_mentis_arm_budget_exhausted_honest_stop(self):
-        """模型预算 1 次：诊断后盲比被预算拦截 → 如实收尾 unverified，不冒充。"""
+        """模型预算1单位：计划后诊断被拦截，如实收尾 unverified。"""
         prepared = make_prepared(self.root)
         policy = dict(POLICY, max_guidance_model_calls=1)
         arm_dir = prepared / "input-002/M"

@@ -127,6 +127,7 @@ def main(argv=None) -> int:
                       help="探测目标组目录（相对 prepared，如 input-001/M）")
     eiso.add_argument("--no-codex", action="store_true",
                       help="只探测 Mentis 环境端；准入要求 Codex 端证据时不得使用")
+    eiso.add_argument("--run-spec", default="", help="E2 开窗前冻结的代码/协议契约")
     eplan = sub.add_parser("eval-plan",
                            help="P2.4-V1 评估计划先行：为某目标组装并打印评估计划"
                                 "（默认离线组装；--real 调模型实例化领域规则）")
@@ -148,7 +149,48 @@ def main(argv=None) -> int:
     erun.add_argument("--suite-sha", required=True, help="冻结 suite sha256（准入绑定）")
     erun.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="冻结清单路径")
     erun.add_argument("--out", default="runtime/evaluation/e1-runs", help="运行记录根目录")
+    erun.add_argument("--run-spec", required=True, help="eval-freeze 生成的代码/协议契约（E2 准入必需）")
+    efreeze = sub.add_parser("eval-freeze", help="干净提交上冻结 E2 代码/协议契约；开窗前执行")
+    efreeze.add_argument("--suite", default="docs/evaluation/e1/suite.json")
+    efreeze.add_argument("--out", required=True)
+    eanswer = sub.add_parser("eval-answer", help="待决后注入受控回答；答案不得提前送入运行组")
+    eanswer.add_argument("--run", required=True)
+    eanswer.add_argument("--answer", required=True)
+    eanswer.add_argument("--answered-by", required=True)
+    eanswer.add_argument("--source", choices=["controlled_simulation", "human_user"], default="controlled_simulation")
+    econtinue = sub.add_parser("eval-continue", help="unknown 停写核对后至多续办一次")
+    econtinue.add_argument("--run", required=True)
+    econtinue.add_argument("--checked-by", required=True)
+    econtinue.add_argument("--basis", required=True)
+    econtinue.add_argument("--artifact-complete", action="store_true", help="只核对作品，保留 unknown，不再委托")
+    esummary = sub.add_parser("eval-summary", help="评价侧20臂汇总与作品盲评导出")
+    esummary.add_argument("--runs", required=True)
+    esummary.add_argument("--suite", default="docs/evaluation/e1/suite.json")
+    esummary.add_argument("--out", required=True)
+    eguard = sub.add_parser("eval-guard-report", help="根据独立人工标签计算守卫误伤率；缺标签报 unknown")
+    eguard.add_argument("--review", required=True)
     args = parser.parse_args(argv)
+
+    if args.command in ("eval-freeze", "eval-summary", "eval-guard-report", "eval-answer", "eval-continue"):
+        from mentis.eval_readiness import ReadinessError, freeze_spec, summarize_runs, guard_rates
+        from mentis.eval_runner import AdmissionError, FairRun
+
+        try:
+            if args.command == "eval-freeze":
+                result = freeze_spec(Path(args.out), Path(args.suite))
+            elif args.command == "eval-summary":
+                result = summarize_runs(Path(args.runs), Path(args.suite), Path(args.out))
+            elif args.command == "eval-guard-report":
+                result = guard_rates(Path(args.review))
+            elif args.command == "eval-answer":
+                result = FairRun.reopen(args.run).answer(args.answer, args.answered_by, args.source)
+            else:
+                result = FairRun.reopen(args.run).checked_continue(args.checked_by, args.basis, args.artifact_complete)
+        except (AdmissionError, ReadinessError, OSError, ValueError) as exc:
+            print(f"操作未执行：{exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
 
     if args.command == "eval-run":
         from mentis.eval_runner import AdmissionError, FairRun
@@ -158,12 +200,12 @@ def main(argv=None) -> int:
             sys.stdout.reconfigure(encoding="utf-8")
         try:
             manifest = FairRun(args.prepared, args.arm, args.out, args.suite_sha,
-                               args.evidence, suite_path=args.suite).run()
+                               args.evidence, suite_path=args.suite, run_spec=args.run_spec).run()
         except (AdmissionError, IsolationError) as exc:
             print(f"运行未启动：{exc}", file=sys.stderr)
             return 2
         print(json.dumps(manifest, ensure_ascii=False, indent=2))
-        return 0 if manifest["artifact"]["exists"] else 1
+        return 0 if manifest["runner_status"] == "finished" and manifest["artifact"]["exists"] else 1
 
     if args.command == "eval-plan":
         from mentis.capabilities.registry import load_registry

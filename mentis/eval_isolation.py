@@ -164,11 +164,18 @@ $results | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $OutFile -Encoding ut
 '''
 
 
+def _native_powershell_env() -> dict:
+    # Codex 的 PowerShell 7 模块路径不能继承给 Windows PowerShell 5。
+    # 后者从自己的 PSHOME/系统配置初始化模块路径。Windows 环境键通常为大写。
+    return {key: value for key, value in os.environ.items() if key.casefold() != "psmodulepath"}
+
+
 def _run_ps_script(script_path: Path, list_file: Path, out_file: Path) -> list[dict]:
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
          str(script_path), "-ListFile", str(list_file), "-OutFile", str(out_file)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        env=_native_powershell_env())
     if not out_file.is_file():
         raise IsolationError(
             f"ACL 脚本未产出结果（rc={proc.returncode}）：{(proc.stdout + proc.stderr)[:200]}")
@@ -671,7 +678,7 @@ def build_probe_targets(verification_targets: list[dict], suite_path: Path) -> l
     targets.append({"id": "GIT-ANSWER-COPY", "kind": "git_history",
                     "repo": str(repo), "spec": spec})
     targets.append({"id": "GIT-METADATA", "kind": "file",
-                    "path": str(repo / ".git" / "config")})
+                    "path": str(_git_metadata_roots(repo)[-1] / "config")})
     return targets
 
 
@@ -713,7 +720,7 @@ def _repo_root_for(suite_path: Path) -> Path | None:
     """
     suite_path = Path(suite_path).resolve()
     for parent in suite_path.parents:
-        if not (parent / ".git").is_dir():
+        if not (parent / ".git").exists():
             continue
         try:
             relative = suite_path.relative_to(parent).as_posix()
@@ -722,6 +729,20 @@ def _repo_root_for(suite_path: Path) -> Path | None:
         if relative.startswith("docs/evaluation/"):
             return parent
     return None
+
+
+def _git_metadata_roots(repo: Path) -> list[Path]:
+    """工作树的 .git 是指针文件；共同 Git 数据库也必须拒读，不能只遮住指针。"""
+    marker = repo / ".git"
+    if marker.is_dir():
+        return [marker.resolve()]
+    content = marker.read_text(encoding="utf-8").strip()
+    if not content.startswith("gitdir: "):
+        raise IsolationError("Git 工作树指针无效，拒绝开窗")
+    gitdir = (repo / content.removeprefix("gitdir: ")).resolve()
+    common_file = gitdir / "commondir"
+    common = (gitdir / common_file.read_text(encoding="utf-8").strip()).resolve() if common_file.is_file() else gitdir
+    return [marker.resolve(), common]
 
 
 def protected_manifest(suite_path: Path, prepared_dir: Path, target_arm: str) -> list[Path]:
@@ -759,7 +780,7 @@ def protected_manifest(suite_path: Path, prepared_dir: Path, target_arm: str) ->
     protected = [suite_path.parent.resolve(), report_path.resolve()]
     repo_root = _repo_root_for(suite_path)
     if repo_root is not None:
-        protected.append((repo_root / ".git").resolve())
+        protected.extend(_git_metadata_roots(repo_root))
     for arm_rel, is_target in arms.items():
         if not is_target:
             protected.append(prepared_dir / arm_rel)
@@ -772,6 +793,16 @@ def protected_manifest(suite_path: Path, prepared_dir: Path, target_arm: str) ->
         if not (child / "prepare-report.json").is_file():
             continue
         protected.append(child.resolve())
+    # 既有运行与评分导出含决定回答/样本身份，不能从父目录读回这些答案副本。
+    for manifest in eval_root.glob("*/*/run-manifest.json"):
+        try:
+            record = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise IsolationError(f"历史运行记录不可核对，拒绝开窗：{manifest}")
+        if str(record.get("schema_version", "")).startswith("mentis-eval-run/"):
+            protected.append(manifest.parent.resolve())
+    for private_map in eval_root.glob("*/private-map.json"):
+        protected.append(private_map.parent.resolve())
     return protected
 
 
@@ -804,17 +835,24 @@ def _codex_processes_since(since_iso: str) -> list[dict] | None:
 
     返回 None 表示查询失败——调用方必须按"可能存活"处理（保守保留窗口）。
     """
+    try:
+        since_iso = datetime.fromisoformat(since_iso).isoformat()
+    except ValueError:
+        return None
     script = (f"$since = Get-Date('{since_iso}'); "
               "Get-CimInstance Win32_Process | Where-Object { "
               "$_.ProcessId -ne $PID "
               "-and $_.CreationDate -and $_.CreationDate -gt $since "
-              "-and $_.Name -match 'node|codex' } | "
+              "-and $_.Name -match 'node|codex' "
+              "-and $_.CommandLine -notmatch 'app-server|computer-use' } | "
               "Select-Object ProcessId,Name,CreationDate,CommandLine | "
               "ConvertTo-Json -Depth 3")
     try:
         proc = subprocess.run(["powershell", "-NoProfile", "-Command", script],
                               capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=60)
+                              errors="replace", timeout=30, env=_native_powershell_env())
+        if proc.returncode != 0:
+            return None
         payload = json.loads(proc.stdout) if proc.stdout.strip() else []
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         return None
@@ -826,7 +864,7 @@ def _codex_processes_since(since_iso: str) -> list[dict] | None:
 
 def run_probe_flow(suite_path: Path, prepared_dir: Path, target_arm: str,
                    isolation_dir: Path, adapter=None, python_exe: str = sys.executable,
-                   codex_timeout_s: int = 540) -> dict:
+                   codex_timeout_s: int = 540, run_spec: Path | None = None) -> dict:
     """完整探测流程：审计 → 事务开窗 → 双端确定性探针 →（全部通过时）写正式证据。
 
     - adapter=None 只产生单端调试结果（debug-mentis-probe.json），不写正式
@@ -842,6 +880,14 @@ def run_probe_flow(suite_path: Path, prepared_dir: Path, target_arm: str,
     frozen = {check["name"]: check for check in audit["checks"]}
     if audit["status"] == "invalid" or not frozen["frozen_source_hashes"]["passed"]:
         raise IsolationError(f"冻结源核对未通过: {audit.get('blocking_reasons')}")
+    execution_binding = {}
+    from mentis.eval_readiness import workspace_hashes
+
+    package_hashes = workspace_hashes(prepared_dir / target_arm)
+    if run_spec:
+        from mentis.eval_readiness import binding
+
+        execution_binding = binding(Path(run_spec), audit["suite_sha256"])
     protected = protected_manifest(suite_path, prepared_dir, target_arm)
     targets = verification_targets(protected)
     probe_targets = build_probe_targets(targets, suite_path)
@@ -852,6 +898,8 @@ def run_probe_flow(suite_path: Path, prepared_dir: Path, target_arm: str,
         "target_arm": target_arm,
         "verification_targets": targets,
         "probe_version": PROBE_VERSION,
+        "execution_binding": execution_binding,
+        "package_hashes": package_hashes,
     })
     wdir = isolation_dir / f"window-{log['window_id']}"
     stamp = _utcnow().strftime("%Y%m%d_%H%M%S")
@@ -1024,6 +1072,8 @@ def write_evidence(out_path: Path, audit: dict, log: dict, mentis: dict,
         "created_at": _iso(_utcnow()),
         "valid_until": _iso(_utcnow() + timedelta(seconds=DEFAULT_TTL_S)),
         "identity": current_identity(),
+        "execution_binding": log.get("execution_binding", {}),
+        "package_hashes": log.get("package_hashes", {}),
         "suite_path": log["suite_path"], "suite_sha256": audit["suite_sha256"],
         "prepared_dir": log["prepared_dir"], "target_arm": log["target_arm"],
         "workspace": str(workspace.resolve()),
@@ -1146,6 +1196,26 @@ def check_admission(evidence_path: Path, suite_path: Path = Path(""),
         f"当前={PROBE_VERSION} 证据={evidence.get('probe_version')}")
 
     expected = expected or {}
+    if expected.get("execution_binding"):
+        add("binding_code_and_protocol", evidence.get("execution_binding") == expected["execution_binding"],
+            "代码 commit、方法字节契约和协议版本绑定必须相同")
+        try:
+            recovery = Path(evidence["window"]["recovery_log"])
+            opened = json.loads(recovery.read_text(encoding="utf-8"))
+            add("binding_window_record", _sha_file(recovery) == evidence["raw_hashes"].get("recovery-log.json")
+                and opened.get("execution_binding") == expected["execution_binding"]
+                and opened.get("package_hashes") == evidence.get("package_hashes"),
+                "绑定必须与开窗原始记录及其哈希一致")
+        except (OSError, ValueError, KeyError) as exc:
+            add("binding_window_record", False, f"开窗绑定记录不可核对：{type(exc).__name__}")
+        try:
+            from mentis.eval_readiness import workspace_hashes
+
+            hashes = workspace_hashes(Path(evidence["prepared_dir"]) / evidence["target_arm"])
+            add("package_hashes_match", bool(evidence.get("package_hashes")) and hashes == evidence["package_hashes"],
+                "整个冻结运行输入包（含方法提示词、素材、公开资料和观察）须与开窗前一致")
+        except (OSError, ValueError, KeyError) as exc:
+            add("package_hashes_match", False, f"输入包核对失败：{type(exc).__name__}")
     for key in ("prepared_dir", "target_arm", "workspace", "suite_sha256"):
         if expected.get(key):
             add(f"binding_{key}", str(evidence.get(key)) == str(expected[key]),
@@ -1291,7 +1361,7 @@ def eval_isolate_cli(args) -> dict:
             from mentis.executors.codex_cli import CodexCliAdapter
             adapter = CodexCliAdapter()
         outcome = run_probe_flow(suite_path, prepared, args.arm, isolation_dir,
-                                 adapter=adapter)
+                                 adapter=adapter, run_spec=getattr(args, "run_spec", None))
         return {
             "ok": outcome.get("ok", False),
             "single_end_debug": outcome.get("debug", False),
@@ -1332,6 +1402,10 @@ def eval_isolate_cli(args) -> dict:
                         lock.read_text(encoding="utf-8")).get("window_dir", "")
                 except (OSError, json.JSONDecodeError):
                     pass
+        alive = _codex_processes_since(log["created_at"])
+        if alive is None or alive:
+            return {"ok": False, "window_id": log["window_id"], "window_kept": True,
+                    "alive_processes": alive or [], "next": "未确认执行器停止；不恢复答案读取权限"}
         outcome = release_window(log)
         evidence_file = isolation_dir / "isolation-evidence.json"
         if evidence_file.is_file():

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import hashlib
 import json
@@ -30,6 +30,8 @@ from mentis.diagnosis import DiagnosisBundle, render_bundle_markdown, run_diagno
 from mentis.evaluation_plan import (PlanPersistenceError, acceptance_block,
                                     build_evaluation_plan, derive_task_facts)
 from mentis.eval_isolation import IsolationError, check_admission
+from mentis.eval_readiness import (ReadinessError, binding, material_state, sha,
+                                   workspace_hashes, write_json)
 from mentis.eval_review import (grade_revision, map_candidate_to_dimension,
                                 route_by_verifiability, run_blind_review)
 from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskSpec
@@ -45,7 +47,7 @@ from mentis.render_measurement import measure_page
 from mentis.trace import TraceArchiveError, TraceWriter, _sha256_file
 from mentis.collab import resolve_codex_executable
 
-RUN_SCHEMA = "mentis-eval-run/1"
+RUN_SCHEMA = "mentis-eval-run/2"
 
 # 与 collab._adjudicate_candidates 相同的保持现状提示词（真实运行 d1 教训）
 _KEEP_HINTS = ("保持现状", "保持当前", "保留当前", "无需修改", "维持现状", "保留现状",
@@ -90,7 +92,7 @@ def _flatten_package(arm_dir: Path, workspace: Path) -> None:
     """把冻结输入包展开为运行工作区：arm/workspace/* 到根，其余（input.json、
     prompt.md、input/、resources/、observation/）原样并列。两臂同一展开规则。"""
     if workspace.exists():
-        shutil.rmtree(workspace)
+        raise AdmissionError(f"拒绝覆盖已有作品工作区：{workspace}")
     workspace.mkdir(parents=True)
     src_ws = arm_dir / "workspace"
     if src_ws.is_dir():
@@ -115,18 +117,22 @@ class FairRun:
 
     def __init__(self, prepared_dir, arm: str, out_dir, suite_sha256: str,
                  evidence_path, adapter=None, gateway=None, browser_capture=None,
-                 measure=None, run_id: str = "", base_dir=None, suite_path=""):
+                 measure=None, run_id: str = "", base_dir=None, suite_path="",
+                 run_spec=""):
         self.prepared_dir = Path(prepared_dir)
         self.arm = arm
         self.arm_dir = self.prepared_dir / arm
         self.suite_path = str(suite_path)
         self.suite_sha256 = suite_sha256
         self.evidence_path = Path(evidence_path)
+        self.run_spec = str(Path(run_spec).resolve()) if run_spec else ""
+        self.execution_binding = {}
         self.run_id = run_id or (datetime.now().strftime("%Y%m%d_%H%M%S")
                                  + "-" + os.urandom(2).hex() + "-"
                                  + arm.replace("/", "-"))
-        self.base_dir = Path(base_dir) if base_dir else Path("runtime") / "evaluation" / "e1-runs"
+        self.base_dir = Path(base_dir) if base_dir else Path(out_dir)
         self.run_dir = self.base_dir / self.run_id
+        self.existed = self.run_dir.exists()
         self.workspace = self.run_dir / "workspace"
         self.adapter = adapter or CodexCliAdapter(executable=resolve_codex_executable())
         self.gateway = gateway if gateway is not None else ModelGateway(config=ModelConfig())
@@ -138,17 +144,33 @@ class FairRun:
                                  executor_version=self.adapter.cli_version)
         self.budget: BudgetState | None = None
         self.manifest: dict = {}
+        self.state = {"schema": "mentis-eval-state/1", "stage": "new", "status": "new",
+                      "answers": [], "checks": [], "checked_continuations": 0,
+                      "reconciliation_closed": False,
+                      "checkpoint": {}, "pending": {}, "model_requests": []}
+        self._gateway_seen = 0
 
     # ---- 准入与准备 ----
 
     def _admission(self) -> dict:
         """隔离窗口准入（fail-closed）：绑定 prepared/arm/suite 哈希 + 身份 + 版本
         + 双端原始记录重验 + 当前 live 拒读。任一不通过 → 拒绝运行。"""
+        expected = {"prepared_dir": str(self.prepared_dir.resolve()),
+                    "target_arm": self.arm, "suite_sha256": self.suite_sha256}
+        if self.run_spec:
+            try:
+                self.execution_binding = binding(Path(self.run_spec), self.suite_sha256)
+            except ReadinessError as exc:
+                raise AdmissionError(str(exc)) from exc
+            if self.state.get("execution_binding") and self.state["execution_binding"] != self.execution_binding:
+                raise AdmissionError("续办契约与原运行的代码/协议绑定不同")
+            if (self.arm.endswith("/M") and isinstance(self.adapter, CodexCliAdapter)
+                    and not self.gateway.has_credentials()):
+                raise AdmissionError("M 臂缺少外层模型凭据；资源未就绪，零委托")
+            expected["execution_binding"] = self.execution_binding
         result = check_admission(
             self.evidence_path,
-            expected={"prepared_dir": str(self.prepared_dir.resolve()),
-                      "target_arm": self.arm,
-                      "suite_sha256": self.suite_sha256},
+            expected=expected,
             codex_version=self.adapter.cli_version if hasattr(self.adapter, "cli_version") else None,
         )
         iso = result["runtime_answer_isolation"]
@@ -156,7 +178,54 @@ class FairRun:
             failed = [f"{c['name']}: {c['detail'][:120]}"
                       for c in iso.get("checks", []) if not c["passed"]]
             raise AdmissionError("隔离准入未通过，运行器拒绝启动：；".join(failed))
+        if self.evidence_path.is_file():
+            admissions = self.run_dir / "admission"
+            admissions.mkdir(parents=True, exist_ok=True)
+            snapshot = admissions / f"evidence-{len(list(admissions.glob('evidence-*.json'))) + 1:03d}.json"
+            snapshot.write_bytes(self.evidence_path.read_bytes())
+            iso["evidence_snapshot"] = str(snapshot.resolve())
+            iso["evidence_sha256"] = sha(snapshot)
+            evidence = json.loads(snapshot.read_text(encoding="utf-8"))
+            recovery = Path(evidence["window"]["recovery_log"])
+            if sha(recovery) != evidence["raw_hashes"].get("recovery-log.json"):
+                raise AdmissionError("开窗原始记录已变化，拒绝委托")
+            recovery_snapshot = snapshot.with_name(snapshot.stem + "-window-open.json")
+            recovery_snapshot.write_bytes(recovery.read_bytes())
+            iso["recovery_snapshot"] = str(recovery_snapshot.resolve())
         return iso
+
+    def _save_state(self):
+        calls = getattr(self.gateway, "calls", [])
+        for call in calls[self._gateway_seen:]:
+            self.state["model_requests"].append({
+                "request_id": getattr(call, "request_id", ""),
+                "ok": getattr(call, "ok", False), "mock": getattr(call, "mock", True),
+                "http_attempted": getattr(call, "http_attempted", False),
+                "usage": getattr(call, "usage", {}), "error": getattr(call, "error", "")})
+        self._gateway_seen = len(calls)
+        self.state.update({"run_id": self.run_id, "arm": self.arm,
+                           "prepared_dir": str(self.prepared_dir.resolve()),
+                           "suite_path": self.suite_path, "suite_sha256": self.suite_sha256,
+                           "evidence_path": str(self.evidence_path.resolve()),
+                           "run_spec": self.run_spec, "execution_binding": self.execution_binding,
+                           "thread_id": self.thread_id, "codex_usage": self.codex_usage,
+                           "budget": asdict(self.budget) if self.budget else None})
+        write_json(self.run_dir / "runner-state.json", self.state)
+
+    def _materials(self, meta):
+        material = material_state(self.workspace, meta["input"].get("conversation_context", []),
+                                  self.state["answers"])
+        self.state["material_state"] = material
+        write_json(self.run_dir / "material-provenance.json", material)
+        return material
+
+    def _request_decision(self, pending, question, stage):
+        self.state.update(status="needs_user", stage=stage,
+                          pending={"fields": pending, "question": question})
+        self.trace.emit("mentis", "decision.requested", question[:180], status="pending")
+        self._save_state()
+        return {"status": "needs_user", "verdict": "unverified",
+                "verdict_basis": question, "pending": self.state["pending"]}
 
     def _prepare_workspace(self) -> dict:
         if not self.arm_dir.is_dir():
@@ -217,6 +286,9 @@ class FairRun:
                              brief_version=1, sandbox="workspace-write",
                              timeout_s=self.budget.per_turn_timeout_s,
                              on_event=on_event)
+        self.state.update(status="in_flight", pending={"action": action_key, "prompt": prompt,
+                          "started_at": datetime.now().astimezone().isoformat()})
+        self._save_state()  # 崩溃也不得自动重新派发；委托预算已消费。
         if resume and self.thread_id:
             result = self.adapter.continue_task(self.thread_id, attempt_id, spec)
         else:
@@ -225,6 +297,8 @@ class FairRun:
         self.thread_id = result.native_thread_id or self.thread_id
         self.codex_usage.append({"action": action_key, "status": result.status.value,
                                  "duration_s": duration, "usage": dict(result.usage)})
+        self.trace.record_executor_result(attempt_id, result.status,
+                                         self.thread_id, dict(result.usage), result.error)
         self.trace.emit("executor", "executor.completed",
                         f"{action_key} 终态 {result.status.value}；时长 {duration}s；"
                         f"用量 {result.usage or '未取得'}"
@@ -234,6 +308,9 @@ class FairRun:
                         status={"completed": "ok", "failed": "failed",
                                 "unknown": "unknown"}[result.status.value],
                         executor_status=result.status.value, usage=dict(result.usage))
+        self.state["status"] = result.status.value
+        self.state["pending"]["executor_attempt_id"] = result.attempt_id
+        self._save_state()
         return {"attempt_id": attempt_id, "status": result.status.value,
                 "duration_s": duration, "error": result.error,
                 "final_text": result.final_response[:400]}
@@ -244,23 +321,48 @@ class FairRun:
 
     # ---- 基线臂（B-0/B-1/B-2/B-3：方法提示词驱动，执行器自检循环） ----
 
-    def _run_baseline(self) -> dict:
+    def _run_baseline(self, initial_outcome=None, answer_prompt="") -> dict:
         prompt_md = (self.arm_dir / "prompt.md").read_text(encoding="utf-8")
         prompt = (prompt_md.rstrip()
                   + "\n\n[运行说明] 输入与公开资料都在当前工作区（input.json 为目标/反馈/预算，"
                   "input/ 为活动资料，resources/ 为领域资料，observation/ 为既有观察如适用）。"
-                  "在当前工作区完成作品（index.html）。\n")
+                  "在当前工作区完成作品（index.html）。重要事实冲突需要提问时，将问题写入"
+                  "QUESTIONS.md 并停止，不自行选择日期。收到回答后删除 QUESTIONS.md。\n"
+                  "[已给出的用户上下文]\n"
+                  + "\n".join(self.state["meta"]["input"].get("conversation_context", [])))
+        prompt = answer_prompt or prompt
+        self.state["stage"] = "baseline"
         outcome = {}
         for _ in range(self.budget.max_attempts):
             try:
-                outcome = self._dispatch("baseline-turn", prompt,
-                                         resume=bool(self.thread_id))
+                if initial_outcome is not None:
+                    outcome, initial_outcome = initial_outcome, None
+                else:
+                    outcome = self._dispatch("baseline-turn", prompt, resume=bool(self.thread_id))
             except BudgetExhausted as exc:
                 self.trace.emit("mentis", "run.finalized", str(exc)[:180],
                                 status="failed")
                 outcome = {"status": "budget_exhausted", "error": str(exc)}
                 break
             if outcome["status"] == "completed":
+                questions = self.workspace / "QUESTIONS.md"
+                if questions.is_file() and questions.read_text(encoding="utf-8").strip():
+                    question = questions.read_text(encoding="utf-8")
+                    write_json(self.run_dir / f"questions-{self.budget.used['attempts']:03d}.json",
+                               {"question": question, "source": "executor", "attempt": outcome["attempt_id"]})
+                    self.state.setdefault("questions", []).append(question)
+                    material = self._materials(self.state["meta"])
+                    if material["pending"] and any(word in question for word in ("日期", "时间")):
+                        return self._request_decision(material["pending"], question, "baseline-answer")
+                    if any(word in question for word in (*_RESERVED_NOUNS, *_NEW_FACT_HINTS)):
+                        if material["decisions"] and "日期" in question:
+                            prompt = "[已有用户决定] " + json.dumps(material["decisions"], ensure_ascii=False)
+                        else:
+                            return self._request_decision([], question, "baseline-answer")
+                    else:
+                        prompt = "[自主决定] 视觉布局在授权范围内自行决定；已有事实保留，缺失资料不虚构。"
+                    prompt += "\n在现有作品上续办，收到回答后删除 QUESTIONS.md。"
+                    continue
                 break
             if outcome["status"] == "unknown":
                 # unknown：锁保留、不自动重发；如实停止等待核对（不冒充完成）
@@ -321,6 +423,8 @@ class FairRun:
             observation_capabilities={"structure_only": True, "screenshots": True,
                                      "render_measurement": True}, can_execute=True)
         use_model = bool(self.gateway is not None and self.gateway.has_credentials())
+        if use_model:
+            self._model_call_guard()
         plan = build_evaluation_plan(
             goal=meta["input"]["user_goal"], brief=brief, material_text=material,
             resources=resources, gateway=self.gateway, use_model=use_model,
@@ -358,30 +462,44 @@ class FairRun:
             elif "溢出" in joined and (measurement_errors or not trusted):
                 decision, reason = "pending", "候选主张溢出但测量不可信/缺失：不据此修订"
             elif (any(v in d.phenomenon for v in _CHANGE_VERBS)
-                  and any(n in d.phenomenon for v in _RESERVED_NOUNS)):
+                  and any(n in d.phenomenon for n in _RESERVED_NOUNS)):
                 decision, reason = ("needs_user",
-                                    "触及用户保留决定：本运行器记录待决并跳过修订"
-                                    "（受控模拟协议接线属决定类样本，运行器未接）")
+                                    "触及用户保留决定：待用户决定，不自行修改")
             elif any(h in d.phenomenon for h in _NEW_FACT_HINTS):
                 decision, reason = ("needs_user",
-                                    "需要素材外新事实：不虚构、不修订（模拟协议接线属决定类样本）")
+                                    "需要素材外新事实：待用户提供，不虚构")
             else:
                 decision, basis = route_by_verifiability(mapped)
                 reason = (f"{basis}；映射 {match.get('matched_by')}"
                           f"（得分 {match.get('score')}）")
             records.append({"no": no, "phenomenon": d.phenomenon,
                             "dimension": mapped.entry_id if mapped else "",
-                            "decision": decision, "reason": reason[:160]})
+                            "decision": decision, "reason": reason[:160],
+                            "matched_by": match.get("matched_by"), "mapping_score": match.get("score"),
+                            "guard": "overflow" if "溢出" in joined and decision in ("reject", "pending") else ""})
             self.trace.emit("mentis", "decision.routed",
                             f"候选审查 {no}「{d.phenomenon[:60]}」→ {decision}；{reason[:120]}",
                             status="ok" if decision in ("adopt", "reject", "keep_as_is")
                             else "pending")
         return records
 
-    def _run_mentis(self, meta: dict) -> dict:
-        material_path = self.workspace / "input" / "copy.md"
-        material = material_path.read_text(encoding="utf-8") if material_path.is_file() else ""
-        plan = self._plan_for(meta, material)
+    def _load_plan(self):
+        from mentis.evaluation_plan import EvaluationPlan
+
+        path = self.run_dir / "evaluation-plan" / "plan-v1.json"
+        plan = EvaluationPlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        plan.sha256 = sha(path)
+        return plan
+
+    def _run_mentis(self, meta: dict, resume_build=False) -> dict:
+        materials = self._materials(meta)
+        if materials["pending"]:
+            return self._request_decision(materials["pending"],
+                "公开活动素材中的事实冲突，请确认日期；确认前停止构建。", "m-facts")
+        material = materials["material"]
+        if not material:
+            raise ReadinessError("公开活动素材缺失，不允许用空素材构建")
+        plan = self._load_plan() if resume_build else self._plan_for(meta, material)
         derived = derive_task_facts(material)
         preserved = [(k, v) for k, v in derived["needles"].items()]
         if not (self.workspace / "index.html").is_file():
@@ -390,12 +508,16 @@ class FairRun:
             req_note = ("[公开要求] input/requirements.md" if requirements.is_file()
                         else "[公开要求] input.json policy 字段")
             build_prompt = (f"[目标] {meta['input']['user_goal']}\n"
-                            "[素材] input/copy.md（活动事实唯一来源，不得虚构）\n"
+                            f"[素材] {materials['effective_path']}（原始来源见 input/copy*.md；不得虚构）\n"
+                            "[用户上下文] " + "；".join(meta["input"].get("conversation_context", [])) + "\n"
+                            + "[事实决定] " + json.dumps(materials["decisions"], ensure_ascii=False) + "\n"
+                            +
                             f"{req_note}\n"
                             "[硬要求] 单文件 index.html、中文、双视口可用无溢出、"
                             "表单必填校验+本地确认提示、无外链不联网；"
                             "不要读取工作区以外文件。\n"
                             + acceptance_block(plan))
+            self.state["stage"] = "m-build"
             outcome = self._dispatch("build-page", build_prompt)
             if outcome["status"] != "completed":
                 return {"plan_version": 1, "plan_sha256": plan.sha256,
@@ -422,7 +544,7 @@ class FairRun:
         diagnosis_path = self.run_dir / "diagnosis.md"
         diagnosis_path.write_text(
             f"goal: {meta['input']['user_goal']}\nfeedback: {user_feedback}\n\n"
-            + str(getattr(bundle, "render_markdown", "") or ""), encoding="utf-8")
+            + render_bundle_markdown(bundle), encoding="utf-8")
         self.trace.emit("mentis", "observation.diagnosis",
                         f"诊断（{'Mock' if bundle.mock else '真实模型'}）：有效 "
                         f"{len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}",
@@ -438,11 +560,13 @@ class FairRun:
                    "candidates": adjudication, "revisions": [], "blind": None,
                    "verdict": None, "verdict_basis": ""}
         if not adopted:
-            summary["verdict"] = "no_change"
-            summary["verdict_basis"] = "成立问题 0 条（含保持现状/不可修订路由）：合格不改，零修订"
+            pending = [c for c in adjudication if c["decision"] in ("pending", "needs_user")]
+            measurement_unknown = any(_measurement_anomalies(v) for v in pack.measurement.viewports)
+            summary["verdict"] = "unverified" if pending or measurement_unknown else "no_change"
+            summary["verdict_basis"] = ("存在待决/不可信观察，零修订，不能验收"
+                                        if pending or measurement_unknown else "可成立的自主修订 0 条，保留作品；质量仍待独立评分")
             self.trace.emit("mentis", "review.recorded",
-                            "候选审查完毕、自主修订 0——合格不改（接受依据=审查记录）",
-                            status="ok")
+                            summary["verdict_basis"], status="unknown" if pending else "ok")
             return summary
         # 成立问题 → 修订指令（含计划验收项）→ 预算内委托
         defect_ids = [c["no"] for c in adopted]
@@ -456,6 +580,10 @@ class FairRun:
             [i.text for i in plan.entries[:0]] or
             [policy_text for policy_text in [meta.get("policy", {}).get("execution_scope", "")]])
             .rstrip() + "\n\n" + acceptance_block(plan))
+        self.state["stage"] = "m-revision"
+        self.state["checkpoint"] = {"summary": summary, "adopted": adopted,
+                                    "preserved": preserved, "form_reqs": form_reqs,
+                                    "before": self._pack_checkpoint(pack, images)}
         outcome = self._dispatch("revision-1", instruction, resume=bool(self.thread_id))
         summary["revisions"].append(outcome)
         if outcome["status"] != "completed":
@@ -463,6 +591,46 @@ class FairRun:
                                   else outcome["status"])
             summary["verdict_basis"] = f"修订执行 {outcome['status']}：不判通过（需核对）"
             return summary
+        return self._verify_revision(summary, adopted, pack, images, preserved, form_reqs)
+
+    def _pack_checkpoint(self, pack, images):
+        refs = []
+        for name, blob in images:
+            path = self.run_dir / "observation" / "checkpoint" / Path(name).name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(blob)
+            refs.append({"path": str(path.resolve()), "sha256": sha(path)})
+        return {"structure": asdict(pack.structure), "measurement": asdict(pack.measurement),
+                "image_names": pack.image_names, "images": refs}
+
+    def _restore_pack(self, data):
+        from mentis.observation import ObservationItem, ObservationRecord
+        from mentis.render_measurement import (RenderMeasurement, ViewportMeasurement,
+                                               FormCheck, OverflowElement)
+
+        structure = dict(data["structure"])
+        structure["items"] = [ObservationItem(**i) for i in structure["items"]]
+        measurement = dict(data["measurement"])
+        views = []
+        for v in measurement["viewports"]:
+            v = dict(v)
+            for key in ("overflowing", "clipped_text"):
+                v[key] = [OverflowElement(**e) for e in v[key]]
+            v["forms"] = [FormCheck(**f) for f in v["forms"]]
+            views.append(ViewportMeasurement(**v))
+        measurement["viewports"] = views
+        images = []
+        for ref in data["images"]:
+            p = Path(ref["path"])
+            if sha(p) != ref["sha256"]:
+                raise ReadinessError("续办前观察图片哈希不一致")
+            images.append((p.name, p.read_bytes()))
+        return ObservationPack(structure=ObservationRecord(**structure),
+                               measurement=RenderMeasurement(**measurement),
+                               image_names=data["image_names"]), images
+
+    def _verify_revision(self, summary, adopted, pack, images, preserved, form_reqs):
+        plan = self._load_plan()
         pack2, images2 = self._observe_full("verify")
         findings, regression, unknown = deterministic_checks(pack2, preserved, form_reqs)
         blind_path = self.run_dir / "blind-review.json"
@@ -503,12 +671,13 @@ class FairRun:
 
     def run(self) -> dict:
         """准入 → 展开 → 方法循环 → manifest。准入失败抛 AdmissionError（零委托）。"""
+        if self.existed:
+            raise AdmissionError(f"运行目录已存在；使用 eval-answer/eval-continue 续办：{self.run_dir}")
         iso = self._admission()
         meta = json.loads((self.arm_dir / "input.json").read_text(encoding="utf-8"))
+        self.state["meta"] = meta
         policy = meta.get("policy", {})
         self.budget = BudgetState.from_policy(policy)
-        self._prepare_workspace()
-        self._git_baseline()
         self.trace.emit("mentis", "policy.set",
                         f"E1 臂 {self.arm}；预算 {self.budget.max_attempts} 委托/"
                         f"{self.budget.max_revisions} 修订/{self.budget.max_model_calls}"
@@ -516,6 +685,14 @@ class FairRun:
                         status="ok")
         arm_kind = self.arm.rsplit("/", 1)[-1]
         try:
+            self._prepare_workspace()
+            self._git_baseline()
+            initial = self.workspace / "index.html"
+            if initial.is_file():
+                before = self.run_dir / "versions" / "initial.html"
+                before.parent.mkdir(parents=True, exist_ok=True)
+                before.write_bytes(initial.read_bytes())
+            self._save_state()
             if arm_kind == "M":
                 summary = self._run_mentis(meta)
             else:
@@ -526,16 +703,50 @@ class FairRun:
                        "budget_exhausted": True}
             self.trace.emit("mentis", "run.finalized", f"预算耗尽收尾：{exc}"[:180],
                             status="failed")
+        except Exception as exc:
+            # 观察或方法异常也留下 manifest；不把异常等同质量失败。
+            if self.state["status"] == "in_flight":
+                self.state["status"] = "unknown"
+            else:
+                self.state["status"] = "error"
+            summary = {"verdict": "unverified", "verdict_basis": f"运行异常：{type(exc).__name__}",
+                       "error_type": type(exc).__name__}
+            self.trace.emit("mentis", "run.error", summary["verdict_basis"], status="failed")
+        return self._finish(summary, iso)
+
+    def _finish(self, summary, iso):
+        self.state["summary"] = summary
+        if self.state["status"] not in ("unknown", "needs_user", "error", "in_flight"):
+            self.state["status"] = "finished"
+        self._save_state()
         index = self.workspace / "index.html"
         artifact_sha = hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else ""
+        versions = self.run_dir / "versions"
+        versions.mkdir(exist_ok=True)
+        snapshots = list(versions.glob("final-*.html"))
+        final = versions / f"final-{len(snapshots) + 1:03d}.html"
+        if index.is_file():
+            final.write_bytes(index.read_bytes())
         manifest = {
             "schema_version": RUN_SCHEMA,
             "run_id": self.run_id, "arm": self.arm,
             "prepared_dir": str(self.prepared_dir.resolve()),
             "suite_path": self.suite_path,
             "suite_sha256": self.suite_sha256,
+            "execution_binding": self.execution_binding,
+            "execution_status": (self.codex_usage[-1]["status"] if self.codex_usage
+                                 else "not_dispatched"),
+            "runner_status": self.state["status"],
+            "evidence_mode": ("live_local" if isinstance(self.adapter, CodexCliAdapter)
+                              and not self.adapter._runner_injected
+                              and self.adapter._default_stream_path
+                              and not any(r["mock"] for r in self.state["model_requests"])
+                              else "mechanism_fixture"),
             "isolation": {"window_id": iso.get("window_id", ""),
                           "evidence": str(self.evidence_path),
+                          "evidence_snapshot": iso.get("evidence_snapshot", ""),
+                          "evidence_sha256": iso.get("evidence_sha256", ""),
+                          "recovery_snapshot": iso.get("recovery_snapshot", ""),
                           "admission": "passed"},
             "budget": {"limits": {"attempts": self.budget.max_attempts,
                                   "revisions": self.budget.max_revisions,
@@ -544,15 +755,156 @@ class FairRun:
                        "used": dict(self.budget.used)},
             "codex_usage": self.codex_usage,
             "model_usage": self.gateway.usage_summary() if self.gateway else {},
-            "artifact": {"path": str(index), "sha256": artifact_sha,
+            "model_requests": {"total": len(self.state["model_requests"]),
+                               "http_attempts": sum(r["http_attempted"] for r in self.state["model_requests"]),
+                               "records": self.state["model_requests"]},
+            "artifact": {"path": str(final.resolve()) if index.is_file() else str(index.resolve()),
+                         "workspace_path": str(index.resolve()), "sha256": artifact_sha,
                          "exists": index.is_file()},
+            "decisions": self.state.get("material_state", {}).get("decisions", []),
+            "questions": self.state.get("questions", []),
+            "controlled_answers": self.state["answers"],
+            "checked_continuations": self.state["checked_continuations"],
+            "reconciliation": self.state["checks"],
+            "state_sha256": sha(self.run_dir / "runner-state.json"),
             "summary": summary,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "note": "同条件受控运行记录；不构成质量改善结论（E2 对照回答）。"
                     "跨 process 用量分别记账；Codex 用量按 thread 记录，未取得如实标注。",
         }
         self.manifest = manifest
-        (self.run_dir / "run-manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(self.run_dir / "run-manifest.json", manifest)
         self.trace.finalize(outcome=f"arm {self.arm} verdict={summary.get('verdict')}")
         return manifest
+
+    @classmethod
+    def reopen(cls, run_dir, **dependencies):
+        directory = Path(run_dir).resolve()
+        state_path = directory / "runner-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("schema") != "mentis-eval-state/1" or directory.name != state.get("run_id"):
+            raise AdmissionError("检查点格式/运行目录不匹配，拒绝续办")
+        manifest_path = directory / "run-manifest.json"
+        if not manifest_path.is_file():
+            raise AdmissionError("上次运行未完整收尾：先人工核对，不能自动续办")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if sha(state_path) != manifest.get("state_sha256"):
+            raise AdmissionError("运行检查点哈希不一致，拒绝续办")
+        run = cls(state["prepared_dir"], state["arm"], directory.parent,
+                  state["suite_sha256"], state["evidence_path"],
+                  run_id=state["run_id"], suite_path=state["suite_path"],
+                  run_spec=state["run_spec"], **dependencies)
+        run.state = state
+        run.execution_binding = state["execution_binding"]
+        run.thread_id = state["thread_id"]
+        run.codex_usage = state["codex_usage"]
+        run.budget = BudgetState(**state["budget"])
+        run.manifest = manifest
+        return run
+
+    def _archive_previous(self):
+        history = self.run_dir / "history"
+        history.mkdir(exist_ok=True)
+        sequence = len(list(history.glob("manifest-*.json"))) + 1
+        for src, name in (("run-manifest.json", "manifest"), ("runner-state.json", "state")):
+            shutil.copyfile(self.run_dir / src, history / f"{name}-{sequence:03d}.json")
+
+    def answer(self, answer: str, answered_by: str, source="controlled_simulation"):
+        """仅在已请求决定之后注入回答；受控模拟与真人来源分别记录。"""
+        if self.state["status"] != "needs_user" or not answer.strip() or not answered_by.strip():
+            raise AdmissionError("没有待决问题或缺少回答/回答人，拒绝注入")
+        iso = self._admission()
+        material = self._materials(self.state["meta"])
+        record = {"answer": answer, "answered_by": answered_by, "source": source,
+                  "created_at": datetime.now().astimezone().isoformat(),
+                  "question": self.state["pending"].get("question", "")}
+        # 当前公开案例只接日期决定。其它问题继续待决，不能泛用答案绕过保留决定。
+        trial = material_state(self.workspace, self.state["meta"]["input"].get("conversation_context", []),
+                               self.state["answers"] + [record], write_effective=False)
+        if not material["pending"] or trial["pending"]:
+            raise AdmissionError("回答未唯一解决公开素材的日期冲突；本契约不处理其它决定")
+        if self.budget.used["attempts"] >= self.budget.max_attempts:
+            raise AdmissionError("委托预算耗尽，不能提交回答续办")
+        self._archive_previous()
+        stage = self.state["stage"]
+        self.state["answers"].append(record)
+        self.trace.emit("user", "decision.received", f"{source}：{answer[:120]}", status="ok")
+        self.state["status"] = "ready"
+        self._save_state()
+        try:
+            summary = (self._run_mentis(self.state["meta"]) if stage == "m-facts"
+                       else self._run_baseline(answer_prompt=f"[用户确认，来源 {source}] {answer}\n"
+                                                   "在当前作品上续办，事实以此次确认为准，删除 QUESTIONS.md。"))
+        except Exception as exc:
+            summary = {"verdict": "unverified", "error_type": type(exc).__name__}
+            self.state["status"] = "unknown" if self.state["status"] == "in_flight" else "error"
+        return self._finish(summary, iso)
+
+    def checked_continue(self, checked_by: str, basis: str, artifact_complete=False, process_check=None):
+        """核对后最多同 thread 续办一次；unknown 尝试和作品核对不改写为成功。"""
+        if (self.state["status"] != "unknown" or self.state["checked_continuations"] >= 1
+                or self.state.get("reconciliation_closed")):
+            raise AdmissionError("仅允许 unknown 后一次核对续办")
+        if not checked_by.strip() or not basis.strip():
+            raise AdmissionError("必须记录核对人和核对依据")
+        iso = self._admission()
+        from mentis.eval_isolation import _codex_processes_since
+
+        pending = self.state["pending"]
+        processes = (process_check or _codex_processes_since)(pending["started_at"])
+        if processes is None or processes:
+            raise AdmissionError("未确认执行器已停止；拒绝解锁和续办")
+        hashes = workspace_hashes(self.workspace)
+        if "index.html" not in hashes:
+            raise AdmissionError("作品缺失，无法核对续办")
+        if not artifact_complete and (not self.thread_id or self.budget.used["attempts"] >= self.budget.max_attempts):
+            raise AdmissionError("缺少原会话或委托预算耗尽，不能续办")
+        check = {"checked_by": checked_by, "basis": basis,
+                 "checked_at": datetime.now().astimezone().isoformat(),
+                 "processes": processes, "workspace_hashes": hashes,
+                 "artifact_complete": artifact_complete, "original_status": "unknown"}
+        stage = self.state["stage"]
+        if stage.startswith("m-"):
+            plan_path = self.run_dir / "evaluation-plan" / "plan-v1.json"
+            if sha(plan_path) != self.state["summary"].get("plan_sha256"):
+                raise AdmissionError("评估计划在 unknown 后被修改；拒绝续办")
+        if stage == "m-revision":
+            self._restore_pack(self.state["checkpoint"]["before"])
+        self._archive_previous()
+        self.state["checks"].append(check)
+        self.state["checked_continuations"] += int(not artifact_complete)
+        self.trace.emit("user", "executor.reconciled", f"核对者 {checked_by}；{basis[:120]}", status="ok")
+        if artifact_complete:
+            self.state["reconciliation_closed"] = True
+            summary = dict(self.state["summary"])
+            summary.update(verdict="unknown", artifact_state="unknown_artifact_checked",
+                           verdict_basis="人工核对作品已包含预期修改；原执行状态仍 unknown，未续办")
+            return self._finish(summary, iso)
+        self._save_state()
+        try:
+            unlock = getattr(self.adapter, "release_reconciled_lock", None)
+            if unlock:
+                unlock(self.workspace, pending["started_at"], pending.get("executor_attempt_id", ""))
+            outcome = self._dispatch(pending["action"],
+                "[核对后续办] 原尝试状态 unknown。先核对现有文件，继续尚未完成部分，保留已完成修改。\n"
+                + pending["prompt"], resume=True)
+            if outcome["status"] != "completed":
+                summary = {"verdict": "unverified", "revisions": [outcome],
+                           "verdict_basis": "核对续办未完成，终止本臂，不能再次续办"}
+            elif stage == "baseline":
+                summary = self._run_baseline(initial_outcome=outcome)
+            elif stage == "m-build":
+                summary = self._run_mentis(self.state["meta"], resume_build=True)
+            elif stage == "m-revision":
+                checkpoint = self.state["checkpoint"]
+                pack, images = self._restore_pack(checkpoint["before"])
+                summary = dict(checkpoint["summary"])
+                summary["revisions"] = [outcome]
+                summary = self._verify_revision(summary, checkpoint["adopted"], pack, images,
+                                                checkpoint["preserved"], checkpoint["form_reqs"])
+            else:
+                raise ReadinessError(f"不支持的续办阶段：{stage}")
+        except Exception as exc:
+            self.state["status"] = "unknown" if self.state["status"] == "in_flight" else "error"
+            summary = {"verdict": "unverified", "error_type": type(exc).__name__}
+        return self._finish(summary, iso)

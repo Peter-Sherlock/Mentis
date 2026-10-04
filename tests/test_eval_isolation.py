@@ -119,6 +119,18 @@ def _sha_entry(raw: bytes) -> str:
 
 
 class ManifestTests(IsolationFixture):
+    def test_prior_run_answers_and_private_scoring_exports_are_protected(self):
+        past = self.prepared.parent / "e2-runs" / "prior-run"
+        past.mkdir(parents=True)
+        (past / "run-manifest.json").write_text(
+            json.dumps({"schema_version": "mentis-eval-run/2", "controlled_answers": []}), encoding="utf-8")
+        export = self.prepared.parent / "e2-review"
+        export.mkdir()
+        (export / "private-map.json").write_text("{}", encoding="utf-8")
+        protected = iso.protected_manifest(self.suite_path, self.prepared, "input-001/M")
+        self.assertIn(past.resolve(), protected)
+        self.assertIn(export.resolve(), protected)
+
     def test_manifest_rejects_unknown_arm(self):
         with self.assertRaisesRegex(iso.IsolationError, "不在 prepare-report"):
             iso.protected_manifest(self.suite_path, self.prepared, "input-009/Z")
@@ -383,7 +395,7 @@ class ProbeTests(IsolationFixture):
 
 @unittest.skipUnless(NT, "真实 deny ACL 仅在 Windows 验证")
 class EvidenceAdmissionTests(IsolationFixture):
-    def _run_flow_with_fake_codex(self):
+    def _run_flow_with_fake_codex(self, run_spec=None):
         """真实 ACL 窗口 + 真实 Mentis 探针 + 构造的 Codex 端结果 → 正式证据。"""
         outcome = None
         with mock.patch.object(iso, "_run_codex_probe") as fake_codex:
@@ -405,8 +417,27 @@ class EvidenceAdmissionTests(IsolationFixture):
                         "stdin_status": "sent"}
             fake_codex.side_effect = side_effect
             outcome = iso.run_probe_flow(self.suite_path, self.prepared, "input-001/M",
-                                         self.root / "iso", adapter=object())
+                                         self.root / "iso", adapter=object(), run_spec=run_spec)
         return outcome
+
+    def test_code_protocol_and_entire_input_package_bind_admission(self):
+        method = {"code_commit": "c" * 40, "protocol_version": "v1.1-frozen", "spec_sha256": "a" * 64}
+        with mock.patch("mentis.eval_readiness.binding", return_value=method):
+            outcome = self._run_flow_with_fake_codex(self.root / "contract.json")
+        try:
+            evidence = Path(outcome["evidence_path"])
+            good = iso.check_admission(evidence, expected={"execution_binding": method}, codex_version="0.158.0")
+            self.assertTrue(good["runtime_answer_isolation"]["passed"], good)
+            drift = dict(method, code_commit="d" * 40)
+            wrong = iso.check_admission(evidence, expected={"execution_binding": drift}, codex_version="0.158.0")
+            self.assertFalse(wrong["runtime_answer_isolation"]["passed"])
+            prompt = self.prepared / "input-001/M/prompt.md"
+            prompt.write_text("mutated method", encoding="utf-8")
+            changed = iso.check_admission(evidence, expected={"execution_binding": method}, codex_version="0.158.0")
+            checks = {c["name"]: c["passed"] for c in changed["runtime_answer_isolation"]["checks"]}
+            self.assertFalse(checks["package_hashes_match"])
+        finally:
+            iso.release_window(outcome["window"])
 
     def test_full_flow_writes_evidence_and_admission_passes_only_in_window(self):
         outcome = self._run_flow_with_fake_codex()
