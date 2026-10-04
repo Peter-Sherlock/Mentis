@@ -34,7 +34,7 @@ EXTRA_DENY_ACCOUNTS = ("CodexSandboxUsers", "CodexSandboxOffline", "CodexSandbox
 ISO_SCHEMA = "mentis-eval-isolation/2"
 PROBE_SCHEMA = "mentis-eval-probe/1"
 # 探针逻辑版本：变化后旧证据一律失效，必须重新探测。
-PROBE_VERSION = "e1-probe/2"
+PROBE_VERSION = "e1-probe/3"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 WINDOW_LOCK_DIR = _REPO_ROOT / "runtime" / "evaluation" / "window-locks"
 
@@ -549,8 +549,11 @@ def main():
         try:
             rel = os.path.relpath(target, workspace)
         except ValueError:
-            entries.append({"id": t["id"], "form": "parent_traversal", "outcome": "error",
-                            "error": "relpath 跨盘符"})
+            # Windows 相对路径无法跨盘符寻址：该访问形式结构性不可达（如实标注，
+            # 不冒充 denied——同一目标的绝对路径与 junction 形式仍真实实测）。
+            entries.append({"id": t["id"], "form": "parent_traversal",
+                            "outcome": "structurally_unreachable",
+                            "error": "目标与工作区在不同盘符，相对路径无法跨盘寻址"})
         else:
             entries.append({"id": t["id"], "form": "parent_traversal",
                             **classify_read(workspace / rel)})
@@ -624,6 +627,13 @@ def judge_probe_result(payload: dict, targets: list[dict],
 
 def judge_probe_entries(payload: dict, expected_entries: list,
                         expected_input_sha: str = "") -> list[str]:
+    """确定性判定：只有全部条目真实 denied（或结构性不可达）且正向哈希匹配才通过。
+
+    not_found / error / link_create_failed 都不计入通过，逐项报告。
+    structurally_unreachable 仅用于跨盘符目标的 parent_traversal 形式：
+    Windows 相对路径无法跨盘寻址，该形式不可能发生（同一目标的绝对路径与
+    junction 形式仍实测拒读）；条目原样保留在探针证据中可审计。
+    """
     problems = []
     if payload.get("schema") != PROBE_SCHEMA or payload.get("probe_version") != PROBE_VERSION:
         problems.append(f"探针结果 schema/版本不符: {payload.get('schema')}/"
@@ -639,7 +649,7 @@ def judge_probe_entries(payload: dict, expected_entries: list,
         if outcome == "READ":
             problems.append(f"反向证据失败：{tid}/{form} 读到受保护内容"
                             f"（指纹 {entry.get('sha256', '')[:16]}，{entry.get('bytes')} 字节）")
-        elif outcome == "denied":
+        elif outcome in ("denied", "structurally_unreachable"):
             continue
         elif outcome == "not_found":
             problems.append(f"探针异常：{tid}/{form} 文件不存在（清单与磁盘不一致）")

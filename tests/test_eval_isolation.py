@@ -392,6 +392,58 @@ class ProbeTests(IsolationFixture):
         self.assertTrue(any("不存在" in p for p in problems), problems)
         self.assertTrue(any("缺失" in p for p in problems), problems)
 
+    def test_judge_accepts_structurally_unreachable_cross_drive_traversal(self):
+        """跨盘符目标：parent_traversal 结构性不可达（如实留痕）；同目标其余形式仍须 denied。"""
+        payload = {"schema": iso.PROBE_SCHEMA, "probe_version": iso.PROBE_VERSION,
+                   "entries": [
+                       {"id": "T1", "form": "absolute", "outcome": "denied"},
+                       {"id": "T1", "form": "parent_traversal",
+                        "outcome": "structurally_unreachable",
+                        "error": "目标与工作区在不同盘符，相对路径无法跨盘寻址"},
+                       {"id": "T1", "form": "junction", "outcome": "denied"}],
+                   "positive": {"input.json": {"readable": True, "sha256": "x"},
+                                "prompt.md": {"readable": True},
+                                "workspace_write": {"ok": True}}}
+        problems = iso.judge_probe_entries(
+            payload, [("T1", "absolute"), ("T1", "parent_traversal"),
+                      ("T1", "junction")], "")
+        self.assertEqual(problems, [], problems)
+
+    def _other_drive(self) -> str | None:
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            if Path(f"{letter}:\\").exists() and Path(letter + ":\\").drive != Path.cwd().drive:
+                return letter
+        return None
+
+    @unittest.skipUnless(NT, "探针脚本行为按 Windows 实测")
+    def test_probe_runner_marks_cross_drive_traversal_structurally_unreachable(self):
+        """真实子进程：目标在另一盘符时 parent_traversal 记 structurally_unreachable（不冒充 denied）。"""
+        drive = self._other_drive()
+        if not drive:
+            self.skipTest("本机没有第二块盘符可构造跨盘符目标")
+        target_dir = Path(drive + ":/") / "mentis-crossdrive-probe" / uuid4().hex[:8]
+        target_dir.mkdir(parents=True)
+        target = target_dir / "secret.txt"
+        target.write_bytes(b"cross-drive-secret")
+        self.addCleanup(shutil.rmtree, target_dir, ignore_errors=True)
+        targets = [{"id": "X01", "kind": "file", "path": str(target)}]
+        workspace = self._write_workspace(targets)
+        runner = self.root / "probe_runner.py"
+        runner.write_text(iso._PROBE_RUNNER, encoding="utf-8")
+        input_sha = _sha(workspace / "input.json")
+        out = iso.run_deterministic_probe(
+            workspace, targets, self.root / "probe-out", runner, sys.executable,
+            "mentis", input_sha)
+        entries = {(e["id"], e["form"]): e for e in out["payload"]["entries"]}
+        traversal = entries[("X01", "parent_traversal")]
+        self.assertEqual(traversal["outcome"], "structurally_unreachable")
+        self.assertIn("跨盘", traversal["error"])
+        self.assertFalse(any("X01/parent_traversal" in p for p in out["problems"]),
+                         out["problems"])
+        # 绝对路径与 junction 形式仍真实执行（无窗口时可读 → READ 属实报告）
+        self.assertEqual(entries[("X01", "absolute")]["outcome"], "READ")
+        self.assertEqual(entries[("X01", "junction")]["outcome"], "READ")
+
 
 @unittest.skipUnless(NT, "真实 deny ACL 仅在 Windows 验证")
 class EvidenceAdmissionTests(IsolationFixture):
