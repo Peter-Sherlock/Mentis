@@ -22,9 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from mentis.capabilities.registry import load_registry
 from mentis.capabilities.routing import Gap, route_gap
-from mentis.capabilities.selection import select_for_task
 from mentis.contracts import AttemptStatus, DelegationPolicy, Disposition, Provenance, SourcedItem
 from mentis.diagnosis import DiagnosisBundle, render_bundle_markdown, run_diagnosis
 # V2：可验证性路由与盲比复检（ADR-008 第 6—8 条）
@@ -36,6 +34,8 @@ from mentis.evaluation_plan import (EvaluationPlan, PlanPersistenceError, accept
                                     execute_structural_check, load_latest_plan,
                                     render_plan_markdown, revise_plan, SPEC_RENDER_OVERFLOW)
 from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskResult, CodexTaskSpec
+# C1：最小任务专业配置——职责/资源快照/任务条件与阶段绑定（大纲 §3）
+from mentis.professional import ConfigManager, ConfigPersistenceError
 # T4 补修：交付前专业评审复用 guidance 的观察/诊断/指令/复检机制（提取为模块级函数），
 # 不另建平行流程。
 from mentis.guidance import (AUTONOMOUS_DECISION_TEXT, ObservationPack, _CHANGE_VERBS,
@@ -48,7 +48,8 @@ from mentis.observation import observe_structure
 from mentis.persist import save_session, session_from_dict
 from mentis.render_measurement import measure_page
 from mentis.session import TaskSession
-from mentis.trace import TraceArchiveError, TraceWriter, _sha256_file
+from mentis.trace import (TraceArchiveError, TraceWriter, _sha256_file,
+                          describe_executor_event)
 
 COLLAB_DIR = Path("runtime") / "collab"
 STATE_VERSION = "p2.3"
@@ -184,6 +185,15 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj._finalized_emitted = False
     obj.evaluation_plan = obj._load_latest_plan()  # V1：恢复已落盘的评估计划（不改写）
     obj.trace = TraceWriter(obj.run_dir, obj.run_id, executor_version=obj.adapter.cli_version)
+    # O1：恢复对象的网关是新实例——只记恢复后的调用；恢复前的调用 unrecorded
+    obj._gateway_seen = len(getattr(obj.gateway, "calls", []))
+    obj._model_stage = ""
+    obj._model_output_refs = []
+    obj.stages = obj.trace.stage_tracker()  # O2：阶段记录（恢复后旧未关闭阶段如实对账）
+    # C1：恢复/续办复用已落盘配置（ensure 读回并核验；不重冻结）
+    obj.professional = ConfigManager(obj.run_dir, session=obj.session, trace=obj.trace,
+                                     user_source="user-cli-invocation")
+    obj._model_config = None
     obj.trace.emit("mentis", "run.resumed",
                    f"从落盘状态恢复（进入时状态 {obj.status}）；既有事件续排，不重放历史委托",
                    brief_version=obj.session.current_brief.version)
@@ -232,6 +242,16 @@ class Collaboration:
         # P2.4-T1：追踪写入器（契约 mentis-trace/1）；委托/复检/收尾点写入
         self.trace = TraceWriter(self.run_dir, self.run_id,
                                  executor_version=self.adapter.cli_version)
+        # O1：模型调用记账游标与阶段关联（_drain_model_calls 用）
+        self._gateway_seen = len(getattr(self.gateway, "calls", []))
+        self._model_stage = ""
+        self._model_output_refs: list = []
+        self.stages = self.trace.stage_tracker()  # O2：阶段起止记录
+        # C1：任务专业配置（首次使用前冻结；计划/诊断/委托/复检取同一版本）
+        self.professional = ConfigManager(self.run_dir, session=self.session,
+                                          trace=self.trace,
+                                          user_source="user-cli-invocation")
+        self._model_config: dict | None = None
         self.trace.emit("mentis", "goal.recorded", self.session.goal,
                         brief_version=self.session.current_brief.version)
         self.trace.emit("mentis", "policy.set",
@@ -285,7 +305,13 @@ class Collaboration:
         self.trace.emit("mentis", "decision.requested",
                         f"请求决定 {ix.interaction_id}（阻塞 {blocking_action}）：{question}｜"
                         f"阻塞原因：{blocking_reason}",
-                        brief_version=self.session.current_brief.version, status="pending")
+                        brief_version=self.session.current_brief.version, status="pending",
+                        interaction_id=ix.interaction_id)
+        # O2：等待用户决定是真实阶段——只阻塞依赖动作；未回答时保持打开（等待持续）
+        self.stages.start("waiting_user", blocking=True, reason=question,
+                          detail=f"请求 {ix.interaction_id}（阻塞 {blocking_action}）；"
+                                 f"阻塞原因：{blocking_reason}",
+                          interaction_id=ix.interaction_id)
         if self.interactive:
             print(f"\n[需要你决定] {question}")
             print(f"  为什么现在问：{blocking_reason}")
@@ -297,7 +323,9 @@ class Collaboration:
                 self._last_answer = answer
                 self.trace.emit("user", "decision.answered",
                                 f"回答 {ix.interaction_id}：「{answer[:120]}」",
-                                brief_version=self.session.current_brief.version)
+                                brief_version=self.session.current_brief.version,
+                                interaction_id=ix.interaction_id)
+                self.stages.finish(status="ok", detail="用户当场回答；依赖工作继续")
                 return True
         self.notify(f"请求已记录（{ix.interaction_id}），依赖动作 {blocking_action} 暂停；"
                     "其余独立工作继续，不越权。")
@@ -324,21 +352,19 @@ class Collaboration:
         self.notify(f"隔离工作区已建立：{ws}（仅 brief 与素材，无任何秘密文件）")
 
     def current_context(self):
-        return select_for_task(
-            load_registry(), task_label="页面诊断",
-            task_keywords=["单页活动介绍页"],
-            decision_needs=["信息密度", "主操作层级", "表单校验行为", "促销感来源"],
-            observation_capabilities={"structure_only": True, "screenshots": True},
-            can_execute=True,
-        )
+        """C1：全部阶段取用同一冻结配置的上下文（一次选择；注册表后变不静默换内容）。"""
+        _, context, resources = self.professional.ensure(brief=self.session.current_brief)
+        return context, resources
 
     # ---- 评估计划（V1：首次委托前落盘，硬要求读计划） ----
 
     def _plan_resources(self) -> list:
-        """已加载的领域资源（评估计划领域层来源）；加载失败不阻塞计划组装。"""
+        """已加载的领域资源（评估计划领域层来源）；配置核验失败不静默吞掉。"""
         try:
             _, loaded = self.current_context()
             return list(loaded)
+        except ConfigPersistenceError:
+            raise
         except Exception:
             return []
 
@@ -355,18 +381,27 @@ class Collaboration:
                                   "（用户修正/新增偏好进入 brief，受影响条目随之更新）")
 
     def _ensure_evaluation_plan(self) -> EvaluationPlan:
-        """确保存在与当前 brief 版本匹配的评估计划；先落盘后委托。
+        """确保存在与当前 brief 版本匹配的评估计划；配置先落盘、计划随后派生。
 
-        落盘失败抛 PlanPersistenceError——调用方（_dispatch_codex）在委托前停止，
-        执行器零调用。改版仅在有原因时发生（brief 改版/目标变化；ADR-008 第 5 条）。
+        落盘失败抛 PlanPersistenceError/ConfigPersistenceError——调用方
+        （_dispatch_codex）在委托前停止，执行器零调用。改版仅在有原因时发生
+        （brief 改版/目标变化；ADR-008 第 5 条）。
         """
         current_v = self.session.current_brief.version
+        # C1：配置在计划与委托之前冻结/核验（失败→不发起，不使用缺失依据）
+        self.professional.ensure(brief=self.session.current_brief)
         plan = self.evaluation_plan or self._load_latest_plan()
         if (plan is not None and plan.brief_version == current_v
                 and plan.goal == self.session.current_brief.objective):
             self.evaluation_plan = plan
+            self.professional.note_plan(plan)
             return plan
         use_model = bool(self.use_model and self.gateway is not None)
+        self._model_stage = "plan_instantiation"
+        self._model_output_refs = []
+        self._model_config = self.professional.binding("plan")
+        self.stages.start("plan", detail="评估计划组装（首次委托前或改版）",
+                          config=self._model_config)
         if plan is None:
             new_plan = build_evaluation_plan(
                 goal=self.session.current_brief.objective,
@@ -396,6 +431,16 @@ class Collaboration:
         except OSError as exc:
             raise PlanPersistenceError(f"评估计划落盘失败，本次委托不发起：{exc}") from exc
         new_plan.sha256 = hashlib.sha256(payload).hexdigest()
+        self._model_output_refs = [{"path": str(path), "sha256": new_plan.sha256, "role": "plan"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
+        # C1：配置↔计划绑定（bindings.jsonl；同版计划不重复记）
+        self.professional.note_plan(new_plan)
+        self.stages.finish(status="ok",
+                           detail=f"计划 v{new_plan.version} 落盘（{event_kind}）；"
+                                  f"{len(new_plan.entries)} 个维度")
         self.trace.emit("mentis", event_kind, summary, brief_version=current_v,
                         refs=[{"path": str(path), "sha256": new_plan.sha256, "role": "plan"}])
         self.notify(f"评估计划 v{new_plan.version} 已生成（先于委托落盘；"
@@ -407,6 +452,17 @@ class Collaboration:
         plan = self.evaluation_plan
         return {"version": plan.version if plan else None, "sha256": plan.sha256 if plan else ""}
 
+    def _drain_model_calls(self):
+        """O1：把新增网关调用记入 trace/model-calls.jsonl（阶段/产出引用由
+        调用点设置；未设置的如实记 unrecorded）。失败计追踪写失败，不静默。
+        C1：_model_config 非空时调用行携带配置版本/哈希与本阶段职责。"""
+        calls = getattr(self.gateway, "calls", [])
+        for call in calls[self._gateway_seen:]:
+            self.trace.record_model_call(call, stage=self._model_stage,
+                                         output_refs=self._model_output_refs,
+                                         config=self._model_config)
+        self._gateway_seen = len(calls)
+
     # ---- 委托与反问分流 ----
 
     def _dispatch_codex(self, action_key: str, prompt: str, resume: bool = False,
@@ -416,10 +472,19 @@ class Collaboration:
         prompt = prompt.rstrip() + "\n\n" + acceptance_block(plan)
         attempt = self.session.dispatch(action_key, "exec-workspace", revision_id=revision_id)
         brief_version = self.session.current_brief.version
+        # O2：委托即「执行器制作/修订」阶段的真实起止
+        stage_name = "revise" if action_key.startswith("review-fix") or "revise" in action_key \
+            else "build"
+        self.stages.start(stage_name, detail=f"委托 {action_key}",
+                          attempt_id=attempt.attempt_id, brief_version=brief_version,
+                          plan={"version": plan.version, "sha256": plan.sha256},
+                          config=self.professional.binding(
+                              "revise" if stage_name == "revise" else "build"))
         # 契约 §1：确切委托文本在实际调用前落盘；失败则不发起该次委托
         try:
             prompt_ref = self.trace.archive_prompt(attempt.attempt_id, prompt)
         except TraceArchiveError as exc:
+            self.stages.finish(status="error", detail="prompt 落盘失败，委托未发起")
             self.session.fail_attempt(attempt.attempt_id)
             self.trace.emit("mentis", "delegation.prepared",
                             f"prompt 落盘失败，本次委托不发起：{exc}", attempt_id=attempt.attempt_id,
@@ -440,31 +505,22 @@ class Collaboration:
         self.trace.record_delegation(attempt.attempt_id, brief_version, prompt_ref, action=action_key)
 
         def on_executor_event(event: dict, meta: dict):
-            # T2：逐行回调；异常不得中断执行（写失败由 manifest 完整性记录）
+            # O1：与 guide-revise / eval-run 共用采集逻辑；异常不中断执行，
+            # 采集失败经 note_capture_failure 计入完整性（不静默吞掉）
             try:
-                kind = str(event.get("type", "?"))
-                item = event.get("item") if isinstance(event.get("item"), dict) else {}
-                itype = str(item.get("type", ""))
-                refs = []
-                if itype == "command_execution":
-                    detail = f"命令 {str(item.get('command', ''))[:140]}（{item.get('status', '')}）"
-                elif kind == "item.completed" and itype == "agent_message":
-                    detail = f"最终消息：「{str(item.get('text', ''))[:160]}」"
-                    message_ref = self.trace.archive_executor_message(
-                        attempt.attempt_id, str(item.get("text", "")))
-                    if message_ref is not None:
-                        refs.append(message_ref)
-                elif itype == "reasoning":
-                    detail = "推理条目（内容不入默认层）"
-                else:
-                    detail = f"{kind} {itype}".strip() + (f"（{item.get('status', '')}）" if item.get("status") else "")
-                if meta.get("first"):
-                    detail = f"首事件延迟 {meta.get('first_event_latency_s', 0):.1f}s；" + detail
+                detail, refs = describe_executor_event(
+                    event, meta,
+                    archive_message=lambda text: self.trace.archive_executor_message(
+                        attempt.attempt_id, text))
                 self.trace.emit("executor", "executor.started" if meta.get("first") else "executor.item",
                                 detail, attempt_id=attempt.attempt_id, brief_version=brief_version,
                                 native_thread_id=self.thread_id or None, status="pending", refs=refs)
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    self.trace.note_capture_failure(
+                        f"executor 事件采集失败：{type(exc).__name__}（原文未入流）")
+                except Exception:
+                    pass
 
         self.session.mark_running(attempt.attempt_id)
         spec = CodexTaskSpec(
@@ -492,6 +548,9 @@ class Collaboration:
         self.trace.record_executor_result(attempt.attempt_id, result.status,
                                           native_thread_id=result.native_thread_id,
                                           usage=dict(result.usage), error=result.error)
+        # O2：阶段结束按执行器真实终态记录（unknown 保持 unknown）
+        self.stages.finish(status=result.status.value,
+                           detail=f"{action_key} 终态 {result.status.value}；时长 {duration}s")
         self.codex_runs.append(CodexRunSummary(
             action_key=action_key, attempt_id=attempt.attempt_id, task_id=result.task_id,
             thread_id=result.native_thread_id, status=result.status.value,
@@ -888,9 +947,11 @@ class Collaboration:
             result["delivery_note"] = "专业评审未执行（模型不可用）；最终完成与满意度待你判断"
             return result
         origin = ""
+        self.stages.start("observe", detail="专业评审观察（结构+渲染测量+截图）")
         try:
             pack, images, browser_obs = self._observe_full("professional", attempt.attempt_id)
         except Exception as exc:
+            self.stages.finish(status="unknown", detail=f"观察失败：{type(exc).__name__}")
             self.last_professional_review = {"performed": False, "reason": f"观察失败：{type(exc).__name__}"}
             self.notify(f"专业评审观察失败（{type(exc).__name__}）：不冒充评审通过；"
                         "初稿按结构检查结果处理")
@@ -900,17 +961,18 @@ class Collaboration:
                             status="unknown")
             result["delivery_note"] = "专业评审观察失败（测量/截图不可用）；评审未执行"
             return result
+        self.stages.finish(status="ok",
+                           detail=f"观察 {len(pack.structure.items)} 条目、截图 {len(images)} 张")
         self._review_form_requirements = sorted({
             i.text for i in pack.structure.items
             if i.kind in ("input", "textarea") and i.extra.get("required") == "yes"})
         # 诊断（领域规则草案 + 截图 + 渲染测量；无截图时模型被明确禁止声称看过画面）
-        context, _ = select_for_task(
-            load_registry(), task_label="页面诊断与修改指导",
-            task_keywords=["单页活动介绍页"],
-            decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
-            observation_capabilities={"structure_only": True, "screenshots": bool(images),
-                                      "render_measurement": True},
-            can_execute=True)
+        # C1：诊断取用同一冻结配置的领域依据（不再单独重选注册表）
+        context, _ = self.current_context()
+        self._model_config = self.professional.binding("diagnose")
+        self.stages.start("diagnose",
+                          detail=f"诊断输入：观察 {len(pack.structure.items)} 条目、截图 {len(images)} 张",
+                          config=self._model_config)
         bundle = run_diagnosis(self.gateway, self.session.current_brief.objective, "",
                                pack, context, images=images, system=_diagnosis_system_prompt())
         self.last_diagnosis = bundle
@@ -921,6 +983,17 @@ class Collaboration:
             if refs:
                 image_note = f"\n- 图像输入：{';'.join(refs)}（随诊断请求发送的截图）"
         diagnosis_path.write_text(render_bundle_markdown(bundle) + image_note, encoding="utf-8")
+        self._model_stage = "diagnosis"
+        self._model_output_refs = [{"path": str(diagnosis_path),
+                                    "sha256": _sha256_file(diagnosis_path),
+                                    "role": "diagnosis"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
+        self.stages.finish(status="ok" if bundle.valid_diagnoses else "unknown",
+                           detail=f"有效 {len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}"
+                                  f"、决策请求 {len(bundle.valid_decision_requests)}")
         origin = "Mock 固定响应" if bundle.mock else f"真实模型 {bundle.model}"
         self.trace.emit("mentis", "observation.diagnosis",
                         f"专业评审诊断（{'Mock' if bundle.mock else '真实模型'}）："
@@ -958,7 +1031,12 @@ class Collaboration:
                                 f"agent_decide：{q}；可逆专业取舍；决定 {AUTONOMOUS_DECISION_TEXT[:80]}",
                                 attempt_id=attempt.attempt_id, brief_version=brief_version)
         # 候选审查（采纳/驳回/保持现状/待用户，理由逐条留档）
+        self.stages.start("adjudicate", detail="候选审查与可验证性路由",
+                          config=self.professional.binding("adjudicate"))
         adjudication = self._adjudicate_candidates(bundle, pack, attempt.attempt_id)
+        self.stages.finish(status="ok",
+                           detail=f"{len(adjudication)} 条候选处置完毕；"
+                                  f"采纳 {len([c for c in adjudication if c['decision'] == 'adopt'])}")
         adopted = [c for c in adjudication if c["decision"] == "adopt"]
         rejected = [c for c in adjudication if c["decision"] == "reject"]
         keep = [c for c in adjudication if c["decision"] == "keep_as_is"]
@@ -1075,6 +1153,8 @@ class Collaboration:
             return result
         # 修订完成 → 重新观察并**盲比复检**（V2/ADR-008 第 7 条：A/B 随机、只给计划标准、
         # 正反两序、不一致记 unknown；不再给诊断清单问"问题是否仍存在"）
+        self.stages.start("reverify", detail="修订复检：重观察 + 确定性检查 + 盲比两序",
+                          config=self.professional.binding("reverify"))
         pack2, images2, browser_obs2 = self._observe_full(
             "professional-verify", rev_attempt.attempt_id)
         result["structure"], result["browser_obs"] = pack2.structure, browser_obs2
@@ -1083,10 +1163,21 @@ class Collaboration:
         if self.browser_capture is not None and not images2:
             unknown.append("复查截图缺失：视觉类解决声明无法核对（不作为通过依据）")
         blind_path = self.run_dir / "blind-review-professional.json"
+        self._model_stage = "blind_review"
+        self._model_output_refs = []
+        self._model_config = self.professional.binding("reverify")
         blind = run_blind_review(
             self.gateway, self.evaluation_plan, pack, images, pack2, images2,
             blind_path, use_model=self.use_model, notify=self.notify, rng=self._blind_rng,
-            before_html_sha256=pack.sha256, after_html_sha256=pack2.sha256)
+            before_html_sha256=pack.sha256, after_html_sha256=pack2.sha256,
+            professional=self._model_config)
+        if blind_path.is_file():
+            self._model_output_refs = [{"path": str(blind_path),
+                                        "sha256": _sha256_file(blind_path), "role": "review"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
         artifact_changed = pack.sha256 != pack2.sha256
         verdict, verdict_basis = grade_revision(
             regression, unknown, artifact_changed, blind,
@@ -1132,6 +1223,8 @@ class Collaboration:
         self.last_professional_review["blind"] = {
             "overall": blind["overall"], "consistent": blind["consistent"],
             "mock": blind["mock"], "usage_total": blind["usage_total"]}
+        self.stages.finish(status="ok" if review_passed else "unknown",
+                           detail=f"判定 {verdict}：{verdict_basis[:80]}")
         self.last_dimension_verdicts = [
             {"entry_id": e.entry_id, "name": e.name,
              "verdict": blind["per_dimension"].get(e.entry_id, "unknown")}
@@ -1198,6 +1291,8 @@ class Collaboration:
 
     def run(self) -> str:
         try:
+            # O2：生产者活动信号（独立于旁观器）；停止后信号自然过期
+            self.trace.start_heartbeat(producer_role=f"collab:{self.run_id}")
             self.notify(f"开始协作：{self.session.goal}（模式 {self.mode}，"
                         f"{'交互' if self.interactive else '非交互'}）")
             self.prepare_workspace()
@@ -1222,6 +1317,11 @@ class Collaboration:
         except Exception as exc:
             self._finalize_on_error(exc)
             raise
+        finally:
+            # O2：未关闭阶段如实记中断（未决等待保持打开，等待跨进程持续）；
+            # 停止活动信号（随后自然过期，不冒充生产者状态）
+            self.stages.close_stray(keep_waiting=True)
+            self.trace.stop_heartbeat()
 
     def _finalize_on_error(self, exc: Exception) -> None:
         """T3：意外异常也如实收尾——无终态尝试改记 unknown（需核对，不判失败），
@@ -1349,11 +1449,16 @@ class Collaboration:
                confirm_outcome: AttemptStatus | None = None) -> str:
         """恢复一次运行（异常同样收尾落盘，见 _finalize_on_error）。"""
         try:
+            # O2：恢复代次的运行由本进程继续发信号（旧代次信号不得冒充当前活跃）
+            self.trace.start_heartbeat(producer_role=f"collab:{self.run_id}")
             return self._resume_impl(answers=answers, feedback=feedback, goal_new=goal_new,
                                      revoke=revoke, confirm_outcome=confirm_outcome)
         except Exception as exc:
             self._finalize_on_error(exc)
             raise
+        finally:
+            self.stages.close_stray(keep_waiting=True)
+            self.trace.stop_heartbeat()
 
     def _resume_impl(self, answers: dict | None = None, feedback: str = "",
                      goal_new: str = "", revoke: bool = False,
@@ -1397,6 +1502,14 @@ class Collaboration:
         if answers:
             for ix_id, text in answers.items():
                 self.session.answer_interaction(ix_id, text, source="user")
+                # 审查修正 A：恢复回答补记事件并带关联标识；只关闭对应的等待阶段
+                self.trace.emit("user", "decision.answered",
+                                f"回答 {ix_id}：「{str(text)[:120]}」",
+                                brief_version=self.session.current_brief.version,
+                                interaction_id=ix_id)
+                self.stages.finish_waiting(status="ok",
+                                           detail=f"用户回答 {ix_id}；依赖工作继续",
+                                           interaction_id=ix_id)
             self.notify(f"已记录你的 {len(answers)} 条回答")
         pending_apply = any(
             ix.blocking_action == "apply-answers" and ix.answer_source is None

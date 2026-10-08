@@ -167,13 +167,17 @@ def _parse_blind_response(text: str, valid_ids: set) -> tuple:
 
 def run_blind_review(gateway, plan, before_pack, before_images, after_pack, after_images,
                      out_path, use_model: bool = True, notify=None, rng=None,
-                     before_html_sha256: str = "", after_html_sha256: str = "") -> dict:
+                     before_html_sha256: str = "", after_html_sha256: str = "",
+                     professional: dict | None = None) -> dict:
     """前后两版盲比：随机 A/B、只给计划标准、正反两序各判一次。
 
     返回 dict（落盘 out_path）：assignment（随机指派，可审计）、两序原始判定、
     逐维度正反一致性（不一致→该维度 unknown）、overall 与 usage/mock 标注。
     模型调用失败或输出非法 → overall="unknown"（不判改善）。同源模型：盲比
     降低确认偏差，不建立独立性。
+    C1：professional 只接收配置版本/哈希/本阶段职责的**关联信息**（写入结果
+    JSON 供追溯）；盲比输入仍然只有计划标准与观察——不接收诊断结论、候选或
+    配置内容（大纲 §3：保持盲评隔离）。
     """
     def _notify(message):
         if notify is not None:
@@ -191,6 +195,13 @@ def run_blind_review(gateway, plan, before_pack, before_images, after_pack, afte
         "overall": VERDICT_UNKNOWN, "note": "", "mock": False,
         "usage_total": {}, "dropped_refs": [],
     }
+    if isinstance(professional, dict) and professional.get("version"):
+        # 仅关联信息；不含配置内容（隔离边界见 docstring）
+        result["professional_config"] = {
+            "version": professional.get("version"),
+            "sha256": professional.get("sha256", ""),
+            "stage_responsibility": professional.get("stage_responsibility", ""),
+        }
     if before_pack is None or after_pack is None:
         result["note"] = "观察记录缺失（修改前/后至少一版无观察包）：无法盲比，记 unknown"
         _write_blind(out_path, result)

@@ -39,12 +39,13 @@ from mentis.guidance import (ObservationPack, _CHANGE_VERBS, _NEW_FACT_HINTS,
                              _RESERVED_NOUNS, _diagnosis_system_prompt,
                              _measurement_anomalies, _measurement_to_dict,
                              compose_revision_instruction, deterministic_checks)
-from mentis.capabilities.registry import load_registry
-from mentis.capabilities.selection import select_for_task
 from mentis.models.gateway import ModelConfig, ModelGateway
 from mentis.observation import observe_structure
+# C1：M 臂（含计划/诊断链）的任务专业配置；B-1 基线臂不使用，保持不记录
+from mentis.professional import ConfigManager
 from mentis.render_measurement import measure_page
-from mentis.trace import TraceArchiveError, TraceWriter, _sha256_file
+from mentis.trace import (TraceArchiveError, TraceWriter, _sha256_file,
+                          describe_executor_event)
 from mentis.collab import resolve_codex_executable
 
 RUN_SCHEMA = "mentis-eval-run/2"
@@ -144,6 +145,11 @@ class FairRun:
                                  executor_version=self.adapter.cli_version)
         self.budget: BudgetState | None = None
         self.manifest: dict = {}
+        self._model_stage = ""
+        self._model_output_refs: list = []
+        self._model_config: dict | None = None
+        self.professional: ConfigManager | None = None  # C1：M 臂懒创建
+        self.stages = self.trace.stage_tracker()  # O2：阶段起止记录
         self.state = {"schema": "mentis-eval-state/1", "stage": "new", "status": "new",
                       "answers": [], "checks": [], "checked_continuations": 0,
                       "reconciliation_closed": False,
@@ -194,7 +200,11 @@ class FairRun:
             iso["recovery_snapshot"] = str(recovery_snapshot.resolve())
         return iso
 
-    def _save_state(self):
+    def _drain_model_calls(self):
+        """O1：把新增网关调用记入 runner-state 与 trace/model-calls.jsonl。
+        阶段与产出引用由调用方在发起调用前/产出落盘后设置；未设置的如实记
+        unrecorded，不猜测归属。记录失败计追踪写失败（不静默）。
+        C1：_model_config 非空时调用行携带配置版本/哈希与本阶段职责。"""
         calls = getattr(self.gateway, "calls", [])
         for call in calls[self._gateway_seen:]:
             self.state["model_requests"].append({
@@ -202,7 +212,26 @@ class FairRun:
                 "ok": getattr(call, "ok", False), "mock": getattr(call, "mock", True),
                 "http_attempted": getattr(call, "http_attempted", False),
                 "usage": getattr(call, "usage", {}), "error": getattr(call, "error", "")})
+            self.trace.record_model_call(call, stage=self._model_stage,
+                                         output_refs=self._model_output_refs,
+                                         config=self._model_config)
         self._gateway_seen = len(calls)
+
+    def _professional_manager(self, goal: str) -> ConfigManager:
+        """C1：M 臂专业配置管理器（懒创建；恢复/续办时读回已落盘配置并核验）。
+        B-1 基线臂不走计划/诊断链，永不创建——其运行保持配置未记录（如实显示）。"""
+        if getattr(self, "professional", None) is None:
+            budget = getattr(self, "budget", None)
+            self.professional = ConfigManager(
+                self.run_dir, session=None, goal=goal, trace=self.trace,
+                user_source="e1-input-package",
+                budget_ref=(f"suite-policy:attempts<={budget.max_attempts},"
+                            f"revisions<={budget.max_revisions},model<={budget.max_model_calls}"
+                            if budget else "unrecorded"))
+        return self.professional
+
+    def _save_state(self):
+        self._drain_model_calls()
         self.state.update({"run_id": self.run_id, "arm": self.arm,
                            "prepared_dir": str(self.prepared_dir.resolve()),
                            "suite_path": self.suite_path, "suite_sha256": self.suite_sha256,
@@ -220,9 +249,19 @@ class FairRun:
         return material
 
     def _request_decision(self, pending, question, stage):
+        # 审查修正 A：稳定决定关联标识（注入回答按同一标识关闭对应等待）
+        n = int(self.state.get("decision_requests", 0)) + 1
+        self.state["decision_requests"] = n
+        ix_id = f"IX-E{n}"
         self.state.update(status="needs_user", stage=stage,
-                          pending={"fields": pending, "question": question})
-        self.trace.emit("mentis", "decision.requested", question[:180], status="pending")
+                          pending={"fields": pending, "question": question,
+                                   "interaction_id": ix_id})
+        self.trace.emit("mentis", "decision.requested", question[:180], status="pending",
+                        interaction_id=ix_id)
+        # O2：等待用户决定是真实阶段——阻塞依赖工作，原因与开始时间入阶段记录
+        self.stages.start("waiting_user", blocking=True, reason=question,
+                          detail=f"待决阶段 {stage}；依赖工作暂停（沉默≠批准）",
+                          interaction_id=ix_id)
         self._save_state()
         return {"status": "needs_user", "verdict": "unverified",
                 "verdict_basis": question, "pending": self.state["pending"]}
@@ -250,9 +289,16 @@ class FairRun:
         self.budget.take("attempts", self.budget.max_attempts, "执行器委托")
         attempt_seq = self.budget.used["attempts"]
         attempt_id = f"attempt-{attempt_seq:03d}"
+        # O2：委托即「执行器制作/修订」阶段的真实起止（失败/未知如实入阶段记录）
+        stage_name = "revise" if action_key.startswith("revision") or "revise" in action_key \
+            else "build"
+        self.stages.start(stage_name, detail=f"委托 {action_key}", attempt_id=attempt_id,
+                          plan={"version": 1, "sha256": (self.state.get("summary") or {})
+                                .get("plan_sha256", "")} if isinstance(self.state.get("summary"), dict) else {})
         try:
             prompt_ref = self.trace.archive_prompt(attempt_id, prompt)
         except TraceArchiveError as exc:
+            self.stages.finish(status="error", detail="prompt 落盘失败，委托未发起")
             self.trace.emit("mentis", "delegation.prepared",
                             f"prompt 落盘失败，本次委托不发起：{exc}",
                             attempt_id=attempt_id, status="failed")
@@ -263,21 +309,23 @@ class FairRun:
         self.trace.record_delegation(attempt_id, 0, prompt_ref, action=action_key)
 
         def on_event(event: dict, meta: dict):
+            # O1：与 collab/guide-revise 共用采集逻辑——公开消息全文归档+哈希引用，
+            # 摘要首尾保留；命令状态明确且标「输出未采集」缺口；采集异常不静默。
             try:
-                kind = str(event.get("type", "?"))
-                item = event.get("item") if isinstance(event.get("item"), dict) else {}
-                detail = f"{kind} {item.get('type', '')}".strip()
-                if kind == "item.completed" and item.get("type") == "agent_message":
-                    detail = f"最终消息：「{str(item.get('text', ''))[:160]}」"
-                elif item.get("type") == "command_execution":
-                    detail = f"命令 {str(item.get('command', ''))[:140]}（{item.get('status', '')}）"
-                if meta.get("first"):
-                    detail = f"首事件延迟 {meta.get('first_event_latency_s', 0):.1f}s；" + detail
+                detail, refs = describe_executor_event(
+                    event, meta,
+                    archive_message=lambda text: self.trace.archive_executor_message(
+                        attempt_id, text))
                 self.trace.emit("executor", "executor.started" if meta.get("first")
                                 else "executor.item", detail, attempt_id=attempt_id,
-                                native_thread_id=self.thread_id or None, status="pending")
-            except Exception:
-                pass
+                                native_thread_id=self.thread_id or None, status="pending",
+                                refs=refs)
+            except Exception as exc:
+                try:
+                    self.trace.note_capture_failure(
+                        f"executor 事件采集失败：{type(exc).__name__}（原文未入流）")
+                except Exception:
+                    pass
 
         import time
 
@@ -308,6 +356,9 @@ class FairRun:
                         status={"completed": "ok", "failed": "failed",
                                 "unknown": "unknown"}[result.status.value],
                         executor_status=result.status.value, usage=dict(result.usage))
+        # O2：阶段结束按执行器真实终态记录（unknown 保持 unknown，不冒充完成）
+        self.stages.finish(status=result.status.value,
+                           detail=f"{action_key} 终态 {result.status.value}；时长 {duration}s")
         self.state["status"] = result.status.value
         self.state["pending"]["executor_attempt_id"] = result.attempt_id
         self._save_state()
@@ -417,14 +468,17 @@ class FairRun:
         brief = Brief(brief_id="e1-m", version=1, objective=meta["input"]["user_goal"],
                       constraints=brief_constraints, preferences=[],
                       created_at=datetime.now().isoformat(timespec="seconds"))
-        _, resources = select_for_task(
-            load_registry(), task_label="评估计划", task_keywords=["单页活动介绍页"],
-            decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
-            observation_capabilities={"structure_only": True, "screenshots": True,
-                                     "render_measurement": True}, can_execute=True)
+        # C1：配置先落盘（一次选择+快照+绑定），计划随后派生；失败→不发起
+        professional = self._professional_manager(goal=meta["input"]["user_goal"])
+        _, _, resources = professional.ensure()
+        self._model_config = professional.binding("plan")
         use_model = bool(self.gateway is not None and self.gateway.has_credentials())
         if use_model:
             self._model_call_guard()
+        self._model_stage = "plan_instantiation"
+        self._model_output_refs = []
+        self.stages.start("plan", detail="评估计划组装（委托前）",
+                          config=self._model_config)
         plan = build_evaluation_plan(
             goal=meta["input"]["user_goal"], brief=brief, material_text=material,
             resources=resources, gateway=self.gateway, use_model=use_model,
@@ -436,11 +490,20 @@ class FairRun:
         payload = plan.to_json_bytes()
         path.write_bytes(payload)
         plan.sha256 = hashlib.sha256(payload).hexdigest()
+        self._model_output_refs = [{"path": str(path), "sha256": plan.sha256, "role": "plan"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
+        professional.note_plan(plan)
         self.trace.emit("mentis", "evaluation_plan.recorded",
                         f"评估计划 v1 已落盘（委托前）：{len(plan.entries)} 个维度、"
                         f"阻塞 {len(plan.blocking_entries())} 条；"
                         f"模型实例化 {plan.model_instantiation.get('status')}",
                         refs=[{"path": str(path), "sha256": plan.sha256, "role": "plan"}])
+        self.stages.finish(status="ok",
+                           detail=f"计划 v1 落盘；{len(plan.entries)} 个维度；"
+                                  f"模型实例化 {plan.model_instantiation.get('status')}")
         return plan
 
     def _adjudicate(self, bundle, pack, plan) -> list:
@@ -532,12 +595,15 @@ class FairRun:
 
         user_feedback = meta["input"].get("user_feedback", "")
         self._model_call_guard()
-        context, _ = select_for_task(
-            load_registry(), task_label="E1 M 臂诊断", task_keywords=["单页活动介绍页"],
-            decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
-            observation_capabilities={"structure_only": True,
-                                     "screenshots": bool(images),
-                                     "render_measurement": True}, can_execute=True)
+        # C1：诊断取用同一冻结配置的领域依据（恢复/续办时读回并核验，不重冻结）
+        professional = self._professional_manager(goal=meta["input"]["user_goal"])
+        _, context, _ = professional.ensure()
+        self._model_config = professional.binding("diagnose")
+        self._model_stage = "diagnosis"
+        self._model_output_refs = []
+        self.stages.start("diagnose",
+                          detail=f"诊断输入：观察 {len(pack.structure.items)} 条目、截图 {len(images)} 张",
+                          config=self._model_config)
         bundle = run_diagnosis(self.gateway, meta["input"]["user_goal"], user_feedback,
                                pack, context, images=images,
                                system=_diagnosis_system_prompt())
@@ -545,13 +611,28 @@ class FairRun:
         diagnosis_path.write_text(
             f"goal: {meta['input']['user_goal']}\nfeedback: {user_feedback}\n\n"
             + render_bundle_markdown(bundle), encoding="utf-8")
+        self._model_output_refs = [{"path": str(diagnosis_path),
+                                    "sha256": _sha256_file(diagnosis_path),
+                                    "role": "diagnosis"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
         self.trace.emit("mentis", "observation.diagnosis",
                         f"诊断（{'Mock' if bundle.mock else '真实模型'}）：有效 "
                         f"{len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}",
                         status="ok" if bundle.valid_diagnoses else "unknown",
                         refs=[{"path": str(diagnosis_path),
                                "sha256": _sha256_file(diagnosis_path), "role": "diagnosis"}])
+        self.stages.finish(status="ok" if bundle.valid_diagnoses else "unknown",
+                           detail=f"有效 {len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}"
+                                  f"（{'Mock' if bundle.mock else '真实模型'}）")
+        self.stages.start("adjudicate", detail="候选审查与可验证性路由",
+                          config=professional.binding("adjudicate"))
         adjudication = self._adjudicate(bundle, pack, plan)
+        self.stages.finish(status="ok",
+                           detail=f"{len(adjudication)} 条候选处置完毕；"
+                                  f"采纳 {sum(1 for c in adjudication if c['decision'] == 'adopt')}")
         adopted = [c for c in adjudication if c["decision"] == "adopt"]
         summary = {"plan_version": 1, "plan_sha256": plan.sha256,
                    "diagnosis": {"valid": len(bundle.valid_diagnoses),
@@ -631,24 +712,39 @@ class FairRun:
 
     def _verify_revision(self, summary, adopted, pack, images, preserved, form_reqs):
         plan = self._load_plan()
+        self.stages.start("reverify", detail="确定性复检 + 盲比两序")
         pack2, images2 = self._observe_full("verify")
         findings, regression, unknown = deterministic_checks(pack2, preserved, form_reqs)
         blind_path = self.run_dir / "blind-review.json"
+        _prof_binding = (self.professional.binding("reverify")
+                         if getattr(self, "professional", None) is not None else None)
         try:
             self._model_call_guard()
+            self._model_stage = "blind_review"
+            self._model_output_refs = []
+            self._model_config = _prof_binding
             blind = run_blind_review(
                 self.gateway, plan, pack, images, pack2, images2, blind_path,
                 use_model=bool(self.gateway is not None and self.gateway.has_credentials()),
                 rng=getattr(self, "_blind_rng", None),
-                before_html_sha256=pack.sha256, after_html_sha256=pack2.sha256)
+                before_html_sha256=pack.sha256, after_html_sha256=pack2.sha256,
+                professional=_prof_binding)
+            if blind_path.is_file():
+                self._model_output_refs = [{"path": str(blind_path),
+                                            "sha256": _sha256_file(blind_path),
+                                            "role": "review"}]
+            verdict, basis = grade_revision(
+                regression, unknown, pack.sha256 != pack2.sha256, blind,
+                targeted_dimensions=[c.get("dimension", "") for c in adopted])
         except BudgetExhausted as exc:
             blind = {"overall": "unknown", "consistent": False, "per_dimension": {},
                      "mock": False, "usage_total": {}}
             verdict, basis = "unverified", f"模型预算耗尽，盲比未执行：{exc}"
-        else:
-            verdict, basis = grade_revision(
-                regression, unknown, pack.sha256 != pack2.sha256, blind,
-                targeted_dimensions=[c.get("dimension", "") for c in adopted])
+        finally:
+            self._drain_model_calls()
+            self._model_stage = ""
+            self._model_output_refs = []
+            self._model_config = None
         summary["blind"] = {"overall": blind["overall"], "consistent": blind["consistent"],
                             "per_dimension": blind["per_dimension"],
                             "mock": blind["mock"], "usage_total": blind["usage_total"],
@@ -659,6 +755,8 @@ class FairRun:
                                     "unknown": unknown}
         blind_refs = ([{"path": str(blind_path), "sha256": _sha256_file(blind_path),
                         "role": "review"}] if blind_path.is_file() else [])
+        self.stages.finish(status="ok" if not regression and not unknown else "unknown",
+                           detail=f"判定 {verdict}：{basis[:80]}")
         self.trace.emit("mentis", "review.recorded",
                         f"修订复检：回归 {regression or '无'}；盲比两序"
                         f"{'一致' if blind['consistent'] else '不一致'}"
@@ -673,6 +771,8 @@ class FairRun:
         """准入 → 展开 → 方法循环 → manifest。准入失败抛 AdmissionError（零委托）。"""
         if self.existed:
             raise AdmissionError(f"运行目录已存在；使用 eval-answer/eval-continue 续办：{self.run_dir}")
+        # O2：生产者活动信号（独立于旁观器；后台线程，停止后信号自然过期）
+        self.trace.start_heartbeat(producer_role=f"eval-run:{self.arm}")
         iso = self._admission()
         meta = json.loads((self.arm_dir / "input.json").read_text(encoding="utf-8"))
         self.state["meta"] = meta
@@ -715,6 +815,13 @@ class FairRun:
         return self._finish(summary, iso)
 
     def _finish(self, summary, iso):
+        self.stages.start("finalize",
+                          detail=f"收尾：判定 {summary.get('verdict', 'unrecorded')}；"
+                                 f"状态 {self.state.get('status')}")
+        self.stages.finish(status="ok")
+        # 兜底：未关闭阶段如实记中断；待决的等待用户阶段保持打开（等待跨进程持续）
+        self.stages.close_stray(keep_waiting=True)
+        self.trace.stop_heartbeat()  # 信号随后自然过期，不写「已停止」冒充生产者状态
         self.state["summary"] = summary
         if self.state["status"] not in ("unknown", "needs_user", "error", "in_flight"):
             self.state["status"] = "finished"
@@ -828,7 +935,14 @@ class FairRun:
         self._archive_previous()
         stage = self.state["stage"]
         self.state["answers"].append(record)
-        self.trace.emit("user", "decision.received", f"{source}：{answer[:120]}", status="ok")
+        ix_id = str(self.state.get("pending", {}).get("interaction_id", ""))
+        self.trace.emit("user", "decision.received", f"{source}：{answer[:120]}", status="ok",
+                        interaction_id=ix_id or None)
+        # 等待用户阶段关闭：按关联标识只关闭对应等待；无法匹配时退回最近遗留等待
+        if not self.stages.finish_waiting(status="ok",
+                                          detail=f"用户决定已注入（来源 {source}）；依赖工作继续",
+                                          interaction_id=ix_id or None):
+            self.stages.finish(status="ok", detail=f"用户决定已注入（来源 {source}）")
         self.state["status"] = "ready"
         self._save_state()
         try:

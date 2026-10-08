@@ -24,9 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from mentis.capabilities.registry import load_registry
 from mentis.capabilities.routing import Gap, route_gap
-from mentis.capabilities.selection import select_for_task
 from mentis.contracts import (AttemptStatus, DelegationPolicy, Disposition, Provenance,
                               SourcedItem)
 from mentis.diagnosis import (DiagnosisBundle, render_bundle_markdown, run_diagnosis)
@@ -37,9 +35,11 @@ from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskSpec
 from mentis.models.gateway import ModelConfig, ModelGateway
 from mentis.observation import ObservationRecord, observe_structure
 from mentis.persist import save_session
+# C1：最小任务专业配置——职责/资源快照/任务条件与阶段绑定（大纲 §3）
+from mentis.professional import ConfigManager, ConfigPersistenceError
 from mentis.render_measurement import measure_page
 from mentis.session import TaskSession
-from mentis.trace import TraceArchiveError, TraceWriter
+from mentis.trace import TraceArchiveError, TraceWriter, describe_executor_event
 
 GUIDANCE_DIR = Path("runtime") / "guidance"
 STATE_VERSION = "p3.2"
@@ -275,16 +275,41 @@ class GuidanceCycle:
         self._blind_rng = None       # V2：盲比 A/B 随机源；测试可注入种子
         self.trace = TraceWriter(self.run_dir, self.run_id,
                                  executor_version=self.adapter.cli_version)
+        # O1/O2：模型调用记账游标与阶段记录
+        self._gateway_seen = len(getattr(self.gateway, "calls", []))
+        self._model_stage = ""
+        self._model_output_refs: list = []
+        self.stages = self.trace.stage_tracker()
+        # C1：任务专业配置（首次使用前冻结；诊断/计划/复检取同一版本）
+        self.professional = ConfigManager(self.run_dir, session=self.session,
+                                          trace=self.trace, notify=self._notify)
+        self._model_config: dict | None = None
+
+    def _drain_model_calls(self):
+        """O1：把新增网关调用记入 trace/model-calls.jsonl（阶段/产出引用由调用点
+        设置；未设置的如实记 unrecorded）。失败计追踪写失败，不静默。
+        C1：_model_config 非空时调用行携带配置版本/哈希与本阶段职责。"""
+        calls = getattr(self.gateway, "calls", [])
+        for call in calls[self._gateway_seen:]:
+            self.trace.record_model_call(call, stage=self._model_stage,
+                                         output_refs=self._model_output_refs,
+                                         config=self._model_config)
+        self._gateway_seen = len(calls)
 
     # ---- 流程 ----
 
     def run(self) -> str:
         """指导修订循环（意外异常同样收尾落盘，见 _finalize_on_error）。"""
         try:
+            # O2：生产者活动信号（独立于旁观器）；停止后信号自然过期
+            self.trace.start_heartbeat(producer_role=f"guide-revise:{self.run_id}")
             return self._run_impl()
         except Exception as exc:
             self._finalize_on_error(exc)
             raise
+        finally:
+            self.stages.close_stray(keep_waiting=True)
+            self.trace.stop_heartbeat()
 
     def _finalize_on_error(self, exc: Exception) -> None:
         """T3：意外异常也如实收尾——无终态尝试改记 unknown（需核对，不判失败），
@@ -524,15 +549,15 @@ class GuidanceCycle:
         if not self.use_model or not self.gateway.has_credentials():
             self._notify("模型不可用：无法生成诊断；不凭空给出修改指令")
             return None
-        context, _ = select_for_task(
-            _load_registry(), task_label="页面诊断与修改指导",
-            task_keywords=["单页活动介绍页"],
-            decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
-            observation_capabilities={"structure_only": True, "screenshots": bool(images),
-                                      "render_measurement": True},
-            can_execute=True,
-        )
+        # C1：诊断取用同一冻结配置的领域依据（不再单独重选注册表）
+        _, context, _ = self.professional.ensure(brief=self.session.current_brief)
+        self._model_config = self.professional.binding("diagnose")
         system = _diagnosis_system_prompt()
+        self._model_stage = "diagnosis"
+        self._model_output_refs = []
+        self.stages.start("diagnose",
+                          detail=f"诊断输入：观察 {len(pack.structure.items)} 条目、截图 {len(images)} 张",
+                          config=self._model_config)
         bundle = run_diagnosis(self.gateway, self._goal, "", pack, context,
                                images=images, system=system)
         origin = "Mock 固定响应" if bundle.mock else f"真实模型（{bundle.model}）"
@@ -544,6 +569,16 @@ class GuidanceCycle:
         record.diagnosis_path = str(self.run_dir / f"diagnosis-{tag}.md")
         (self.run_dir / f"diagnosis-{tag}.md").write_text(
             render_bundle_markdown(bundle) + image_note, encoding="utf-8")
+        self._model_output_refs = [{"path": record.diagnosis_path,
+                                    "sha256": _sha256_file(record.diagnosis_path),
+                                    "role": "diagnosis"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
+        self.stages.finish(status="ok" if bundle.valid_diagnoses else "unknown",
+                           detail=f"有效 {len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}"
+                                  f"、决策请求 {len(bundle.valid_decision_requests)}")
         self.trace.emit("mentis", "observation.diagnosis",
                         f"诊断（{'Mock' if bundle.mock else '真实模型'}）：有效 "
                         f"{len(bundle.valid_diagnoses)}、拒收 {len(bundle.invalid_diagnoses)}、"
@@ -577,10 +612,16 @@ class GuidanceCycle:
                 })
                 self.trace.emit("mentis", "decision.requested",
                                 f"请求 {ix.interaction_id}：{q}；依赖修订暂停（沉默≠批准）",
-                                brief_version=self.session.current_brief.version, status="pending")
+                                brief_version=self.session.current_brief.version,
+                                status="pending",
+                                interaction_id=ix.interaction_id)
                 self.trace.emit("mentis", "decision.routed",
                                 f"{ix.interaction_id} → request_user；触及保留决定或需要用户独有事实",
                                 brief_version=self.session.current_brief.version, status="pending")
+                # O2：等待用户决定阶段（只阻塞修订委托；未决时保持打开）
+                self.stages.start("waiting_user", blocking=True, reason=q,
+                                  detail=f"请求 {ix.interaction_id}；依赖 round{record.round_no} 修订暂停",
+                                  interaction_id=ix.interaction_id)
                 self._notify(f"决策请求转用户（{ix.interaction_id}）：{q}")
                 pause = True
             else:
@@ -613,10 +654,18 @@ class GuidanceCycle:
         )
         revision.to_attempt_id = attempt.attempt_id
         brief_version = self.session.current_brief.version
+        # O2：委托修订阶段的真实起止；C1：阶段绑定专业配置
+        self.stages.start("revise", detail=f"委托修订 {tag}",
+                          attempt_id=attempt.attempt_id, brief_version=brief_version,
+                          plan={"version": self.evaluation_plan.version,
+                                "sha256": self.evaluation_plan.sha256}
+                          if self.evaluation_plan else {},
+                          config=self.professional.binding("revise"))
         # 契约 §1：确切指令在实际调用前落盘；失败则不发起该次委托
         try:
             prompt_ref = self.trace.archive_prompt(attempt.attempt_id, record.instruction)
         except TraceArchiveError as exc:
+            self.stages.finish(status="error", detail="prompt 落盘失败，委托未发起")
             self.session.fail_attempt(attempt.attempt_id)
             self.trace.emit("mentis", "delegation.prepared",
                             f"prompt 落盘失败，本次委托不发起：{exc}",
@@ -632,31 +681,21 @@ class GuidanceCycle:
                                      action=f"revise-{tag}")
 
         def on_executor_event(event: dict, meta: dict):
-            # T2：逐行回调；异常不得中断执行（写失败由 manifest 完整性记录）
+            # O1：与 collab / eval-run 共用采集逻辑；采集失败计完整性，不静默
             try:
-                kind = str(event.get("type", "?"))
-                item = event.get("item") if isinstance(event.get("item"), dict) else {}
-                itype = str(item.get("type", ""))
-                refs = []
-                if itype == "command_execution":
-                    detail = f"命令 {str(item.get('command', ''))[:140]}（{item.get('status', '')}）"
-                elif kind == "item.completed" and itype == "agent_message":
-                    detail = f"最终消息：「{str(item.get('text', ''))[:160]}」"
-                    message_ref = self.trace.archive_executor_message(
-                        attempt.attempt_id, str(item.get("text", "")))
-                    if message_ref is not None:
-                        refs.append(message_ref)
-                elif itype == "reasoning":
-                    detail = "推理条目（内容不入默认层）"
-                else:
-                    detail = f"{kind} {itype}".strip() + (f"（{item.get('status', '')}）" if item.get("status") else "")
-                if meta.get("first"):
-                    detail = f"首事件延迟 {meta.get('first_event_latency_s', 0):.1f}s；" + detail
+                detail, refs = describe_executor_event(
+                    event, meta,
+                    archive_message=lambda text: self.trace.archive_executor_message(
+                        attempt.attempt_id, text))
                 self.trace.emit("executor", "executor.started" if meta.get("first") else "executor.item",
                                 detail, attempt_id=attempt.attempt_id, brief_version=brief_version,
                                 native_thread_id=self.thread_id or None, status="pending", refs=refs)
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    self.trace.note_capture_failure(
+                        f"executor 事件采集失败：{type(exc).__name__}（原文未入流）")
+                except Exception:
+                    pass
 
         self.session.mark_running(attempt.attempt_id)
         spec = CodexTaskSpec(
@@ -690,6 +729,10 @@ class GuidanceCycle:
         self.trace.record_executor_result(attempt.attempt_id, result.status,
                                           native_thread_id=result.native_thread_id,
                                           usage=dict(result.usage), error=result.error)
+        # O2：阶段结束按执行器真实终态记录（unknown 保持 unknown）
+        self.stages.finish(status=result.status.value,
+                           detail=f"修订 {tag} 终态 {result.status.value}；"
+                                  f"时长 {record.codex_duration_s}s")
         events_path = self.run_dir / f"codex-{tag}-events.json"
         events_path.write_text(json.dumps(
             [{"seq": e.sequence, "kind": e.kind, "item_type": e.item_type,
@@ -747,23 +790,19 @@ class GuidanceCycle:
         """
         if getattr(self, "evaluation_plan", None) is not None:
             return self.evaluation_plan
+        # C1：配置先落盘（失败→不发起），计划随后派生；资源取同一冻结配置
+        _, _, resources = self.professional.ensure(brief=self.session.current_brief)
         material_path = self._v1_dir / "source" / "workspace_input_copy.md"
         material = ""
         try:
             material = material_path.read_text(encoding="utf-8") if material_path.is_file() else ""
         except OSError:
             material = ""
-        resources = []
-        try:
-            _, resources = select_for_task(
-                load_registry(), task_label="评估计划",
-                task_keywords=["单页活动介绍页"],
-                decision_needs=["信息密度", "主操作层级", "表单校验行为", "视觉层级"],
-                observation_capabilities={"structure_only": True, "screenshots": True,
-                                         "render_measurement": True},
-                can_execute=True)
-        except Exception:
-            resources = []
+        self._model_stage = "plan_instantiation"
+        self._model_output_refs = []
+        self._model_config = self.professional.binding("plan")
+        self.stages.start("plan", detail="评估计划组装（修订委托前）",
+                          config=self._model_config)
         plan = build_evaluation_plan(
             goal=self._goal, brief=self.session.current_brief, material_text=material,
             resources=resources, gateway=self.gateway,
@@ -779,6 +818,15 @@ class GuidanceCycle:
         import hashlib
 
         plan.sha256 = hashlib.sha256(payload).hexdigest()
+        self._model_output_refs = [{"path": str(path), "sha256": plan.sha256, "role": "plan"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
+        self.professional.note_plan(plan)
+        self.stages.finish(status="ok",
+                           detail=f"计划 v1 落盘；{len(plan.entries)} 个维度、"
+                                  f"阻塞 {len(plan.blocking_entries())} 条")
         self.trace.emit("mentis", "evaluation_plan.recorded",
                         f"评估计划 v1 已落盘（修订委托前）：{len(plan.entries)} 个维度、"
                         f"阻塞 {len(plan.blocking_entries())} 条；"
@@ -798,17 +846,30 @@ class GuidanceCycle:
 
         测量不可信、缺记录或缺复查截图 → unknown：不判通过，记为 unverified。
         """
+        self.stages.start("reverify", detail=f"复检 {tag}：确定性检查 + 盲比两序",
+                          config=self.professional.binding("reverify"))
         pack2, images2 = self._observe(v2_html, f"{tag}-verify")
         findings, regression, unknown = self._deterministic_checks(pack2)
         if self.include_images and self.browser_capture is not None and not images2:
             unknown.append("复查截图缺失：视觉类解决声明无法核对（不作为通过依据）")
         blind_path = self.run_dir / f"blind-review-{tag}.json"
+        self._model_stage = "blind_review"
+        self._model_output_refs = []
+        self._model_config = self.professional.binding("reverify")
         blind = run_blind_review(
             self.gateway, self.evaluation_plan, pack_before, images_before or [],
             pack2, images2, blind_path, use_model=self.use_model, notify=self._notify,
             rng=getattr(self, "_blind_rng", None),
             before_html_sha256=pack_before.sha256 if pack_before else "",
-            after_html_sha256=pack2.sha256)
+            after_html_sha256=pack2.sha256,
+            professional=self._model_config)
+        if blind_path.is_file():
+            self._model_output_refs = [{"path": str(blind_path),
+                                        "sha256": _sha256_file(blind_path), "role": "review"}]
+        self._drain_model_calls()
+        self._model_stage = ""
+        self._model_output_refs = []
+        self._model_config = None
         artifact_changed = bool(pack_before) and pack_before.sha256 != pack2.sha256
         verdict, verdict_basis = grade_revision(regression, unknown, artifact_changed, blind)
         # 验收门与判定分级解耦（V2）：接受=确定性健康；盲比只决定“改善声明”
@@ -858,6 +919,8 @@ class GuidanceCycle:
                               {"path": str(blind_path),
                                "sha256": _sha256_file(blind_path), "role": "review"}])
         record.review_path = str(self.run_dir / f"review-{tag}.md")
+        self.stages.finish(status="ok" if review_passed else "unknown",
+                           detail=f"判定 {verdict}：{verdict_basis[:80]}")
         return verdict
 
     def _deterministic_checks(self, pack: ObservationPack) -> tuple[list, list, list]:
@@ -1002,10 +1065,18 @@ class GuidanceCycle:
     def resume(self, answers: dict | None = None, retry: bool = False) -> str:
         """恢复循环（异常同样收尾落盘，见 _finalize_on_error）。"""
         try:
+            # O2：恢复代次由本进程继续发信号；回答注入后等待阶段如实关闭
+            self.trace.start_heartbeat(producer_role=f"guide-revise:{self.run_id}")
+            if answers:
+                self.stages.finish_waiting(status="ok",
+                                           detail=f"用户回答 {len(answers)} 条；依赖工作继续")
             return self._resume_impl(answers=answers, retry=retry)
         except Exception as exc:
             self._finalize_on_error(exc)
             raise
+        finally:
+            self.stages.close_stray(keep_waiting=True)
+            self.trace.stop_heartbeat()
 
     def _resume_impl(self, answers: dict | None = None, retry: bool = False) -> str:
         """恢复循环：回答诊断的用户决定（answers），或在核对后续办失败轮（retry=True）。"""
@@ -1014,9 +1085,13 @@ class GuidanceCycle:
         answers = answers or {}
         for ix_id, text in answers.items():
             self.session.answer_interaction(ix_id, text, source="user")
+            # 审查修正 A：回答带关联标识；只关闭对应的等待阶段
             self.trace.emit("user", "decision.answered",
                             f"用户回答 {ix_id}；原文保存在会话记录",
-                            brief_version=self.session.current_brief.version)
+                            brief_version=self.session.current_brief.version,
+                            interaction_id=ix_id)
+            self.stages.finish_waiting(status="ok", detail=f"用户回答 {ix_id}",
+                                       interaction_id=ix_id)
         pending = [ix for ix in self.session.interactions
                    if ix.kind.value == "request_decision" and ix.answer_source is None]
         if pending:
@@ -1663,12 +1738,6 @@ def _diagnosis_system_prompt() -> str:
     return SYSTEM_PROMPT + "\n" + GUIDANCE_SYSTEM_ADDENDUM
 
 
-def _load_registry():
-    from mentis.capabilities.registry import load_registry
-
-    return load_registry()
-
-
 def _bundle_from_markdown(path: Path) -> DiagnosisBundle:
     """恢复场景的兜底：诊断正文从 markdown 重建（仅保留现象行，供复查清单引用）。"""
     bundle = DiagnosisBundle(goal="", observation_source="", model="restored",
@@ -1744,6 +1813,15 @@ def guidance_from_state(state_path: str | Path, adapter=None, gateway=None,
     obj._ensure_v1_reference()  # 从冻结 v1 重建逐段保留项与逐字段必填基准
     obj._finalized_emitted = False
     obj.trace = TraceWriter(obj.run_dir, obj.run_id, executor_version=obj.adapter.cli_version)
+    # O1：恢复对象的网关是新实例——只记恢复后的调用；恢复前的调用 unrecorded
+    obj._gateway_seen = len(getattr(obj.gateway, "calls", []))
+    obj._model_stage = ""
+    obj._model_output_refs = []
+    obj.stages = obj.trace.stage_tracker()  # O2：恢复后旧未关闭阶段如实对账
+    # C1：恢复/续办复用已落盘配置（ensure 读回并核验；不重冻结）
+    obj.professional = ConfigManager(obj.run_dir, session=obj.session, trace=obj.trace,
+                                     notify=obj._notify)
+    obj._model_config = None
     obj.trace.emit("mentis", "run.resumed",
                    f"从落盘状态恢复（进入时状态 {obj.status}）；既有事件续排，不重放历史委托",
                    brief_version=obj.session.current_brief.version)

@@ -32,6 +32,9 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis field-feedback 查看作品后补记逐字反馈（绑定该运行的会话记录）
   python -m mentis trace           P2.4 事后回放 / --follow 实时旁观（只读）/ --export 导出白名单时间线
   python -m mentis conversation    本地交流视图：确切委托、Codex 公开回复与动作摘要（只读）
+  python -m mentis replay          P2.4-O1 只读运行投影：决策/模型调用/版本证据关联（CLI 与后续页面共用）
+  python -m mentis status          P2.4-O2 最后可靠状态：阶段、等待、生产者活动、预算（只读）
+  python -m mentis view            本地只读流程页（时间线、决策、交流、作品证据；--run 选择运行）
   python -m mentis eval-check      E1 冻结清单核对（离线；--isolation-evidence 接入真实隔离准入）
   python -m mentis eval-prepare    E1 按白名单制作各组相同输入包（离线；拒绝覆盖）
   python -m mentis eval-isolate    E1 答案读隔离：probe 开窗双端探测 / release 解除 / check 准入
@@ -112,6 +115,19 @@ def main(argv=None) -> int:
                          "用户逐字反馈/密钥字段；历史运行导出材料清单+缺口，不回填）")
     conversation = sub.add_parser("conversation", help="本地交流视图（确切指令、公开回复与动作摘要；只读）")
     conversation.add_argument("--run", required=True, help="运行目录（runtime/collab/<ID> 或 runtime/guidance/<ID>）")
+    view = sub.add_parser("view", help="本地只读运行页面：时间线、决策、公开交流与作品证据")
+    view.add_argument("--run", required=True, help="选定运行目录")
+    view.add_argument("--port", type=int, default=8873, help="本机端口，0 表示自动选择")
+    replay = sub.add_parser("replay",
+                            help="P2.4-O1 只读运行投影：决策记录、模型调用、版本与证据关联"
+                                 "（CLI 与后续页面共用；不重算业务判定、不改写运行目录）")
+    replay.add_argument("--run", required=True, help="运行目录（eval-run / collab / guidance）")
+    replay.add_argument("--out", default="", help="同时把投影 Markdown 写入该路径（默认只打印；"
+                                                  "不写入运行目录）")
+    status = sub.add_parser("status",
+                            help="P2.4-O2 最后可靠状态：当前阶段、等待原因、生产者活动信号、"
+                                 "预算与收尾（只读；活动过期只表示无法确认活跃，不代表失败）")
+    status.add_argument("--run", required=True, help="运行目录（eval-run / collab / guidance）")
     echeck = sub.add_parser("eval-check", help="E1 只读核对冻结源与输入白名单，不运行实验")
     echeck.add_argument("--suite", default="docs/evaluation/e1/suite.json", help="探索性开发集清单")
     echeck.add_argument("--isolation-evidence", default="",
@@ -397,6 +413,50 @@ def main(argv=None) -> int:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")  # 确切指令可能含 ¥ 等本机 GBK 不可编码字符
         print(render_conversation(run_dir))
+        return 0
+    if args.command == "view":
+        from mentis.run_view import serve_run
+        if not 0 <= args.port <= 65535:
+            print("端口必须在 0—65535 之间", file=sys.stderr)
+            return 2
+        try:
+            return serve_run(args.run, args.port)
+        except (OSError, ValueError) as exc:
+            print(f"查看服务无法启动：{exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "replay":
+        from mentis.run_projection import load_projection, render_projection_markdown
+
+        run_dir = Path(args.run)
+        if not run_dir.is_dir():
+            print(f"运行目录不存在：{run_dir.resolve()}", file=sys.stderr)
+            return 2
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        projection = load_projection(run_dir)
+        markdown = render_projection_markdown(projection)
+        if args.out:
+            out_path = Path(args.out)
+            if out_path.resolve() in (run_dir.resolve(),) or run_dir.resolve() in out_path.resolve().parents:
+                print("输出路径不能位于运行目录内（投影不改写运行材料）", file=sys.stderr)
+                return 2
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(markdown, encoding="utf-8")
+            print(f"[投影已写入] {out_path.resolve()}（运行目录字节未改动）")
+        print(markdown)
+        return 0
+
+    if args.command == "status":
+        from mentis.run_projection import load_run_state, render_state_markdown
+
+        run_dir = Path(args.run)
+        if not run_dir.is_dir():
+            print(f"运行目录不存在：{run_dir.resolve()}", file=sys.stderr)
+            return 2
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        print(render_state_markdown(load_run_state(run_dir)))
         return 0
 
     print(BANNER.format(version=__version__, stage=STAGE).rstrip())
