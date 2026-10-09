@@ -1399,6 +1399,7 @@ class Collaboration:
         V2 精度修正（真实运行观察到）：IDE 常驻的 `codex.exe app-server` 与
         computer-use 辅助进程以 codex 之名长期存在，但不是任务委托写入者；
         按命令行排除，避免存活门控被无关进程误触发而永远无法人工核对确认。
+        P3.4 补充：`codex-code-mode-host.exe` 同为常驻辅助进程，同列排除。
         其余 codex 进程（如 `codex.exe exec …`）仍一律视为潜在写入者。
         """
         import subprocess
@@ -1408,7 +1409,8 @@ class Collaboration:
             "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'codex*' "
             "-and $_.CreationDate -and $_.CreationDate -gt $since "
             "-and $_.CommandLine -and $_.CommandLine -notmatch 'app-server' "
-            "-and $_.CommandLine -notmatch 'computer-use' } | "
+            "-and $_.CommandLine -notmatch 'computer-use' "
+            "-and $_.CommandLine -notmatch 'code-mode-host' } | "
             "Select-Object ProcessId,CreationDate | ConvertTo-Json -Compress"
             % since_iso.replace("T", " ")
         )

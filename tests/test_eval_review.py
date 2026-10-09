@@ -332,6 +332,8 @@ class WriterGatePrecisionTests(unittest.TestCase):
         self.assertIn("Get-CimInstance", script)
         self.assertIn("-notmatch 'app-server'", script)
         self.assertIn("-notmatch 'computer-use'", script)
+        # P3.4 真实会话观察到：codex-code-mode-host.exe 亦为常驻辅助进程
+        self.assertIn("-notmatch 'code-mode-host'", script)
         self.assertIn("codex*", script)
 
     def test_gate_script_parses_single_process_object(self):

@@ -35,6 +35,7 @@ Mentis v{version} — 开发入口（当前：{stage}）
   python -m mentis replay          P2.4-O1 只读运行投影：决策/模型调用/版本证据关联（CLI 与后续页面共用）
   python -m mentis status          P2.4-O2 最后可靠状态：阶段、等待、生产者活动、预算（只读）
   python -m mentis view            本地只读流程页（时间线、决策、交流、作品证据；--run 选择运行）
+  python -m mentis workbench      P3.4 本地工作台：浏览器内发起与跟进任务（默认端口 8874）
   python -m mentis eval-check      E1 冻结清单核对（离线；--isolation-evidence 接入真实隔离准入）
   python -m mentis eval-prepare    E1 按白名单制作各组相同输入包（离线；拒绝覆盖）
   python -m mentis eval-isolate    E1 答案读隔离：probe 开窗双端探测 / release 解除 / check 准入
@@ -118,6 +119,12 @@ def main(argv=None) -> int:
     view = sub.add_parser("view", help="本地只读运行页面：时间线、决策、公开交流与作品证据")
     view.add_argument("--run", required=True, help="选定运行目录")
     view.add_argument("--port", type=int, default=8873, help="本机端口，0 表示自动选择")
+    workbench = sub.add_parser("workbench",
+                               help="P3.4 本地工作台：浏览器内发起任务/跟进度/答复待决/"
+                                    "反馈/改目标/核对/撤回与作品对比（动作转发真实 CLI）")
+    workbench.add_argument("--port", type=int, default=8874, help="本机端口，0 表示自动选择")
+    workbench.add_argument("--runs-dir", default="runtime/collab",
+                           help="任务运行目录（默认 runtime/collab）")
     replay = sub.add_parser("replay",
                             help="P2.4-O1 只读运行投影：决策记录、模型调用、版本与证据关联"
                                  "（CLI 与后续页面共用；不重算业务判定、不改写运行目录）")
@@ -423,6 +430,17 @@ def main(argv=None) -> int:
             return serve_run(args.run, args.port)
         except (OSError, ValueError) as exc:
             print(f"查看服务无法启动：{exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "workbench":
+        from mentis.workbench import serve_workbench
+        if not 0 <= args.port <= 65535:
+            print("端口必须在 0—65535 之间", file=sys.stderr)
+            return 2
+        try:
+            return serve_workbench(args.runs_dir, args.port)
+        except (OSError, ValueError) as exc:
+            print(f"工作台无法启动：{exc}", file=sys.stderr)
             return 2
 
     if args.command == "replay":
