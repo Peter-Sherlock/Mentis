@@ -537,6 +537,10 @@ class Collaboration:
         self.trace.record_delegation(attempt.attempt_id, brief_version, prompt_ref, action=action_key)
 
         def on_executor_event(event: dict, meta: dict):
+            # P3.3：thread.started 一到就记线程 ID（原先等适配器返回才记）——
+            # 进程中断后可从追踪的 executor 事件恢复续接凭据
+            if str(event.get("type", "")) == "thread.started" and event.get("thread_id"):
+                self.thread_id = str(event.get("thread_id"))
             # O1：与 guide-revise / eval-run 共用采集逻辑；异常不中断执行，
             # 采集失败经 note_capture_failure 计入完整性（不静默吞掉）
             try:
@@ -555,6 +559,10 @@ class Collaboration:
                     pass
 
         self.session.mark_running(attempt.attempt_id)
+        # P3.3：委托发起即落盘（checkpoint，不发 run.finalized）——适配器调用
+        # 阻塞期间进程若被杀，在途尝试已在任务库中（running），恢复后的会话
+        # 才能经核对路径收养它；否则该尝试只存在于追踪与写锁中
+        self._persist(None, None, delivered=False, checkpoint=True)
         spec = CodexTaskSpec(
             workspace=self.workspace, prompt=prompt,
             brief_version=brief_version,
@@ -821,6 +829,13 @@ class Collaboration:
             self.notify("结构检查与专业评审完成 → 初稿已交付（可查看）；" + review.get("delivery_note", ""))
         except Exception as exc:
             self.notify(f"接受被拒绝：{exc}")
+            # P3.3：拒绝留痕——接受门禁（含过期版本）的否决只发通知不够，
+            # 追踪事件流必须有据可查（与 UnauthorizedAction 拒绝同等待遇）
+            self.trace.emit("mentis", "accept.rejected",
+                            f"接受被拒绝：{exc}（晚到/过期结果不自动验收）",
+                            attempt_id=final_attempt.attempt_id,
+                            brief_version=self.session.current_brief.version,
+                            status="failed")
         self.status = "DELIVERED" if delivered else "NOT_DELIVERED"
         self._persist(review.get("structure") or structure,
                       review.get("browser_obs") or browser_obs, delivered=delivered)
@@ -1434,6 +1449,25 @@ class Collaboration:
                 self.session.mark_unknown(attempt.attempt_id)
                 self.notify("修正：旧版本持久化把超时尝试记为 running；"
                             "按执行器实际结果改记 unknown（透明修正）")
+            else:
+                # P3.3：进程中断孤儿——尝试停在 running 且没有任何执行器结果记录
+                #（运行进程在适配器调用期间被杀的特征）。按 unknown 纳入核对；
+                # 是否仍在写入由上方的活跃 codex 进程检查把关，不自动重发。
+                known_runs = {r.attempt_id for r in self.codex_runs}
+                orphan = [a for a in running if a.attempt_id not in known_runs]
+                if orphan:
+                    attempt = orphan[-1]
+                    self.session.mark_unknown(attempt.attempt_id)
+                    self.notify(f"进程中断恢复：尝试 {attempt.attempt_id} 处于 running 且无"
+                                "执行器结果记录（运行进程中断特征）；按 unknown 纳入核对，"
+                                "不自动重发")
+                    self.trace.emit("mentis", "attempt.reconciled",
+                                    f"进程中断恢复：尝试 {attempt.attempt_id} 处于 running 且无"
+                                    "执行器结果记录（运行进程中断特征）；按 unknown 纳入核对，"
+                                    "不自动重发",
+                                    attempt_id=attempt.attempt_id,
+                                    brief_version=self.session.current_brief.version,
+                                    status="unknown")
         if attempt is None:
             # 无终态事件被记为 failed，但执行器有最终文本且产物可核对 → 按不确定处理
             failed = [a for a in self.session.attempts if a.status.value == "failed"]
@@ -1718,15 +1752,18 @@ class Collaboration:
         prefs = [i.text for i in self.session.current_brief.preferences]
         return "；".join(prefs) if prefs else "温暖简洁"
 
-    def _persist(self, structure, browser_obs, delivered: bool):
+    def _persist(self, structure, browser_obs, delivered: bool, checkpoint: bool = False):
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        if not self._finalized_emitted:
+        # checkpoint=委托发起时的过程落盘：只保全量状态，不发收尾事件
+        #（运行并未收尾；真正的收尾由后续 _persist 正常发 run.finalized）
+        if not checkpoint and not self._finalized_emitted:
             self.trace.emit("mentis", "run.finalized",
                             f"运行收尾：状态 {self.status}；交付 {'是' if delivered else '否'}",
                             brief_version=self.session.current_brief.version,
                             status="ok" if delivered else "unknown")
             self._finalized_emitted = True
-        self.trace.finalize(outcome=f"{self.status}（delivered={delivered}）")
+        if not checkpoint:
+            self.trace.finalize(outcome=f"{self.status}（delivered={delivered}）")
         save_session(self.session, str(self.run_dir / "session.json"))
         meta = {
             "state_version": STATE_VERSION,
