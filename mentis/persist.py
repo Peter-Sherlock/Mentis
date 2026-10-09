@@ -84,6 +84,22 @@ def save_session(session: TaskSession, path: str) -> str:
     return path
 
 
+def session_rows(session: TaskSession) -> dict:
+    """P1.3：供 SQLite 存储使用的规范化行数据（与 JSON 导出同一套映射，
+    不另建第二套转换）。返回的 dict 均可 JSON 序列化。"""
+    return {
+        "briefs": [_brief_to_dict(b) for b in session.briefs],
+        "policies": [_policy_to_dict(p) for p in session.policies],
+        "authorizations": [_auth_to_dict(a) for a in session.authorizations],
+        "interactions": [_interaction_to_dict(ix) for ix in session.interactions],
+        "attempts": [_attempt_to_dict(a) for a in session.attempts],
+        "artifacts": [_artifact_to_dict(x) for x in session.artifacts],
+        "reviews": [_review_to_dict(r) for r in session.reviews],
+        "revisions": [_revision_to_dict(r) for r in session.revisions],
+        "user_feedback": dict(session.user_feedback),
+    }
+
+
 def load_session(path: str) -> TaskSession:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -179,6 +195,9 @@ def _interaction_to_dict(ix: Interaction) -> dict:
         "answer_text": ix.answer_text,
         "answer_source": ix.answer_source,
         "answered_at": ix.answered_at,
+        # P1.3 新增可选字段：历史 session.json 无此键，读取用 .get 兼容
+        "brief_version": ix.brief_version,
+        "answered_brief_version": ix.answered_brief_version,
     }
 
 
@@ -192,6 +211,8 @@ def _interaction_from_dict(d: dict) -> Interaction:
         answer_text=d["answer_text"],
         answer_source=d["answer_source"],
         answered_at=d["answered_at"],
+        brief_version=d.get("brief_version"),
+        answered_brief_version=d.get("answered_brief_version"),
     )
 
 

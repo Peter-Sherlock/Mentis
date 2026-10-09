@@ -497,6 +497,14 @@ def load_projection(run_dir) -> dict:
         gaps.append(f"seq {r.get('event_seq')} 引用 {r.get('name', r.get('path', ''))}：{r['verify_detail']}")
     unverified_usage = any((not c.get("usage")) and c.get("ok") for c in calls_view)
 
+    # P1.3：任务库摘要（只读；库与 JSON 导出摘要不一致时如实显示——库为规范态）
+    task_db = {"present": False}
+    try:
+        from mentis.store import store_status
+        task_db = store_status(run_dir)
+    except Exception:
+        task_db = {"present": False, "error": "读取异常"}
+
     return {
         "schema": PROJECTION_SCHEMA,
         "run_id": run_dir.name,
@@ -521,6 +529,7 @@ def load_projection(run_dir) -> dict:
         "model_calls": calls_view,
         "versions": versions,
         "professional": professional,
+        "task_db": task_db,
         "ref_checks": ref_results,
         "gaps": gaps,
         "usage_note": ("存在 ok 调用但无用量记录：未知用量不写 0" if unverified_usage
@@ -765,6 +774,15 @@ def _finalized_info(events: list) -> dict:
                      else "仅旧代次收尾存在于流中；恢复后的新代次不得据此视为完成")}
 
 
+def _load_task_db_view(run_dir: Path) -> dict:
+    """P1.3：任务库只读摘要（status 入口显示；不一致如实标注，以库为规范态）。"""
+    try:
+        from mentis.store import store_status
+        return store_status(run_dir)
+    except Exception as exc:
+        return {"present": False, "error": f"读取异常（{type(exc).__name__}）"}
+
+
 def load_run_state(run_dir) -> dict:
     """最后可靠状态投影：阶段、等待、生产者活动、最近业务事件与预算。
 
@@ -948,6 +966,7 @@ def load_run_state(run_dir) -> dict:
         "verdict": verdict or "unrecorded",
         "budget": _load_run_budget(run_dir, kind, state if isinstance(state, dict) else {}),
         "professional": load_professional_view(run_dir),
+        "task_db": _load_task_db_view(run_dir),
         "counts": counts,
         "integrity": integrity,
         "notes": notes,
@@ -1025,6 +1044,18 @@ def render_state_markdown(state: dict) -> str:
                      f"（{prof['status']}；绑定 {prof.get('bindings_count', 0)} 条；"
                      f"资源快照 {len(prof.get('grounds', []))} 项）"
                      + (f"；核验问题 {len(prof['problems'])} 项" if prof.get("problems") else ""))
+    tdb = state.get("task_db") or {}
+    if tdb.get("present"):
+        if tdb.get("error"):
+            lines.append(f"- 任务库：存在但不可读（{tdb['error']}）——恢复需先核对，不以 JSON 导出静默替代")
+        else:
+            lines.append(f"- 任务库：{tdb.get('path', 'state.sqlite3')}"
+                         f"（mentis-task-store/1 v{tdb.get('db_version', '?')}；"
+                         f"摘要 {tdb.get('state_digest', '') or '未记录'}）"
+                         + ("；与 JSON 导出摘要不一致（以库为准）" if tdb.get("export_mismatch") else ""))
+    else:
+        lines.append("- 任务库：未创建（collab 运行本轮起落盘创建；历史 collab 运行下次"
+                     "落盘/迁移时创建，恢复暂走 JSON 导出路径；eval/guidance 沿用各自 JSON 状态）")
     for note in state["notes"]:
         lines.append(f"- 注意：{note}")
     lines.append("")

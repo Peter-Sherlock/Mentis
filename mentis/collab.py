@@ -140,9 +140,39 @@ class CodexRunSummary:
 
 
 def load_state(state_path: str | Path) -> tuple[dict, TaskSession]:
+    """读取运行状态。P1.3：任务库（state.sqlite3）存在时以库为规范态来源；
+    库损坏/版本不符显式报错（不静默降级到可能陈旧的 JSON 导出，也不新建任务）。
+    无库（历史运行）走 JSON 导出路径，由下次落盘时完成迁移。"""
     state_path = Path(state_path)
+    from mentis.store import restore_task_state
+    db = state_path.parent / "state.sqlite3"
+    if db.is_file():
+        session, dbmeta = restore_task_state(state_path.parent)  # StoreError 直接上抛
+        sp = state_path if state_path.is_file() else None
+        meta = json.loads(sp.read_text(encoding="utf-8")) if sp else {}
+        # 以库为准合并任务级字段；JSON 导出仅补充视图性字段（可缺失——库为规范态）
+        for key in ("run_id", "mode", "status", "goal", "workspace", "base_dir",
+                    "thread_id", "repairs_used", "timeout_s", "max_repairs",
+                    "applied_answers", "delivered", "material_text",
+                    "codex_runs", "question_routes", "model_usage",
+                    "evaluation_plan", "observation_source", "currency_cap"):
+            if key in dbmeta:
+                meta[key] = dbmeta[key]
+        exported = json.loads(sp.read_text(encoding="utf-8")) if sp else {}
+        exported_digest = (exported.get("task_db") or {}).get("digest", "")
+        meta["task_db"] = {"state": "restored",
+                           "db_version": (dbmeta.get("task_db") or {}).get("db_version", 1),
+                           "digest": dbmeta.get("state_digest", "")}
+        meta["restored_from"] = "sqlite"
+        if exported_digest and exported_digest != dbmeta.get("state_digest", ""):
+            meta["restore_notes"] = [
+                "JSON 导出与任务库摘要不一致：以库为准（导出可能是旧一次落盘）"]
+        return meta, session
     meta = json.loads(state_path.read_text(encoding="utf-8"))
     session = session_from_dict(json.loads((state_path.parent / "session.json").read_text(encoding="utf-8")))
+    meta["restored_from"] = "json-export"
+    meta["restore_notes"] = [
+        "任务库不存在：从 JSON 导出恢复（迁移路径；下次落盘将创建任务库）"]
     return meta, session
 
 
@@ -194,6 +224,8 @@ def collaboration_from_state(state_path: str | Path, interactive: bool = False,
     obj.professional = ConfigManager(obj.run_dir, session=obj.session, trace=obj.trace,
                                      user_source="user-cli-invocation")
     obj._model_config = None
+    for note in meta.get("restore_notes", []):
+        obj.notify(f"恢复说明：{note}")
     obj.trace.emit("mentis", "run.resumed",
                    f"从落盘状态恢复（进入时状态 {obj.status}）；既有事件续排，不重放历史委托",
                    brief_version=obj.session.current_brief.version)
@@ -1499,9 +1531,31 @@ class Collaboration:
                 self.status = "FAILED"
                 self._persist(None, None, delivered=False)
             return self.status
+        from mentis.contracts import InvalidInteraction
+        from mentis.store import record_task_event
+        answers_all_stale = False
+        fresh = 0
         if answers:
             for ix_id, text in answers.items():
-                self.session.answer_interaction(ix_id, text, source="user")
+                # P1.3：重复事件不重复推进——已回答的请求幂等跳过
+                if self.session.is_answered(ix_id):
+                    record_task_event(self.run_dir, "task.answer_duplicate_skipped",
+                                      {"interaction_id": ix_id},
+                                      self.session.current_brief.version)
+                    self.notify(f"{ix_id} 已回答过：幂等跳过，不重复推进")
+                    continue
+                try:
+                    ix = None
+                    for cand in self.session.interactions:
+                        if cand.interaction_id == ix_id:
+                            ix = cand
+                            break
+                    request_brief_v = ix.brief_version if ix is not None else None
+                    self.session.answer_interaction(ix_id, text, source="user")
+                except InvalidInteraction as exc:
+                    # 与上方检查之间的极端竞态或通知误答：如实拒绝，不推进
+                    self.notify(f"跳过 {ix_id}：{exc}")
+                    continue
                 # 审查修正 A：恢复回答补记事件并带关联标识；只关闭对应的等待阶段
                 self.trace.emit("user", "decision.answered",
                                 f"回答 {ix_id}：「{str(text)[:120]}」",
@@ -1510,7 +1564,27 @@ class Collaboration:
                 self.stages.finish_waiting(status="ok",
                                            detail=f"用户回答 {ix_id}；依赖工作继续",
                                            interaction_id=ix_id)
-            self.notify(f"已记录你的 {len(answers)} 条回答")
+                # P1.3：旧版本回复不批准新范围——请求时的 brief 已被替代则只入档
+                if (request_brief_v is not None
+                        and request_brief_v != self.session.current_brief.version):
+                    record_task_event(self.run_dir, "task.stale_reply_archived",
+                                      {"interaction_id": ix_id,
+                                       "request_brief_version": request_brief_v,
+                                       "current_brief_version":
+                                           self.session.current_brief.version},
+                                      self.session.current_brief.version)
+                    self.notify(
+                        f"{ix_id} 是 brief v{request_brief_v} 时的请求，当前已是 "
+                        f"v{self.session.current_brief.version}：回答已入档，但"
+                        "旧版本回复不自动推进新范围对应的动作（需要你按当前目标重新确认）")
+                else:
+                    fresh += 1
+                    record_task_event(self.run_dir, "task.answer_applied",
+                                      {"interaction_id": ix_id,
+                                       "request_brief_version": request_brief_v},
+                                      self.session.current_brief.version)
+            answers_all_stale = (fresh == 0)
+            self.notify(f"已记录你的回答：{len(answers)} 条中的新回答 {fresh} 条")
         pending_apply = any(
             ix.blocking_action == "apply-answers" and ix.answer_source is None
             for ix in self.session.interactions if ix.kind.value == "request_decision"
@@ -1525,6 +1599,12 @@ class Collaboration:
             ix.blocking_action == "apply-answers" and ix.answer_source
             for ix in self.session.interactions if ix.kind.value == "request_decision"
         )
+        if has_apply and answers_all_stale and not self.applied_answers:
+            self.notify("本轮回答全部为旧 brief 版本的回复：apply-answers 不自动发起"
+                        "（旧回复不批准新范围）；请按当前目标重新确认或撤回")
+            self.status = self.status if self.status != "UNKNOWN" else "PENDING"
+            self._persist(None, None, delivered=False)
+            return self.status
         if has_apply and not self.applied_answers:
             attempt, result = self._dispatch_codex(
                 "apply-answers",
@@ -1548,6 +1628,16 @@ class Collaboration:
             decision = next(ix for ix in self.session.interactions
                             if ix.kind.value == "request_decision"
                             and ix.blocking_action == "build-page" and ix.answer_source)
+            # P1.3：旧版本方向回复不自动批准当前目标下的构建委托
+            if (decision.answered_brief_version is not None
+                    and decision.answered_brief_version != self.session.current_brief.version):
+                self.notify(
+                    f"{decision.interaction_id} 的方向回复来自 brief "
+                    f"v{decision.answered_brief_version}（当前 v"
+                    f"{self.session.current_brief.version}）：不据此自动委托构建；"
+                    "请按当前目标重新确认方向或撤回")
+                self._persist(None, None, delivered=False)
+                return self.status
             already = any(i.provenance.value == "user_selected" and "风格方向" in i.text
                           for b in self.session.briefs for i in b.preferences)
             if not already:
@@ -1657,6 +1747,20 @@ class Collaboration:
             "observation_source": (structure.source_path if structure else ""),
             "currency_cap": "无货币硬上限——仅记录可取得的用量",
         }
+        # P1.3：任务库（规范态事务写入；失败不阻断收尾，JSON 导出仍可用，恢复时如实提示）
+        try:
+            from mentis.store import StoreError, save_task_state
+            saved = save_task_state(self.run_dir, self.session, meta)
+            meta["task_db"] = {"path": Path(saved["path"]).name,
+                               "schema": "mentis-task-store/1",
+                               "db_version": saved["db_version"],
+                               "digest": saved["digest"],
+                               "state": "ok"}
+        except Exception as exc:  # StoreError / sqlite 不可用等——收尾语义不变，如实留痕
+            meta["task_db"] = {"path": "state.sqlite3", "state": f"failed:{type(exc).__name__}",
+                               "error": str(exc)[:200]}
+            self.notify(f"任务库保存失败（{str(exc)[:160]}）；本次以 JSON 导出收尾，"
+                        "恢复时将提示需核对")
         (self.run_dir / "state.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         from mentis.trace import render_conversation

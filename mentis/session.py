@@ -133,28 +133,42 @@ class TaskSession:
         return interaction
 
     def request_decision(self, message: str, blocking_action: str) -> Interaction:
+        brief_version = None
+        if self.briefs:
+            brief_version = self.current_brief.version
         interaction = Interaction(
             interaction_id=self._next_id("ix"),
             kind=InteractionKind.REQUEST_DECISION,
             message=message,
             created_at=_now(),
             blocking_action=blocking_action,
+            brief_version=brief_version,
         )
         self.interactions.append(interaction)
         return interaction
 
     def answer_interaction(self, interaction_id: str, text: str, source: str) -> Interaction:
         """回答请求决定。来源只允许 user 或 existing_authorization；
-        不存在"沉默"回答方式——不回答就保持未决并继续阻塞。"""
+        不存在"沉默"回答方式——不回答就保持未决并继续阻塞。
+        P1.3：已回答的请求拒绝重复回答——重复事件不重复推进（幂等跳过由调用方处理）。"""
         if source not in ("user", "existing_authorization"):
             raise InvalidInteraction(f"回答来源不合法: {source}")
         ix = self._get_interaction(interaction_id)
         if ix.kind is not InteractionKind.REQUEST_DECISION:
             raise InvalidInteraction("通知不是请求，无需回答")
+        if ix.answer_source is not None:
+            raise InvalidInteraction(
+                f"{interaction_id} 已于 {ix.answered_at} 回答过；重复回答被拒绝，"
+                "不得据此重复推进")
         ix.answer_text = text
         ix.answer_source = source
         ix.answered_at = _now()
+        if self.briefs:
+            ix.answered_brief_version = self.current_brief.version
         return ix
+
+    def is_answered(self, interaction_id: str) -> bool:
+        return self._get_interaction(interaction_id).answer_source is not None
 
     def _get_interaction(self, interaction_id: str) -> Interaction:
         for ix in self.interactions:

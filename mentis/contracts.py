@@ -140,6 +140,9 @@ class Interaction:
     answer_text: str | None = None
     answer_source: str | None = None     # "user" | "existing_authorization"
     answered_at: str | None = None
+    # P1.3：请求/回答发出时的 brief 版本——旧版本回复不自动批准新范围（恢复校验用）
+    brief_version: int | None = None
+    answered_brief_version: int | None = None
 
 
 @dataclass

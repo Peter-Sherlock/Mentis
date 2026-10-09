@@ -1082,9 +1082,15 @@ class GuidanceCycle:
         """恢复循环：回答诊断的用户决定（answers），或在核对后续办失败轮（retry=True）。"""
         if retry:
             return self._retry_failed_round()
-        answers = answers or {}
-        for ix_id, text in answers.items():
+        requested_answers = answers or {}
+        fresh_answers = {}
+        for ix_id, text in requested_answers.items():
+            # P1.3：重复事件不重复推进——已回答的请求幂等跳过
+            if self.session.is_answered(ix_id):
+                self._notify(f"{ix_id} 已回答过：幂等跳过，不重复推进")
+                continue
             self.session.answer_interaction(ix_id, text, source="user")
+            fresh_answers[ix_id] = text
             # 审查修正 A：回答带关联标识；只关闭对应的等待阶段
             self.trace.emit("user", "decision.answered",
                             f"用户回答 {ix_id}；原文保存在会话记录",
@@ -1092,6 +1098,11 @@ class GuidanceCycle:
                             interaction_id=ix_id)
             self.stages.finish_waiting(status="ok", detail=f"用户回答 {ix_id}",
                                        interaction_id=ix_id)
+        answers = fresh_answers
+        if requested_answers and not fresh_answers:
+            self._notify("本轮没有新回答：不据此重复推进修订轮")
+            self._persist()
+            return self.status
         pending = [ix for ix in self.session.interactions
                    if ix.kind.value == "request_decision" and ix.answer_source is None]
         if pending:
