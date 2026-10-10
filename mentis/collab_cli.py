@@ -7,10 +7,24 @@ from pathlib import Path
 from mentis.collab import Collaboration, collaboration_from_state
 
 
+def _load_material(path: str) -> str:
+    """读取任务素材文件（标注化文本）；未提供时返回空串（Collaboration 用内置合成素材）。"""
+    if not path:
+        return ""
+    from pathlib import Path as _P
+    material = _P(path).read_text(encoding="utf-8", errors="replace")
+    if len(material) > 65536:
+        raise ValueError(f"素材文件过大（{len(material)} 字符，上限 65536）")
+    if not material.strip():
+        raise ValueError("素材文件为空")
+    return material
+
+
 def run_collab(args) -> int:
     interactive = (not args.non_interactive) and sys.stdin.isatty()
     collab = Collaboration(
         goal=args.goal,
+        material_text=_load_material(getattr(args, "material", "")),
         mode="design" if args.design else "autonomous",
         direction=args.direction or "",
         interactive=interactive,

@@ -141,7 +141,9 @@ class StaleGoalLateConfirmTests(unittest.TestCase):
                              measure=file_aware_measure)
         self.assertEqual(collab.run(), "UNKNOWN")
         # 改目标 → 按新目标重建并交付（v2）
-        self.assertEqual(collab.resume(goal_new="改为两天营介绍页（新目标）"), "DELIVERED")
+        # 审计 #1 语义：改目标沿用同主体，Fake 执行器写的咖啡页才能通过 T3/T4
+        self.assertEqual(collab.resume(
+            goal_new="改为「周六手冲入门工作坊」两天进阶营介绍页（新目标）"), "DELIVERED")
         self.assertEqual(len(adapter.calls), 2)
         # 晚到的确认：用户核对旧目标的 unknown 尝试——确认入档，
         # 但接受被 StaleVersion 拒绝（晚到结果不自动验收、不复活旧目标）

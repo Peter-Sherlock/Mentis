@@ -211,7 +211,8 @@ class HardRequirementReadsPlanTests(unittest.TestCase):
 
     def test_different_facts_fixture_judged_correctly(self):
         """异事实夹具：书店活动（¥45/2027-01-09/梧桐北路店）同样正确判定。"""
-        good = self.make(material=BOOK_DECK,
+        good = self.make(goal="为青梧书店「周日绘本共读」做一个亲子友好的活动介绍页（本地单页，含报名表单）",
+                         material=BOOK_DECK,
                          adapter=FakeAdapter(behavior={"first": "good"}))
         # FakeAdapter 写的是咖啡页；手工写入书店好页后再检查
         good.prepare_workspace()
@@ -358,12 +359,13 @@ class OrderingAndRevisionTests(unittest.TestCase):
     def test_goal_change_revises_plan(self):
         collab = self.make()
         self.assertEqual(collab.run(), "DELIVERED")
-        status = collab.resume(goal_new="改做个人作品展示页（同样是本地单页）")
+        # 审计 #1 语义：改目标沿用同主体（异主体目标现会判素材不一致并禁现旧素材内容）
+        status = collab.resume(goal_new="改为「周六手冲入门工作坊」两天深度场介绍页（本地单页，含报名表单）")
         self.assertEqual(status, "DELIVERED")
         v2 = json.loads((collab.run_dir / "evaluation-plan" / "plan-v2.json")
                         .read_text(encoding="utf-8"))
         self.assertEqual(v2["revision"]["reason_kind"], "goal_change")
-        self.assertEqual(v2["goal"], "改做个人作品展示页（同样是本地单页）")
+        self.assertEqual(v2["goal"], "改为「周六手冲入门工作坊」两天深度场介绍页（本地单页，含报名表单）")
 
     def test_restore_keeps_latest_plan_without_rewrite(self):
         collab = self.make()

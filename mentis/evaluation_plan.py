@@ -52,6 +52,7 @@ CHECK_METHOD_LABEL = {
 # 可执行确定性检查（collab.hard_requirement_review / 专业评审段按 kind 分派）
 SPEC_TEXT_CONTAINS = "text_contains"
 SPEC_FORM_FIELDS = "form_fields_present"
+SPEC_TEXT_ABSENT = "text_absent"
 SPEC_NO_EXTERNAL_REFS = "no_external_refs"
 SPEC_RENDER_OVERFLOW = "render_overflow"
 
@@ -117,6 +118,7 @@ class EvaluationPlan:
     out_of_scope: list                       # 不评估的范围
     model_instantiation: dict                # {status, model, usage, rejected, note}
     revision: dict = field(default_factory=dict)  # v1 为 {}；改版含 reason_kind/detail/affected
+    material_assessment: dict = field(default_factory=dict)  # 目标—素材主体一致性判定（审计 #1）
     supersedes_sha256: str = ""
     sha256: str = ""                         # 落盘时对文件字节计算
 
@@ -230,6 +232,74 @@ def derive_task_facts(material_text: str, briefs=()) -> dict:
                    if facts.get("signup") and kw in facts["signup"]]
     return {"facts": facts, "needles": needles, "form_fields": form_fields,
             "price_updates": price_updates}
+
+
+# ---- 目标—素材一致性判定（P3.4 审计 #1：确定性、可审计、不确定时不判不一致） ----
+
+_QUOTED_RE = re.compile(r"[「“]([^」”]{2,24})[”」]")
+# 词面对照的通用词停用表：品牌/品类/载体词不足以判「素材就是为本目标准备的」
+_GENERIC_GRAMS = {
+    "拾光", "咖啡", "本地", "单页", "介绍", "页面", "活动", "简洁", "温暖", "一个",
+    "做一", "制作", "产品", "新品", "上新", "虚拟", "虚构", "品牌", "信息", "内容",
+}
+
+
+def _cn_bigrams(text: str) -> set:
+    cleaned = re.sub(r"[\s\W]+", "", text or "")
+    return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+
+
+def assess_material_goal_consistency(goal: str, material_text: str) -> dict:
+    """确定性判断任务素材的主体是否与目标一致（审计 20261010 #1 的结构修复）。
+
+    规则（全部词面、可审计；判不了就 undetermined，不假装知道）：
+    1. 取素材主体：facts["活动名称"]，缺则取首个 "# " 标题行（去括注）。
+    2. 目标主体：目标中「」/“” 引用的片段（如 「焦糖苹果拿铁）。
+    3. 有目标主体：任一主体词出现在素材中 → consistent；否则素材主体出现在
+       目标中 → consistent；否则 → mismatch（两边互不含对方主体）。
+    4. 无目标主体：素材主体与目标做去停用词的二元组重叠，共享 ≥2 → consistent；
+       0 → mismatch；否则 undetermined。
+    """
+    goal = goal or ""
+    facts = derive_task_facts(material_text).get("facts", {})
+    subject = (facts.get("name") or "").strip()
+    if not subject:
+        for line in (material_text or "").splitlines():
+            body = line.strip()
+            if body.startswith("# ") and len(body) > 3:
+                subject = re.sub(r"（[^）]*）", "", body[2:]).strip()
+                break
+    if not subject:
+        return {"verdict": "undetermined", "material_subject": "",
+                "goal_subjects": [], "shared": [], "rule": "素材主体不可确定"}
+    goal_subjects = [q.strip() for q in _QUOTED_RE.findall(goal) if q.strip()]
+    if goal_subjects:
+        hit = [q for q in goal_subjects if q in (material_text or "")]
+        if hit:
+            return {"verdict": "consistent", "material_subject": subject,
+                    "goal_subjects": goal_subjects, "shared": hit,
+                    "rule": "目标引用主体出现在素材中"}
+        if subject in goal:
+            return {"verdict": "consistent", "material_subject": subject,
+                    "goal_subjects": goal_subjects, "shared": [subject],
+                    "rule": "素材主体出现在目标中"}
+        return {"verdict": "mismatch", "material_subject": subject,
+                "goal_subjects": goal_subjects, "shared": [],
+                "rule": "目标引用主体不出现在素材中，且素材主体不出现在目标中"}
+    subj_grams = {g for g in _cn_bigrams(subject) if g not in _GENERIC_GRAMS}
+    goal_grams = {g for g in _cn_bigrams(goal) if g not in _GENERIC_GRAMS}
+    shared = sorted(subj_grams & goal_grams)
+    if len(shared) >= 2:
+        return {"verdict": "consistent", "material_subject": subject,
+                "goal_subjects": [], "shared": shared[:6],
+                "rule": "主体词面共享 ≥2"}
+    if not shared and subj_grams and goal_grams:
+        return {"verdict": "mismatch", "material_subject": subject,
+                "goal_subjects": [], "shared": [],
+                "rule": "主体词面无共享（目标未引用主体时以词面重叠判定）"}
+    return {"verdict": "undetermined", "material_subject": subject,
+            "goal_subjects": [], "shared": shared[:6],
+            "rule": "主体词面证据不足"}
 
 
 # ---- 四层组装 ----
@@ -396,11 +466,23 @@ def _rule_observation(text: str) -> str:
     return "产物观察（当前无自动化核对工具）"
 
 
-def build_task_instance_entries(goal: str, material_text: str, briefs=()) -> list:
-    """任务实例层：从任务素材机械推导具体验收项（活动事实、报名表单）。"""
+def build_task_instance_entries(goal: str, material_text: str, briefs=(),
+                                assessment: dict | None = None) -> list:
+    """任务实例层：从任务素材机械推导具体验收项（活动事实、报名表单）。
+
+    P3.4 审计 #1 修复：先做目标—素材主体一致性判定。mismatch 时素材事实
+    不注入（T1/T2 不建——素材不是为本目标准备的，自决以目标为准）；另建
+    T4 禁现条目：与目标主体不一致的素材内容不得出现在产物中。T3（目标
+    主体一致）始终建立，可确定性核对时为 deterministic（诊断候选中的
+    目标一致性问题由此路由到自主修订，不再落入 unverifiable）。
+    """
+    assessment = assessment or assess_material_goal_consistency(goal, material_text)
+    verdict = assessment.get("verdict")
     derived = derive_task_facts(material_text, briefs)
     needles, form_fields = derived["needles"], derived["form_fields"]
     entries = []
+    if verdict == "mismatch":
+        needles, form_fields = {}, []
     if needles:
         missing = [label for label in ("活动名称", "日期时间", "地点", "价格") if label not in needles]
         entries.append(PlanEntry(
@@ -416,7 +498,7 @@ def build_task_instance_entries(goal: str, material_text: str, briefs=()) -> lis
             check_spec={"kind": SPEC_TEXT_CONTAINS, "needles": dict(needles)},
             note=("素材中未找到的标签：" + "、".join(missing)) if missing else "素材五类事实齐全",
         ))
-    if form_fields or needles.get("报名方式") or derived["facts"].get("signup"):
+    if verdict != "mismatch" and form_fields:  # 表单要求跟素材：只有素材报名方式给出具体字段才要求表单
         entries.append(PlanEntry(
             entry_id="T2", name="报名表单可用",
             meaning="素材报名方式要求的表单存在（必填字段齐全）；主要操作在双视口可发现可操作",
@@ -432,6 +514,45 @@ def build_task_instance_entries(goal: str, material_text: str, briefs=()) -> lis
             check_spec={"kind": SPEC_FORM_FIELDS, "min_fields": 1,
                         "required_named": list(form_fields)},
             note="必填校验生效、提交确认与不发送真实数据属运行时行为，静态观察不可得→如实标注未验证",
+        ))
+    goal_subjects = [q for q in assessment.get("goal_subjects", []) if q]
+    subject_needles = {f"目标主体「{q}」": q for q in goal_subjects}
+    if not subject_needles and verdict == "consistent" \
+            and assessment.get("material_subject") \
+            and assessment["material_subject"] in (goal or ""):
+        subject_needles = {"目标主体": assessment["material_subject"]}
+    if subject_needles:
+        entries.append(PlanEntry(
+            entry_id="T3", name="目标主体一致",
+            meaning="任务目标中的主体内容（产品/活动名）在产物中呈现；产物主题与目标一致（审计 20261010 #1）",
+            category="hard_requirement", source_layer="task_instance",
+            source_refs=["goal:评估目标原文（引用主体）"],
+            observation="产物结构观察与正文文本",
+            check_method="deterministic",
+            pass_line="；".join(f"{k}可见" for k in subject_needles),
+            blocking=True, priority=1,
+            check_spec={"kind": SPEC_TEXT_CONTAINS, "needles": dict(subject_needles)},
+            note="目标主体词面核对；深层语义一致性由专业评审与用户判断",
+        ))
+    if verdict == "mismatch":
+        forbidden = {"素材主体": assessment.get("material_subject", "")}
+        forbidden.update({f"素材{k}": v for k, v in needles.items()} if needles else {})
+        # mismatch 时 needles 已清空；用原始推导的素材事实作为禁现内容
+        raw = derive_task_facts(material_text, briefs)["needles"]
+        forbidden.update({f"素材{k}": v for k, v in raw.items()})
+        forbidden = {k: v for k, v in forbidden.items() if v}
+        entries.append(PlanEntry(
+            entry_id="T4", name="不一致素材内容不出现",
+            meaning="与目标主体不一致的素材内容（其主体、日期、价格等事实）不出现在产物中（审计 20261010 #1）",
+            category="hard_requirement", source_layer="task_instance",
+            source_refs=["material-consistency:" + assessment.get("rule", "")],
+            observation="产物结构观察与正文文本",
+            check_method="deterministic",
+            pass_line="；".join(f"{k}「{v}」不出现" for k, v in forbidden.items()),
+            blocking=True, priority=1,
+            check_spec={"kind": SPEC_TEXT_ABSENT, "needles": dict(forbidden)},
+            note=("素材与目标主体不一致（" + assessment.get("rule", "")
+                  + "）：素材事实不注入委托，且其内容不得进入产物"),
         ))
     return entries
 
@@ -630,7 +751,9 @@ def build_evaluation_plan(goal, brief, material_text, resources=(), gateway=None
     entries = []
     entries.extend(build_core_entries())
     entries.extend(build_user_entries(brief))
-    entries.extend(build_task_instance_entries(goal, material_text, [brief]))
+    assessment = assess_material_goal_consistency(goal, material_text)
+    entries.extend(build_task_instance_entries(goal, material_text, [brief],
+                                               assessment=assessment))
     # 领域硬约束中已被任务实例条目引用落实的规则不再单列（保持计划短）
     realized = set()
     for e in entries:
@@ -650,6 +773,7 @@ def build_evaluation_plan(goal, brief, material_text, resources=(), gateway=None
         entries.append(e)
     entries.sort(key=lambda e: (e.priority, e.entry_id))
     return EvaluationPlan(
+        material_assessment=assessment,
         schema_version=PLAN_SCHEMA, plan_id="plan-" + uuid.uuid4().hex[:12],
         version=version, brief_version=brief.version, goal=goal,
         created_at=datetime.now().isoformat(timespec="seconds"),
@@ -708,11 +832,18 @@ def load_latest_plan(run_dir) -> "EvaluationPlan | None":
 
 # ---- 视图 ----
 
-def acceptance_block(plan: EvaluationPlan) -> str:
-    """从计划派生的本轮验收项（写入执行器指令；执行器可见）。"""
+def acceptance_block(plan: EvaluationPlan, skip_entry_ids: tuple = ()) -> str:
+    """从计划派生的本轮验收项（写入执行器指令；执行器可见）。
+
+    skip_entry_ids：不适用条目（如素材无报名要求时的表单类条目）不列入——
+    列入会驱动执行器实现素材未要求的表单（P3.4 审计 #1 的真实观察）。
+    """
     lines = [f"[本轮验收项（来自评估计划 v{plan.version}，"
              f"SHA-256 前 12 位 {(plan.sha256 or '—')[:12]}）]"]
     for e in plan.blocking_entries():
+        if e.entry_id in skip_entry_ids:
+            lines.append(f"- {e.entry_id} {e.name}：本轮不适用（素材未要求），不需要实现")
+            continue
         lines.append(f"- {e.entry_id} {e.name}：{e.pass_line}（检查：{e.observation[:40]}）")
     lines.append("（以上为交付前将逐项核对的标准；无法静态核验的行为类要求仍须实现，"
                  "如必填校验与本地确认提示。素材中没有的事实不要新增。）")
@@ -809,6 +940,13 @@ def execute_structural_check(entry: PlanEntry, text_blob: str, structure_items,
             else:
                 findings.append(f"{label}：未在结构/正文文本中发现（{entry.entry_id}）")
                 blocking.append(label)
+    elif kind == SPEC_TEXT_ABSENT:
+        for label, needle in (spec.get("needles") or {}).items():
+            if needle and needle in text_blob:
+                findings.append(f"{label}「{needle}」出现（与目标主体不一致的素材内容，{entry.entry_id}）")
+                blocking.append(label)
+            else:
+                findings.append(f"{label}「{needle}」未出现（{entry.entry_id}）")
     elif kind == SPEC_FORM_FIELDS:
         inputs = [i for i in structure_items if i.kind in ("input", "textarea")]
         min_fields = int(spec.get("min_fields", 1))

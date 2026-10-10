@@ -67,6 +67,7 @@ def main(argv=None) -> int:
     col.add_argument("--non-interactive", action="store_true", help="不等待输入：待决事项保持未决")
     col.add_argument("--max-repairs", type=int, default=1, help="自动修复轮数上限（默认 1）")
     col.add_argument("--timeout", type=int, default=420, help="单次执行器超时秒数（1—600）")
+    col.add_argument("--material", default="", help="任务素材文件路径（标注化「- 标签：值」；缺省用内置合成素材）")
     res = sub.add_parser("collab-resume", help="恢复协作运行：回答/反馈/改目标/撤回")
     res.add_argument("--state", required=True, help="runtime/collab/<run>/state.json")
     res.add_argument("--answer", action="append", default=[], help="<请求ID>:<回答>，可多次")

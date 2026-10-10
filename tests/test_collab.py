@@ -187,7 +187,8 @@ class CollabFlowTests(unittest.TestCase):
         self.assertEqual(collab.run(), "DELIVERED")
         old_attempt = collab.session.attempts[-1]
         self.assertTrue(old_attempt.accepted)
-        status = collab.resume(goal_new="改做个人作品展示页（同样是本地单页）")
+        # 审计 #1 语义：改目标沿用同主体（异主体目标会判素材不一致并禁现旧素材内容）
+        status = collab.resume(goal_new="改为「周六手冲入门工作坊」晚间场介绍页（本地单页，含报名表单）")
         self.assertEqual(status, "DELIVERED")
         self.assertGreater(collab.session.current_brief.version, 1)
         with self.assertRaises(StaleVersion):

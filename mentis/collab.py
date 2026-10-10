@@ -32,7 +32,8 @@ from mentis.eval_review import (ROUTE_ADOPT, grade_revision, map_candidate_to_di
 from mentis.evaluation_plan import (EvaluationPlan, PlanPersistenceError, acceptance_block,
                                     build_evaluation_plan, derive_task_facts,
                                     execute_structural_check, load_latest_plan,
-                                    render_plan_markdown, revise_plan, SPEC_RENDER_OVERFLOW)
+                                    render_plan_markdown, revise_plan,
+                                    SPEC_FORM_FIELDS, SPEC_RENDER_OVERFLOW)
 from mentis.executors.codex_cli import CodexCliAdapter, CodexTaskResult, CodexTaskSpec
 # C1：最小任务专业配置——职责/资源快照/任务条件与阶段绑定（大纲 §3）
 from mentis.professional import ConfigManager, ConfigPersistenceError
@@ -91,10 +92,17 @@ def resolve_codex_executable() -> str:
 
 
 def build_delegation_prompt(brief_text: str, direction: str, revision_note: str = "",
-                            facts: dict | None = None) -> str:
-    """构建委托指令；事实清单从评估计划的任务实例条目派生（V1 起不再硬编码试点值）。"""
-    if not facts:
-        facts = derive_task_facts(COPY_DECK)["needles"]
+                            facts: dict | None = None,
+                            material_status: str = "consistent",
+                            require_form: bool | None = None) -> str:
+    """构建委托指令；事实清单从评估计划的任务实例条目派生（V1 起不再硬编码试点值）。
+
+    P3.4 审计 #1 修复：facts 为空就是空（不再静默回退到内置素材——那会把
+    上一任务的素材事实注入本目标）；素材与目标主体不一致时向执行器如实
+    声明"素材不适用"；报名表单要求只在素材适用时提出（不再无条件硬编码）。
+    """
+    facts = dict(facts or {})
+    mismatch = material_status == "mismatch"
     fact_parts = []
     if facts.get("活动名称"):
         fact_parts.append(f"活动名称（{facts['活动名称']}）")
@@ -104,12 +112,21 @@ def build_delegation_prompt(brief_text: str, direction: str, revision_note: str 
         fact_parts.append(f"地点（{facts['地点']}）")
     if facts.get("价格"):
         fact_parts.append(f"价格 {facts['价格']}")
-    fact_parts.append("报名表单（姓名与联系方式必填校验，提交后显示本地确认提示，不发送任何网络请求）")
+    if require_form is None:
+        require_form = bool(facts) and not mismatch  # 兼容缺省：有事实即试点素材含报名
+    if require_form:
+        fact_parts.append("报名表单（姓名与联系方式必填校验，提交后显示本地确认提示，不发送任何网络请求）")
     parts = [
         "在当前工作区创建 index.html：一个本地单页活动介绍页。",
         f"[目标] {brief_text}",
-        "[必读素材] input/copy.md（活动信息与文案的唯一来源，不得虚构活动事实）",
-        f"[风格方向] {direction}",
+    ]
+    if mismatch:
+        parts.append("[素材声明] input/copy.md 的主体与本目标不一致，不作为信息来源："
+                     "不要采用其活动名称、日期、价格等内容；页面内容以目标为准，"
+                     "目标未给出且无依据的具体事实（日期/价格等）不要虚构，可写通用表述")
+    else:
+        parts.append("[必读素材] input/copy.md（活动信息与文案的唯一来源，不得虚构活动事实）")
+    parts += [
         "[硬要求] "
         "1) 单文件 index.html，可内嵌 CSS/JS，中文内容；"
         f"2) 必须包含：{'、'.join(fact_parts)}；"
@@ -454,6 +471,17 @@ class Collaboration:
             event_kind = "evaluation_plan.revised"
             summary = (f"评估计划改版 v{plan.version}→v{new_plan.version}（{reason_kind}）："
                        f"{detail[:140]}；阻塞 {len(new_plan.blocking_entries())} 条")
+        verdict = new_plan.material_assessment.get("verdict")
+        if verdict == "mismatch":
+            self.notify("素材主体与本目标不一致（"
+                        + new_plan.material_assessment.get("rule", "") + "）："
+                        "素材事实不注入委托与验收（自决以目标为准）；"
+                        "其内容不得出现在产物中（T4 禁现条目）")
+            self.trace.emit("mentis", "material.consistency",
+                            "目标—素材主体不一致：" + json.dumps(
+                                new_plan.material_assessment, ensure_ascii=False)[:300],
+                            brief_version=self.session.current_brief.version,
+                            status="unknown")
         plan_dir = self.run_dir / "evaluation-plan"
         path = plan_dir / f"plan-v{new_plan.version}.json"
         try:
@@ -501,7 +529,7 @@ class Collaboration:
                         revision_id: str | None = None):
         # V1：任何委托前先确保评估计划已落盘（失败→零调用）；验收项写入确切指令
         plan = self._ensure_evaluation_plan()
-        prompt = prompt.rstrip() + "\n\n" + acceptance_block(plan)
+        prompt = prompt.rstrip() + "\n\n" + acceptance_block(plan, skip_entry_ids=tuple(e.entry_id for e in plan.entries if (e.check_spec or {}).get("kind") == SPEC_FORM_FIELDS and not self._form_required()))
         attempt = self.session.dispatch(action_key, "exec-workspace", revision_id=revision_id)
         brief_version = self.session.current_brief.version
         # O2：委托即「执行器制作/修订」阶段的真实起止
@@ -634,7 +662,7 @@ class Collaboration:
                 user_questions.append((q, route))
             elif any(k in q for k in MATERIAL_KEYWORDS):
                 route = route_gap(Gap(q, "workspace", "plan_changing", "reversible"))
-                hits = [ln.strip() for ln in COPY_DECK.splitlines() if any(w in q for w in ("价格", "日期", "时间", "地点", "报名", "讲师", "退款", "人数"))]
+                hits = [ln.strip() for ln in self.material_text.splitlines() if any(w in q for w in ("价格", "日期", "时间", "地点", "报名", "讲师", "退款", "人数"))]
                 answer = "；".join(hits[:2]) if hits else "素材中没有该信息；请按素材既有内容处理，不要新增事实"
                 autonomous.append((q, route, answer))
             else:
@@ -689,7 +717,7 @@ class Collaboration:
             record = self.gateway.complete(
                 "你是网页制作助手。用一两句话直接回答执行者的问题；"
                 "素材中没有的事实不要编造。",
-                f"[活动素材]\n{COPY_DECK}\n\n[执行者的问题] {question}",
+                f"[活动素材]\n{self.material_text}\n\n[执行者的问题] {question}",
                 json_mode=False,
             )
             if record.ok and record.response_text.strip():
@@ -722,11 +750,35 @@ class Collaboration:
         价格等被 brief 后版本修正的值在计划改版时随 derive_task_facts 更新
         （“从 ¥99 改为 ¥129”取改后值）。
         """
+        from mentis.evaluation_plan import assess_material_goal_consistency
+        assessment = (self.evaluation_plan.material_assessment
+                      if self.evaluation_plan is not None else None) or assess_material_goal_consistency(self.session.goal, self.material_text)
+        if assessment.get("verdict") == "mismatch":
+            return {}  # 素材与目标主体不一致：素材事实不注入（以目标为准；T4 禁现其内容）
         if self.evaluation_plan is not None:
             needles = self.evaluation_plan.fact_needles()
             if needles:
                 return needles
         return derive_task_facts(self.material_text, self.session.briefs)["needles"]
+
+    def _form_required(self) -> bool:
+        """表单要求跟素材走（审计 #1）：素材适用且含报名方式，或目标明确要求表单。"""
+        from mentis.evaluation_plan import assess_material_goal_consistency, derive_task_facts
+        assessment = (self.evaluation_plan.material_assessment
+                      if self.evaluation_plan is not None else None) or assess_material_goal_consistency(self.session.goal, self.material_text)
+        if assessment.get("verdict") != "mismatch":
+            derived = derive_task_facts(self.material_text, self.session.briefs)
+            # 只认素材报名方式给出具体字段（姓名/联系等）——「到店点单，无需报名」
+            # 这类 signup 文本不构成表单要求（真实运行观察到的缺陷）
+            if derived["form_fields"]:
+                return True
+        return "表单" in self.session.goal
+
+    def _material_status(self) -> str:
+        from mentis.evaluation_plan import assess_material_goal_consistency
+        assessment = (self.evaluation_plan.material_assessment
+                      if self.evaluation_plan is not None else None) or assess_material_goal_consistency(self.session.goal, self.material_text)
+        return assessment.get("verdict", "undetermined")
 
     def hard_requirement_review(self, structure):
         """V1：结构硬要求检查读评估计划中的确定性条目（不再读硬编码试点值）。
@@ -753,6 +805,10 @@ class Collaboration:
             if spec.get("kind") == SPEC_RENDER_OVERFLOW:
                 findings.append(f"{entry.name}：由渲染测量在专业评审段核对（{entry.entry_id}）；"
                                 "结构层不判")
+                continue
+            if spec.get("kind") == SPEC_FORM_FIELDS and not self._form_required():
+                findings.append(f"{entry.name}：素材未要求报名且目标未要求表单——不适用"
+                                f"（{entry.entry_id}，非阻塞；表单要求跟随素材）")
                 continue
             entry_findings, entry_blocking, _ = execute_structural_check(
                 entry, text_blob, structure.items, html_text)
@@ -791,6 +847,8 @@ class Collaboration:
             fix_prompt = build_delegation_prompt(
                 self._brief_text(), self._direction_text(),
                 facts=self._expected_values(),
+                material_status=self._material_status(),
+                require_form=self._form_required(),
                 revision_note="上轮结构检查未通过：" + "；".join(blocking)
                 + "。修正后确保 index.html 完整。")
             repair_attempt, result = self._dispatch_codex(
@@ -1316,7 +1374,9 @@ class Collaboration:
         attempt, result = self._dispatch_codex(
             "build-page",
             build_delegation_prompt(self._brief_text(), self._direction_text(),
-                                    facts=self._expected_values()))
+                                    facts=self._expected_values(),
+                                    material_status=self._material_status(),
+                                    require_form=self._form_required()))
         if result.status is AttemptStatus.UNKNOWN:
             self.status = "UNKNOWN"
             # P3.4 验收修复（审计：叙述以原始记录为准）：unknown 可能是超时、
@@ -1558,7 +1618,9 @@ class Collaboration:
             attempt, result = self._dispatch_codex(
                 "rebuild-new-goal",
                 build_delegation_prompt(self._brief_text(), self._direction_text(),
-                                        facts=self._expected_values()))
+                                        facts=self._expected_values(),
+                                        material_status=self._material_status(),
+                                        require_form=self._form_required()))
             if result.status is AttemptStatus.COMPLETED:
                 needs_user, attempt = self.route_executor_questions(attempt)
                 if needs_user:
@@ -1711,6 +1773,8 @@ class Collaboration:
                 build_delegation_prompt(
                     self._brief_text(), self._direction_text(),
                     facts=self._expected_values(),
+                    material_status=self._material_status(),
+                    require_form=self._form_required(),
                     revision_note=f"用户明确修正：{feedback}。保留未被告知改变的部分。"),
                 resume=True, revision_id=revision.revision_id,
             )
