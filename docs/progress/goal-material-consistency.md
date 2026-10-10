@@ -31,6 +31,17 @@ CLI 新增 `collab --material <路径>`（标注化素材文件，≤64KB；缺�
 
 诚实边界：acceptance 过滤（D4 不列入验收项）与 `_form_required` 修正的**线上验证只到「修订产物正确」**——修订委托发生在修复前（其 prompt 仍带旧表单行，产物正确是执行器服从反馈指令）；两者的 prompt 级验证由离线回归覆盖（test_form_not_required_when_material_says_walk_in 断言 prompt 无表单行+验收块含「本轮不适用」）。两次执行器 unknown 均为 turn.completed 伴失败子项（Codex 同型已知行为，约 120s/轮，非超时）。
 
+### 2.1 mismatch 全流程真实验证（2026-10-10 收尾轮，预算 /2：执行器 1/4、模型 2/12、探针 1 组合）
+
+运行 `runtime/collab/20261010_080852-248b`（目标=「桂花乌龙茶」上新页，**不传 --material**：内置工作坊素材与目标主体不一致——审计 #1 原始失败场景）：
+
+1. 计划：`assessment=mismatch`（引用主体互不含）；**无 T1/T2**；T3（目标主体「桂花乌龙茶」）+ T4（工作坊主体/日期/价格禁现）；`material.consistency` 事件留痕。
+2. 委托 prompt：含 `[素材声明]`（素材不作为信息来源、不虚构具体事实）；**无工作坊事实**（无日期/价格行）；验收块 **D4 标「本轮不适用（素材未要求），不需要实现」**（acceptance 过滤的真实生效证据）。
+3. 产物（13,363 字节）：茶主题页，**零工作坊残留**（手冲/工作坊/2026-11-14/¥99 全部未命中）；**零虚构事实**（无任何价格/日期/时间数字——门店与时段写「具体待确认，出发前向门店询问」，正是素材声明要求的通用表述）；页面内"表单"实为本地周末便签交互（非报名，未虚构报名事实）。
+4. 执行器 turn.completed 伴失败子项 → unknown 如实 → 人工核对（上述内容核对+无活跃写入者）→ 确认 completed → 硬要求检查通过（T3/T4 全过）→ 专业评审（真实模型，5 候选合理分流）→ **DELIVERED，全程 1 次委托零重发**。
+
+前置修复（本轮先修后跑）：mismatch 下执行器反问的素材分支曾会用不适用素材行回答（¥99 注入 ANSWERS.md 的风险）——素材分支与 `_answer_by_model` 均加 mismatch 防护（离线回归 test_material_question_answered_without_workshop_facts）。本轮真实运行未出现反问，该防护保持离线证据。
+
 ## 3. 离线回归
 
 - 新增 `tests/test_goal_material_consistency.py` **14 项**：判定四态（审计案例 mismatch/匹配 consistent/无引用工作坊 consistent/无主体 undetermined）；mismatch 计划（无 T1/T2、有 T3/T4、禁现值正确）与 consistent 计划（T1+T3、¥38、无报名素材无 T2）；T4 执行器（工作坊页阻塞、拿铁页通过）；prompt 无静默回退+素材声明；审计案例全流程离线复刻（首稿工作坊页被 T4 拦下→修复为拿铁页→DELIVERED，prompt 无工作坊事实，material.consistency 事件留痕）；`_expected_values` 门控；表单不跟随「无需报名」素材（prompt+验收块）；目标一致性候选路由 adopt（不再 unverifiable）。
@@ -39,7 +50,7 @@ CLI 新增 `collab --material <路径>`（标注化素材文件，≤64KB；缺�
 
 ## 4. 诚实边界（未真实验证/残留）
 
-- mismatch 全流程（判不一致→素材不注入→T4 拦截旧内容）的**真实链路**未跑（离线复刻覆盖；真实运行用的是 consistent 路径）。审计原运行（20261009_095200）不回填不重判。
+- ~~mismatch 全流程未跑真实链~~（2026-10-10 收尾轮已补：见 §2.1）。mismatch 下的执行器反问防护为离线证据（真实 mismatch 运行未出现反问）。审计原运行（20261009_095200）不回填不重判。
 - 「工作台页面传素材」未实现（--material 仅 CLI；单用户可先用 CLI）。
 - 判定是词面启发式：目标不加引号且主体词面不重叠时会误判 mismatch（保守方向：素材不注入+禁现——若素材实际适用会损失事实注入；undetermined 时维持旧行为）。停用表/阈值以常量落盘可审计。
 - 专业效果仍未验证；E2 独立评审、T4 本人体验待负责人。

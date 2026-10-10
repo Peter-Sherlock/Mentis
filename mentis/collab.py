@@ -662,8 +662,14 @@ class Collaboration:
                 user_questions.append((q, route))
             elif any(k in q for k in MATERIAL_KEYWORDS):
                 route = route_gap(Gap(q, "workspace", "plan_changing", "reversible"))
-                hits = [ln.strip() for ln in self.material_text.splitlines() if any(w in q for w in ("价格", "日期", "时间", "地点", "报名", "讲师", "退款", "人数"))]
-                answer = "；".join(hits[:2]) if hits else "素材中没有该信息；请按素材既有内容处理，不要新增事实"
+                if self._material_status() == "mismatch":
+                    # 素材主体与目标不一致：不得用其事实回答（否则把不适用素材
+                    # 注入 ANSWERS.md，违背 mismatch 语义）
+                    answer = ("素材与目标主体不一致，不适用；请按目标的通用表述处理，"
+                              "不要虚构具体事实（日期/价格等）")
+                else:
+                    hits = [ln.strip() for ln in self.material_text.splitlines() if any(w in q for w in ("价格", "日期", "时间", "地点", "报名", "讲师", "退款", "人数"))]
+                    answer = "；".join(hits[:2]) if hits else "素材中没有该信息；请按素材既有内容处理，不要新增事实"
                 autonomous.append((q, route, answer))
             else:
                 route = route_gap(Gap(q, "model_knowledge", "plan_changing", "reversible"))
@@ -714,10 +720,16 @@ class Collaboration:
 
     def _answer_by_model(self, question: str) -> str:
         if self.use_model and self.gateway.has_credentials():
+            if self._material_status() == "mismatch":
+                user_prompt = ("[素材状态] 可用素材与任务目标主体不一致，不作为依据。\n\n"
+                               f"[任务目标] {self.session.goal}\n\n[执行者的问题] {question}")
+            else:
+                user_prompt = (f"[活动素材]\n{self.material_text}\n\n"
+                               f"[执行者的问题] {question}")
             record = self.gateway.complete(
                 "你是网页制作助手。用一两句话直接回答执行者的问题；"
                 "素材中没有的事实不要编造。",
-                f"[活动素材]\n{self.material_text}\n\n[执行者的问题] {question}",
+                user_prompt,
                 json_mode=False,
             )
             if record.ok and record.response_text.strip():

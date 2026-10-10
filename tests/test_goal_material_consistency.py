@@ -221,6 +221,36 @@ class CollabFlowTests(unittest.TestCase):
         self.assertEqual(collab._expected_values()["价格"], "¥38")
 
 
+class MismatchQuestionRoutingTests(unittest.TestCase):
+    """mismatch 下执行器反问不得用不适用素材回答（真实链路的前置修复）。"""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+
+    def test_material_question_answered_without_workshop_facts(self):
+        collab = make_collab(goal=LATTE_GOAL, adapter=FakeAdapter(),
+                             base_dir=self.base, measure=file_aware_measure)
+        collab.prepare_workspace()
+        collab._ensure_evaluation_plan()
+        self.assertEqual(collab._material_status(), "mismatch")
+        (collab.workspace / "QUESTIONS.md").write_text(
+            "Q: 素材里有没有讲师信息和退款政策？\n", encoding="utf-8")
+        from mentis.contracts import AttemptStatus
+        build = collab.session.dispatch("build-page", "exec-workspace")
+        collab.session.complete_attempt(build.attempt_id)
+        needs_user, _ = collab.route_executor_questions(build)
+        self.assertFalse(needs_user)
+        answers = (collab.workspace / "ANSWERS.md").read_text(encoding="utf-8")
+        self.assertIn("素材与目标主体不一致", answers)
+        self.assertNotIn("¥99", answers)
+        self.assertNotIn("2026-11-14", answers)
+        routes = collab.question_routes
+        self.assertTrue(routes and routes[0]["answered_autonomously"])
+
+
 class CandidateRoutingTests(unittest.TestCase):
     """审计 #1 评审侧：目标一致性候选不再落入 unverifiable。"""
 
