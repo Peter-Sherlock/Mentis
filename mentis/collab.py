@@ -1319,7 +1319,10 @@ class Collaboration:
                                     facts=self._expected_values()))
         if result.status is AttemptStatus.UNKNOWN:
             self.status = "UNKNOWN"
-            self.notify("执行器状态未知（超时）：锁已保留，需人工核对后处理；不自动重发")
+            # P3.4 验收修复（审计：叙述以原始记录为准）：unknown 可能是超时、
+            # 也可能是 turn.completed 伴失败子项等——不把原因硬编码为"超时"
+            reason = (result.error or "").strip()[:120] or "原因未记录"
+            self.notify(f"执行器状态未知（{reason}）：锁已保留，需人工核对后处理；不自动重发")
             self._persist(None, None, delivered=False)
             return self.status
         if result.status is AttemptStatus.COMPLETED:

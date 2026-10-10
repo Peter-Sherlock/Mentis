@@ -42,8 +42,20 @@ class Harness(unittest.TestCase):
 
         self.bench = Workbench(self.runs, spawner=spawner, start_wait_s=1)
 
+    def write_heartbeat(self, run_id="20260101_000000-ab", fresh=True):
+        from datetime import datetime, timezone, timedelta
+        d = self.runs / run_id / "trace"
+        d.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        ts = now if fresh else now - timedelta(seconds=300)
+        (d / "heartbeat.json").write_text(json.dumps({
+            "schema": "mentis-heartbeat/1", "run_id": run_id,
+            "time_utc": ts.isoformat(timespec="seconds"), "ttl_s": 45.0,
+        }, ensure_ascii=False), encoding="utf-8")
+
     def make_run(self, run_id="20260101_000000-ab", status="DELIVERED",
-                 pending=True, unknown_attempt=False, active_auth=True):
+                 pending=True, unknown_attempt=False, active_auth=True,
+                 with_versions=False, with_trace=False):
         d = self.runs / run_id
         (d / "workspace").mkdir(parents=True)
         (d / "workspace" / "index.html").write_text("<html><body>页</body></html>",
@@ -75,6 +87,15 @@ class Harness(unittest.TestCase):
                 "screenshots": [], "codex_runs": []}
         (d / "state.json").write_text(json.dumps(meta, ensure_ascii=False),
                                       encoding="utf-8")
+        if with_versions:
+            (d / "versions").mkdir()
+            (d / "versions" / "index-attempt-1.html").write_text(
+                "<html>旧版</html>", encoding="utf-8")
+        if with_trace:
+            tr = d / "trace"
+            tr.mkdir(exist_ok=True)
+            (tr / "events.jsonl").write_text('{"seq": 1}\n', encoding="utf-8")
+            (tr / "model-calls.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
         return d
 
 
@@ -224,6 +245,191 @@ class ServerTests(Harness):
     def test_foreign_host_rejected(self):
         status, _ = self._get("/", host="evil.example.com")
         self.assertEqual(status, 403)
+
+
+class RouteSubpathTests(Harness):
+    """P3.4 验收修复（审计 #2）：versions/ 与 trace/ 白名单子路径可达，
+    路径隔离与穿越拒绝保持。"""
+
+    def setUp(self):
+        super().setUp()
+        self.make_run(with_versions=True, with_trace=True)
+
+    def _get(self, path):
+        server = make_server(self.runs, 0, bench=self.bench)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+        req.add_header("Host", f"127.0.0.1:{port}")
+        try:
+            with urllib.request.build_opener().open(req, timeout=10) as res:
+                return res.status, res.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            exc.close()
+            return exc.code, body
+
+    def test_version_snapshot_preview_served(self):
+        status, body = self._get("/preview/20260101_000000-ab/versions/index-attempt-1.html")
+        self.assertEqual(status, 200)
+        self.assertIn("旧版", body.decode("utf-8"))
+
+    def test_trace_evidence_routes_served(self):
+        status, body = self._get("/evidence/20260101_000000-ab/trace/events.jsonl")
+        self.assertEqual(status, 200)
+        self.assertIn('"seq": 1', body.decode("utf-8"))
+        status, body = self._get("/evidence/20260101_000000-ab/trace/model-calls.jsonl")
+        self.assertEqual(status, 200)
+        status, _ = self._get("/evidence/20260101_000000-ab/trace/stages.jsonl")
+        self.assertEqual(status, 404)  # 白名单内但文件不存在 → 仍 404
+
+    def test_isolation_kept(self):
+        # versions 之外的两段子路径不可达（trace/ 通过 preview 不可达）
+        status, _ = self._get("/preview/20260101_000000-ab/versions/../state.json")
+        self.assertIn(status, (404, 503))
+        status, _ = self._get("/preview/20260101_000000-ab/trace/events.jsonl")
+        self.assertEqual(status, 404)
+        status, _ = self._get("/evidence/20260101_000000-ab/workspace/index.html")
+        self.assertEqual(status, 404)
+        status, _ = self._get("/evidence/20260101_000000-ab/trace/nope.jsonl")
+        self.assertEqual(status, 404)
+        status, _ = self._get("/evidence/20260101_000000-ab/session.jsonx")
+        self.assertEqual(status, 404)
+        status, _ = self._get("/preview/20260101_000000-ab/versions/x/../../state.json")
+        self.assertIn(status, (404, 503))
+
+
+class WriteGuardTests(Harness):
+    """P3.4 验收修复（审计 #4）：写接口校验请求来源与媒体类型。"""
+
+    def setUp(self):
+        super().setUp()
+        self.make_run()
+        server = make_server(self.runs, 0, bench=self.bench)
+        self.port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+    def _post(self, path, payload, content_type="application/json", origin=None):
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}",
+                                     data=body, method="POST")
+        req.add_header("Host", f"127.0.0.1:{self.port}")
+        if content_type:
+            req.add_header("Content-Type", content_type)
+        if origin:
+            req.add_header("Origin", origin)
+        try:
+            with urllib.request.build_opener().open(req, timeout=10) as res:
+                return res.status, json.loads(res.read())
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            exc.close()
+            try:
+                return exc.code, json.loads(payload)
+            except ValueError:
+                return exc.code, {}
+
+    def test_foreign_origin_rejected(self):
+        status, body = self._post("/api/start", {"goal": "x"},
+                                  origin="http://evil.example.com")
+        self.assertEqual(status, 403)
+        self.assertEqual(self.procs, [])
+
+    def test_non_json_media_rejected(self):
+        status, body = self._post("/api/start", {"goal": "x"},
+                                  content_type="text/plain")
+        self.assertEqual(status, 415)
+        status, body = self._post("/api/start", {"goal": "x"}, content_type="")
+        self.assertEqual(status, 415)
+        self.assertEqual(self.procs, [])
+
+    def test_local_json_request_accepted(self):
+        status, body = self._post("/api/start", {"goal": "x"},
+                                  origin=f"http://127.0.0.1:{self.port}")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.procs), 1)
+        status, _ = self._post("/api/start", {"goal": "y"})  # 无 Origin 的本机工具调用放行
+        # 第二个发起被单构建守卫拒绝（409），但守卫本身放行了请求
+        self.assertEqual(status, 409)
+
+
+class InFlightAndStopTests(Harness):
+    """P3.4 验收修复（审计 #3）：在途识别跨重启、动作串行、
+    授权撤回 / 停止请求 / 已确认停止三状态分开。"""
+
+    def test_fresh_activity_refuses_actions(self):
+        self.make_run(status="UNKNOWN", unknown_attempt=True)
+        self.write_heartbeat(fresh=True)
+        result = self.bench.run_action("20260101_000000-ab", "revoke", {})
+        self.assertEqual(result.get("code"), 409)
+        self.assertIn("请求停止", result.get("error", ""))
+        self.assertEqual(self.procs, [])
+
+    def test_restart_identifies_in_flight_without_registry(self):
+        """服务重启（注册表丢失）后仍能识别在途任务并拒绝动作。"""
+        self.make_run(status="UNKNOWN", unknown_attempt=True)
+        self.write_heartbeat(fresh=True)
+        fresh_bench = Workbench(self.runs, spawner=lambda *a, **k: None,
+                                start_wait_s=1)
+        result = fresh_bench.run_action("20260101_000000-ab", "feedback",
+                                        {"text": "改"})
+        self.assertEqual(result.get("code"), 409)
+
+    def test_stale_activity_allows_actions(self):
+        self.make_run(status="UNKNOWN", unknown_attempt=True)
+        self.write_heartbeat(fresh=False)
+        result = self.bench.run_action("20260101_000000-ab", "revoke", {})
+        self.assertTrue(result.get("accepted"))
+        self.procs[0]["proc"].returncode = 0
+        self.bench._action_view("20260101_000000-ab")
+
+    def test_stop_request_marks_and_recovers(self):
+        self.make_run(status="UNKNOWN", unknown_attempt=True)
+        self.write_heartbeat(fresh=True)
+        result = self.bench.request_stop("20260101_000000-ab")
+        self.assertTrue(result.get("stop_requested"))
+        self.assertTrue(self.bench._stop_marker("20260101_000000-ab").is_file())
+        detail = self.bench.task_detail("20260101_000000-ab")
+        self.assertTrue(detail["in_flight"])
+        self.assertTrue(detail["stop_requested"])
+        # 标记目录不写进运行目录（单写入不破例）
+        self.assertFalse((self.runs / "20260101_000000-ab" / "workbench").exists())
+        # 任务结束后（心跳过期）：动作恢复可用；停止请求应清除语义
+        self.write_heartbeat(fresh=False)
+        detail = self.bench.task_detail("20260101_000000-ab")
+        self.assertFalse(detail["in_flight"])
+        self.assertTrue(detail["stop_requested"])  # 历史仍可见，直到撤回确认
+
+    def test_stop_request_refused_when_idle(self):
+        self.make_run()
+        result = self.bench.request_stop("20260101_000000-ab")
+        self.assertEqual(result.get("code"), 409)
+        self.assertFalse(self.bench._stop_marker("20260101_000000-ab").is_file())
+
+    def test_three_states_separated_in_detail(self):
+        # 已确认停止：collab 自身 WITHDRAWN + 授权全部撤回
+        self.make_run(status="WITHDRAWN", pending=False, active_auth=False)
+        detail = self.bench.task_detail("20260101_000000-ab")
+        self.assertTrue(detail["confirmed_stop"])
+        self.assertTrue(detail["authorizations_revoked"])
+        self.assertFalse(detail["can_revoke"])
+        self.assertFalse(detail["in_flight"])
+        # 进行中 + 授权仍有效：in_flight True、撤回不可用、停止请求可发
+        self.make_run(run_id="20260101_000002-ef", status="UNKNOWN",
+                      unknown_attempt=True, active_auth=True)
+        self.write_heartbeat("20260101_000002-ef", fresh=True)
+        detail = self.bench.task_detail("20260101_000002-ef")
+        self.assertTrue(detail["in_flight"])
+        self.assertTrue(detail["can_confirm"])
+        self.assertFalse(detail["can_revoke"])
+        self.assertFalse(detail["confirmed_stop"])
+        self.assertFalse(detail["stop_requested"])
 
 
 if __name__ == "__main__":

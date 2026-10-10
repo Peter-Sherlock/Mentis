@@ -204,6 +204,13 @@ class Workbench:
             args += ["--confirm-outcome", outcome]
         elif kind == "revoke":
             args += ["--revoke"]
+        # 验收修复：在途任务拒绝一切 resume 动作——与进行中的构建/动作进程
+        # 并发写同一运行状态是真实竞态；停止走「请求停止」，不走绕行
+        run_state = _load_run_state_safe(self.runs_dir / run_id)
+        if self._in_flight(run_id, run_state):
+            return {"error": "任务仍在进行（活动信号 fresh 或构建/动作子进程存活）；"
+                             "进行中的执行器轮次无法中断，如需停止请先「请求停止」，"
+                             "结束后再核对或操作", "code": 409}
         with self._mu:
             running = self._actions.get(run_id)
             if running is not None and running["proc"].poll() is None:
@@ -240,6 +247,59 @@ class Workbench:
             if last:
                 view["last_action"] = last
             return view
+
+    # ---- 在途识别与停止请求（验收修复：P3.4 审计 #3） ----
+    #
+    # 在途 = 本服务持有的构建子进程仍活着，或活动信号 fresh 而本服务没有
+    # 存活的动作子进程。后者覆盖服务重启后的孤儿构建/CLI 构建识别——
+    # 注册表随进程消失，心跳不随进程消失。
+    # 停止请求 ≠ 已确认停止：请求只落本服务自己的标记目录（不写运行目录，
+    # 不违反单写入），进行中的执行器轮次无法中断；已确认停止仍是 collab
+    # 自身的 WITHDRAWN 终态（idle 时撤回授权才产生）。
+
+    def _state_dir(self) -> Path:
+        d = self.runs_dir.parent / "workbench"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _stop_marker(self, run_id: str) -> Path:
+        return self._state_dir() / f"{run_id}.stop-request.json"
+
+    def request_stop(self, run_id: str) -> dict:
+        run_dir = self.runs_dir / run_id
+        if not (run_dir / "state.json").is_file():
+            return {"error": "运行不存在", "code": 404}
+        run_state = _load_run_state_safe(run_dir)
+        in_flight = self._in_flight(run_id, run_state)
+        if not in_flight:
+            return {"stop_requested": False,
+                    "note": "任务不在进行中：无需停止请求；如要终止后续委托请使用撤回授权（已确认停止）",
+                    "code": 409}
+        marker = self._stop_marker(run_id)
+        marker.write_text(json.dumps(
+            {"requested_at": datetime.now().isoformat(timespec="seconds"),
+             "note": "停止已请求：进行中的执行器轮次无法中断；进行中动作被拒绝，"
+                     "结束后由用户核对或撤回"},
+            ensure_ascii=False), encoding="utf-8")
+        return {"stop_requested": True, "in_flight": True,
+                "note": "停止已请求：进行中的执行器轮次无法中断；结束后请核对产物或撤回授权"}
+
+    def _stop_requested(self, run_id: str) -> bool:
+        return self._stop_marker(run_id).is_file()
+
+    def _in_flight(self, run_id: str, run_state: dict | None = None) -> bool:
+        with self._mu:
+            running = self._actions.get(run_id)
+            action_alive = running is not None and running["proc"].poll() is None
+            build_here = (self._build_proc is not None
+                          and self._build_proc.poll() is None
+                          and run_id == self.current_build_run())
+        if build_here or action_alive:
+            return True
+        if run_state is None:
+            run_state = _load_run_state_safe(self.runs_dir / run_id)
+        activity = (run_state.get("activity") or {}).get("category")
+        return activity == "fresh"  # 有本服务不知道的生产者活着（重启前的孤儿/CLI 构建）
 
     # ---- 投影（只读） ----
 
@@ -299,11 +359,19 @@ class Workbench:
             "codex_runs": meta.get("codex_runs", []),
             "evaluation_plan": meta.get("evaluation_plan", {}),
             "notes": run_state.get("notes", []),
-            # 服务端计算的可用动作（前端只渲染，不复制规则）
+            # 服务端计算的可用动作与状态区分（前端只渲染，不复制规则）
             "can_answer": bool(pending),
             "can_confirm": any(a.get("status") in ("unknown", "failed")
                                for a in attempts),
-            "can_revoke": _active_authorizations(session) > 0,
+            "can_revoke": (_active_authorizations(session) > 0
+                           and not self._in_flight(run_id, run_state)),
+            # 三状态区分（P3.4 审计 #3）：授权撤回 / 停止请求 / 已确认停止
+            "authorizations_revoked": (_active_authorizations(session) == 0
+                                       and any(a.get("status") == "revoked"
+                                               for a in session.get("authorizations", []))),
+            "stop_requested": self._stop_requested(run_id),
+            "confirmed_stop": meta.get("status") == "WITHDRAWN",
+            "in_flight": self._in_flight(run_id, run_state),
             "build_running": self.build_running() and run_id == self.current_build_run(),
         }
         detail.update(self._action_view(run_id))
@@ -437,6 +505,13 @@ function badge(status) {
   return '<span class="badge ' + (status||'') + '">' + (status||'未知') + '</span>';
 }
 
+function disableActionButtons(disabled) {
+  for (const id of ['answer-btn', 'feedback-btn', 'goal-btn', 'confirm-btn', 'revoke-btn']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = disabled;
+  }
+}
+
 // 每次轮询默认重绘 #detail；三重保护避免打断正在操作的用户：
 // 1) 数据指纹未变不重绘；2) 焦点在面板输入框内不重绘；3) 重绘保留输入值与焦点。
 function fingerprint(d) {
@@ -444,7 +519,9 @@ function fingerprint(d) {
     (d.pending || []).map(p => p.interaction_id), d.artifact,
     (d.attempts || []).map(a => [a.action, a.status, a.accepted]),
     (d.versions || []).map(v => v.name), d.can_answer, d.can_confirm, d.can_revoke,
-    (d.activity || {}).category, (d.stages || []).length]);
+    (d.activity || {}).category, (d.stages || []).length,
+    d.stop_requested, d.in_flight, d.confirmed_stop, d.authorizations_revoked,
+    d.authorizations_active]);
 }
 
 function preserveInputs() {
@@ -487,7 +564,25 @@ function renderDetail(d) {
     '<span>模型调用 <b>' + ((d.model_usage && d.model_usage.real_calls) || 0) + '</b>（Mock ' +
     ((d.model_usage && d.model_usage.mock_calls) || 0) + '）</span>' +
     '<span>活动信号 <b>' + esc((d.activity && d.activity.category) || '') + '</b></span></div>' +
-    '<div class="hint">' + esc((d.activity && d.activity.line) || '') + '</div></section>';
+    '<div class="hint">' + esc((d.activity && d.activity.line) || '') + '</div>' +
+    '<div class="kv" style="margin-top:4px">' +
+    '<span>授权：<b>' + (d.authorizations_active ? '有效 ' + d.authorizations_active + ' 项' :
+      (d.authorizations_revoked ? '已全部撤回' : '无记录')) + '</b></span>' +
+    '<span>停止请求：<b>' + (d.stop_requested ? '已请求（进行中的轮次无法中断）' : '无') + '</b></span>' +
+    '<span>已确认停止：<b>' + (d.confirmed_stop ? '是（WITHDRAWN，任何新委托被拒）' : '否') + '</b></span>' +
+    '<span>任务进行中：<b>' + (d.in_flight ? '是（动作暂不可用）' : '否') + '</b></span></div></section>';
+
+  if (d.in_flight) {
+    h += '<div class="notice">任务进行中：进行中的执行器轮次无法中断，' +
+      '反馈/改目标/核对/撤回等动作暂不可用（服务重启后依活动信号同样识别）。' +
+      (d.stop_requested
+        ? '已请求停止：当前轮次结束后请人工核对产物，再决定撤回授权（已确认停止）。'
+        : '如需停止请点「请求停止」：') +
+      '</div>' +
+      (d.stop_requested ? '' :
+        '<p><button id="stop-btn" class="ghost">请求停止</button>' +
+        '<span class="hint"> 只标记停止意愿，不中断进行中的轮次，可逆。</span></p>');
+  }
 
   if (d.status === 'ERROR' || d.status === 'UNKNOWN') {
     h += '<div class="notice">运行未正常收尾（' + d.status + '）。已保存的作品与最后可靠状态仍在下方；' +
@@ -522,9 +617,9 @@ function renderDetail(d) {
     '<option value="failed">failed（核对确认失败）</option></select>' +
     '<button id="confirm-btn">核对确认</button>' +
     '<span class="hint">仅当执行器结局已由你核对；unknown 不会自动重发。</span></div>' +
-    '<div class="actionrow"><button id="revoke-btn" class="danger" ' +
-    'onclick="revoke()">撤回授权（已确认停止）</button>' +
-    '<span class="hint">撤回后任何新委托都会被拒绝，不可逆；已产出文件保留待核对。</span></div></section>';
+    '<div class="actionrow"><button id="revoke-btn" class="danger">撤回授权</button>' +
+    '<span class="hint">仅任务不在进行中时可用；撤回 = 已确认停止（WITHDRAWN），' +
+    '之后任何新委托都会被拒绝且不可逆；已产出文件保留待核对。进行中请先用「请求停止」。</span></div></section>';
 
   h += '<section><h3>作品（看结果）</h3>';
   if (d.artifact && d.artifact.exists) {
@@ -572,6 +667,7 @@ function renderDetail(d) {
   h += '</section>';
 
   $('detail').innerHTML = h;
+  disableActionButtons(!!d.action_running || !!d.in_flight);
   if ((d.versions || []).length) {
     const bind = (sel, frame) => {
       const el = $(sel), fr = $(frame);
@@ -621,6 +717,12 @@ async function sendKind(kind) {
   pollDetail(true);
 }
 
+async function requestStop() {
+  const { ok, body } = await post('/api/task/' + selected + '/stop', {});
+  if (!ok && body.error) alert(body.error || '请求失败');
+  pollDetail(true);
+}
+
 async function revoke() {
   const btn = $('revoke-btn');
   if (btn.dataset.armed !== '1') {
@@ -657,6 +759,7 @@ $('start-form').onsubmit = async (ev) => {
 $('detail').addEventListener('click', (ev) => {
   const btn = ev.target.closest('button');
   if (!btn) return;
+  if (btn.id === 'stop-btn') return requestStop();
   if (btn.id === 'confirm-btn') return sendKind('confirm');
   if (btn.id === 'feedback-btn') return sendKind('feedback');
   if (btn.id === 'goal-btn') return sendKind('goal');
@@ -695,8 +798,8 @@ def page_html() -> str:
             '</body></html>')
 
 
-def make_server(runs_dir, port=8874):
-    bench = Workbench(runs_dir)
+def make_server(runs_dir, port=8874, bench=None):
+    bench = bench or Workbench(runs_dir)
     runs_root = Path(runs_dir).resolve()
 
     class Handler(BaseHTTPRequestHandler):
@@ -770,14 +873,20 @@ def make_server(runs_dir, port=8874):
                 self.json_response({"error": f"读取失败：{type(exc).__name__}"}, 503)
 
         def _run_segment(self, route, prefix):
-            # /preview/<id>/<subpath> → (run_id, subpath)；拒绝路径穿越
+            # /<prefix><id>/<subpath> → (run_id, subpath)
+            # P3.4 验收修复：允许白名单内的两段子路径（versions/<名>、trace/<名>），
+            # 仍拒绝穿越、反斜杠与隐藏文件；隔离与白名单由各 serve 方法把关
             rest = route[len(prefix):]
             parts = rest.split("/", 1)
             if not parts or not parts[0]:
                 return None, None
             run_id = parts[0]
             sub = parts[1] if len(parts) > 1 else "index.html"
-            if "/" in sub or "\\" in sub or ".." in sub or sub.startswith("."):
+            if "\\" in sub or ".." in sub or sub.startswith(".") \
+                    or sub.endswith("/"):
+                return run_id, None
+            segments = sub.split("/")
+            if len(segments) > 2 or any(not seg for seg in segments):
                 return run_id, None
             return run_id, sub
 
@@ -790,10 +899,23 @@ def make_server(runs_dir, port=8874):
             if run_dir.parent != runs_root:
                 self.respond(404, b"Not found", "text/plain")
                 return
-            target = (run_dir / "workspace" / sub).resolve() if sub else None
-            vdir = (run_dir / "versions").resolve()
-            if target is None or (target.parent != (run_dir / "workspace").resolve()
-                                  and target.parent != vdir) or not target.is_file():
+            if sub is None:  # 路径被 _run_segment 拒绝（穿越/非法段）
+                self.respond(404, "路径不合法".encode("utf-8"), "text/plain; charset=utf-8")
+                return
+            # P3.4 验收修复（审计 #2）：versions/<名> 指向运行目录的 versions/
+            # 快照；其余单段名指向 workspace 根。路径隔离不变：两者都只允许
+            # 单层文件名，workdir 下其他目录（如 trace/state）不可达
+            segments = sub.split("/")
+            if len(segments) == 2:
+                if segments[0] != "versions":
+                    self.respond(404, b"Not found", "text/plain")
+                    return
+                target = (run_dir / "versions" / segments[1]).resolve()
+                allowed_parent = (run_dir / "versions").resolve()
+            else:
+                target = (run_dir / "workspace" / sub).resolve()
+                allowed_parent = (run_dir / "workspace").resolve()
+            if target.parent != allowed_parent or not target.is_file():
                 self.respond(404, "作品不存在".encode("utf-8"), "text/plain; charset=utf-8")
                 return
             ctype = "text/html; charset=utf-8" if target.suffix == ".html" else \
@@ -835,15 +957,43 @@ def make_server(runs_dir, port=8874):
 
         do_HEAD = do_GET
 
+        def _write_guard(self) -> bool:
+            """写接口守卫（P3.4 审计 #4）：仅接受本机同源页面的 JSON 请求。
+
+            - Content-Type 必须是 application/json（允许 charset 后缀）；否则 415
+            - 携带 Origin 时必须与本地服务同源（浏览器 fetch 对跨源/合成请求
+              会带 Origin）；非本地来源 403。无 Origin 的本机工具调用放行
+              （Host 校验已在 _guard 完成）
+            """
+            port_actual = self.server.server_address[1]
+            origin = self.headers.get("Origin", "")
+            if origin and origin not in (f"http://127.0.0.1:{port_actual}",
+                                         f"http://localhost:{port_actual}"):
+                self.json_response({"error": "写请求来源不是本机工作台页面；已拒绝"},
+                                   403)
+                return False
+            ctype = (self.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                self.json_response({"error": "写请求必须是 application/json；已拒绝"},
+                                   415)
+                return False
+            return True
+
         def do_POST(self):
             if not self._guard():
                 return
             route = urlsplit(self.path).path
+            if not self._write_guard():
+                return
             body = self._read_body()
             try:
                 if route == "/api/start":
                     result = bench.start_task(body.get("goal", ""),
                                               int(body.get("timeout_s", 600)))
+                    self.json_response(result, result.get("code", 200))
+                elif route.startswith("/api/task/") and route.endswith("/stop"):
+                    run_id = route.split("/")[3]
+                    result = bench.request_stop(run_id)
                     self.json_response(result, result.get("code", 200))
                 elif route.startswith("/api/task/") and route.endswith("/action"):
                     run_id = route.split("/")[3]
