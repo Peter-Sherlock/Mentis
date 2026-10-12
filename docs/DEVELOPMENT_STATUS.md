@@ -6,8 +6,8 @@
 | --- | --- |
 | 最近更新 | 2026-10-12（负责人授权：GitHub 首次公开发布与 README 改版；基于 e9ee875，业务代码不变；发布说明见 [记录](progress/github-publication.md)，本轮核对的未修边界见 [限制清单](KNOWN_LIMITATIONS.md)） |
 | 当前里程碑 | P3.1—P3.4 completed（含验收修复）；目标—素材—验收一致性修复 completed（2026-10-10）；P5.2a partial；P2.4 completed 待退出判定（T4/E1 partial、E2 独立评审 pending_human） |
-| 当前优先级 | **GitHub 首次公开发布与 README 改版**；后续优先补状态安全验收修复。E2 独立评审、负责人反馈体验继续单列。 |
-| 当前工作 | **发布与文档**：中文 README、原创 SVG 封面、可克隆使用的命令、能力与限制说明；历史开发成果及冻结 E2 不改判。 |
+| 当前优先级 | **本轮公开发布与 README 改版 completed**；等负责人下一指令，推荐状态安全验收修复。E2 独立评审、负责人反馈体验继续单列。 |
+| 当前工作 | **发布与文档 completed**：[公开仓库](https://github.com/Peter-Sherlock/Mentis) main 已推送；README、SVG 与 Git blob 核对一致；远端重新克隆的版本命令与空任务工作台 HTTP 200，零真实模型调用。历史开发成果及冻结 E2 不改判。 |
 | 当前状态 | **O1—O4、C1、P1.3、P1.4、P3.1—P3.4 completed / T4、E1 partial / E2 独立评审 pending_human**。P3.4 含一次真实浏览器端到端（真实 Codex/DeepSeek）；"已交付"=初稿可看；专业效果仍未验证 |
 | 下一执行工作包 | 推荐**状态安全验收修复**（活跃构建锁、陈旧快照覆盖撤权、库保存失败恢复）；需后续开发指令，不在本轮实现。 |
 | 当前请求范围 | 负责人明确要求推送到 GitHub 并设计精美 README，已确认 Peter-Sherlock/Mentis 为公开仓库；本轮授权发布与文档，不启动业务实现或真实 AI 运行。 |

@@ -23,7 +23,15 @@
 - 封面用本机字体实际栅格化为 1600×620 PNG；人工查看后修正四卡文字溢出，再次查看通过。PNG 仅为本地检查，仓库保留 SVG。
 - GitHub 官方 GFM 渲染返回有效 HTML，含封面、5 个表格、1 个折叠区和 Mermaid 代码块。实际浏览器控制连接因本机环境错误未成功，未冒充完整页面截图核验。
 - 本轮未重复全量回归：变更只涉及文档和 SVG；README 的419项引用为2026-10-10已核验结果，未写成本轮新执行。
-- 推送及远端重新克隆的实际输出保存在本机 `runtime/publication/20261012/`；退出条件为公开仓库 default branch=main、远端 main SHA 与本地 HEAD 相同、README与SVG内容哈希相同，以及新克隆的本地空任务服务入口可读取。
+- 推送及远端重新克隆的实际输出保存在本机 `runtime/publication/20261012/`；退出条件为公开仓库 default branch=main、远端 main SHA 与本地 HEAD 相同、README与SVG的Git blob内容哈希相同，以及新克隆的本地空任务服务入口可读取。
+
+### 推送与新克隆的实际结果
+
+首次推送提交 `0fe6871`，仓库为 public，默认分支 main；远端 SHA 与本地一致。README、SVG及限制清单与提交的 Git blob 字节一致，公开 raw SVG 返回200；远端 README 实际返回11个标题锚点，所有目录链接均命中。
+
+重新从 GitHub 克隆：clone退出0；`--version` 为 `mentis 0.24.0`、退出0；`--help`退出0；真实 CLI 工作台首页与任务API均HTTP200，任务列表为空、build_running=false，克隆不含runtime或.env。上述核验未发起任务或模型请求。收尾仅更新本记录与状态文件，最终远端main以发布分支HEAD为准。
+
+初次哈希核对误把Windows工作区CRLF与Git仓库LF直接比较，断言失败；检查原始blob及归一后的工作区证明内容一致。错误输出保留为本机github-verification-initial.json，更正后的结果在github-verification.json，不当作项目缺陷。
 
 ## 失败、限制及未完成项
 
