@@ -1,140 +1,230 @@
-# Mentis
+<div align="center">
 
-代表非专业用户与执行型 Agent 持续协作的代理：帮助形成目标，决定下一步，委托工作，观察实际产物，诊断问题并给出有效修改指导。
+<img src="docs/assets/mentis-banner.svg" alt="Mentis：从你的想法，到有依据的作品" width="100%" />
 
-实际进度、证据边界与下一步以[开发状态](docs/DEVELOPMENT_STATUS.md)为准。阶段性“已交付”表示初稿可查看，最终验收、专业效果与用户满意度分别记录。流程网页入口见下节；资源草案与模型自评不授予专家资格。
+<br />
 
-## 运行（核心 Python 无第三方包依赖）
+**代表非专业用户，与执行型 Agent 持续协作。**
 
-要求 Python ≥ 3.10。本机 `python` 当前指向 Anaconda Python 3.7.3；Windows 上使用 `py -3.14`（本机版本 3.14.7）。为正确显示中文及 `¥`，PowerShell 先设置 `$env:PYTHONIOENCODING='utf-8'`。在本目录执行：
+你表达目标与反馈，Mentis 组织委托、观察作品，并推动有依据的修订。
 
-```bash
-py -3.14 -m mentis                # 入口说明
-py -3.14 -m mentis --version      # 仅版本号
-py -3.14 -m mentis demo-contract  # 脚本化契约演示，页面质量未验证
-py -3.14 -m mentis demo-routing   # 确定性的资源选择与缺口分流演示
-py -3.14 -m mentis diagnose --page runtime/demo/event_page_v1.html --fixture tests/fixtures/mock_diagnosis_response.json
-py -3.14 -m mentis observe-page --page runtime/demo/event_page_v1.html  # 本机浏览器双视口截图
-py -3.14 -m mentis guide-revise --baseline runtime/collab/<运行ID>      # P3.2 指导修订循环（真实运行加 --real）
-py -3.14 -m mentis eval-check     # E1冻结核对；--isolation-evidence 接入真实隔离准入（窗口内才可能 passed）
-py -3.14 -m mentis eval-prepare --out runtime/evaluation/my-e1-preview # 离线制作输入包，已有内容拒绝覆盖
-py -3.14 -m mentis eval-isolate probe --prepared runtime/evaluation/e1-isolation-probe --arm input-001/M
-                                  # 事务化开启 deny ACL 隔离窗口并双端确定性探测（含一次真实 Codex turn）
-py -3.14 -m mentis eval-isolate release --prepared runtime/evaluation/e1-isolation-probe
-                                  # 按原 DACL 事务恢复（逐项核验）；sweep 清扫崩溃遗留窗口
-py -3.14 -m mentis eval-plan --goal "为拾光咖啡工作坊制作活动介绍页" --pilot
-                                  # P2.4-V1 评估计划先行：组装并打印某目标的评估计划（--real 调模型实例化）
-py -3.14 -m mentis eval-run --prepared runtime/evaluation/e1-prepared-verified --arm input-002/B-1   --evidence runtime/evaluation/e1-prepared-verified/isolation/isolation-evidence.json --suite-sha <冻结sha>
-                                  # E1 公平运行器：隔离窗口内运行单个臂（先 eval-isolate probe 开窗）
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](#快速开始) [![Runtime](https://img.shields.io/badge/Core-Standard_Library-284B63?style=flat-square)](#架构) [![Interface](https://img.shields.io/badge/Interface-Local_Workbench-168B7B?style=flat-square)](docs/WORKBENCH_GUIDE.md) [![Status](https://img.shields.io/badge/Status-Research_Prototype-C88D46?style=flat-square)](#验证与边界)
+
+[快速开始](#快速开始) · [协作体验](#协作体验) · [架构](#架构) · [验证与边界](#验证与边界) · [开发文档](#开发文档)
+
+</div>
+
+---
+
+## 为什么做 Mentis
+
+有想法的人，不一定知道如何写专业任务书，也不一定知道作品哪里需要调整。
+
+Mentis 探索一种持续协作方式：用户用自然语言表达意图，系统保留目标、偏好与授权，组织执行型 Agent 制作，再读取**实际产物**来判断下一步。设计细节默认在委托范围内自主处理；用户可以随时补充、纠正方向，或选择共同设计。
+
+首个试点是**本地单页网页**：活动介绍、小产品展示和个人介绍，关注信息组织、视觉表达与基础交互。
+
+> **项目正在验证的主张：** 相比直接委托执行器，额外的观察与指导能否改善作品，或在同等质量下减少用户负担？真实集成已走通，独立效果结论仍待验证。
+
+## 协作体验
+
+| 你要做的事 | Mentis 提供的入口 |
+| :--- | :--- |
+| **表达目标** | 自然语言发起任务，保留目标、条件与决定来源 |
+| **跟进进展** | 阶段、活动信号、待决事项与已保存状态 |
+| **查看作品** | 浏览器预览，桌面与移动视口观察 |
+| **表达反馈** | 新 brief 版本、执行线程续接与修订记录 |
+| **比较变化** | 历史快照与当前作品并排查看，各自带内容哈希 |
+| **检查依据** | 运行报告、确切委托、公开交流、事件与模型调用台账 |
+
+```mermaid
+flowchart LR
+    A[表达目标] --> B[形成委托与评估计划]
+    B --> C[执行器制作]
+    C --> D[观察实际作品]
+    D --> E{检查结果}
+    E -->|需要修订| F[有界修改与复检]
+    F --> D
+    E -->|初稿可看| G[交付与版本对照]
+    G -->|用户反馈| B
+
+    classDef user fill:#ECF8F5,stroke:#168B7B,color:#16483F
+    classDef work fill:#EDF2FC,stroke:#5E78AF,color:#243A61
+    classDef result fill:#FFF5E8,stroke:#C88D46,color:#704F25
+    class A,G user
+    class B,C,D,F work
+    class E result
 ```
 
-## 查看任务执行流程（本地只读网页）
+*图示表达系统流程；阶段性 `DELIVERED` 表示初稿可查看，不代表最终任务完成或用户满意。*
 
-在项目根目录运行，然后打开终端打印的本机地址：
+## 快速开始
+
+核心 Python 代码使用标准库，无需先安装第三方 Python 包。当前真实接入与恢复验证主要在 **Windows** 完成；Python 要求 **≥ 3.10**，下列命令使用本项目已验证的 `py -3.14`。
+
+### 1. 获取项目，先检查本地入口
 
 ```powershell
-py -3.14 -X utf8 -B -m mentis view --run runtime/evaluation/e2-runs/20261004_055316-937e-input-002-M --port 8873
+git clone https://github.com/Peter-Sherlock/Mentis.git
+cd Mentis
+
+py -3.14 -X utf8 -B -m mentis --version
+py -3.14 -X utf8 -B -m mentis --help
 ```
 
-可查看目标、专业决策、执行时间线、公开交流、模型调用、作品证据与归档差异；可将 `--run` 换成其他运行目录，`--port 0` 自动选择空闲端口。页面跟随已落盘的新记录；任务进程活动状态未采集时明确显示未知。查看器只读，不启动或续办任务、不调用模型。停止服务只停止查看。
+这些命令不调用模型。其他环境可以使用符合版本要求的 `python` 替换 `py -3.14`；真实执行与恢复的跨平台行为尚未完整验证。
 
-上述样例是既有真实 E2 记录回放：10 条事件、4 项处置、零委托、no_change；本轮没有新执行的 AI 任务。[实现、截图与核验](docs/progress/P2.4-O3-page.md)。
+### 2. 打开本地工作台
 
-## 协作运行（P2.3：真实执行器 + 真实截图）
-
-```bash
-# 自主有界任务：用户不回复也能完成（需 Codex 已登录；DeepSeek 密钥用于诊断候选）
-py -3.14 -m mentis collab --goal "为拾光咖啡（虚构品牌）周六手冲工作坊做一个温暖简洁的活动介绍页（本地单页，含报名表单）" --non-interactive
-
-# 共同设计：先确认风格方向再委托（非交互时保持待决，不猜测）
-py -3.14 -m mentis collab --design --non-interactive --goal "..."
-py -3.14 -m mentis collab-resume --state runtime/collab/<运行ID>/state.json --answer "ix-3:暖棕纸质感，首屏大图"
-
-# 明确修正进入新 brief 版本并续接修订；撤回授权后一切委托被拒绝
-py -3.14 -m mentis collab-resume --state runtime/collab/<运行ID>/state.json --feedback "首图换成手冲壶插画感，其余保留"
-py -3.14 -m mentis collab-resume --state runtime/collab/<运行ID>/state.json --revoke
+```powershell
+py -3.14 -X utf8 -B -m mentis workbench
 ```
 
-执行器在**隔离 Git 工作区**（`runtime/collab/<运行ID>/workspace/`，只含 brief 与素材，不含任何秘密）内工作；产物与双视口截图在 `runtime/collab/<运行ID>/`，`report.md` 提供看结果/看变化/看依据三个入口。**阶段性交付（PROJECT_PLAN §7）：DELIVERED 表示"初稿做好，可以查看"、结构层硬要求检查通过，不表示最终任务完成或用户满意**；反馈修订前会自动把旧版产物快照到 `versions/` 供前后对照。brief 中每条约束/偏好标注来源：用户选定（user_selected）/ 系统约束（system，如隔离与无网络预置规则）/ Mentis 自主推导（agent_selected）/ 暂定（provisional）。**评估计划先行（V1，ADR-008）**：首次委托前 Mentis 从四层来源（内核/用户/领域规则/任务素材实例）组装版本化评估计划，先落盘（`evaluation-plan/plan-vN.json`）、哈希入 trace，再委托；委托指令携带计划派生的验收项，硬要求检查读计划中的确定性条目（不再硬编码试点值）；brief 改版时计划有原因地改版，旧版本文件不改写；模型实例化条目一律 provisional 不阻塞交付，`--real` 路径无凭据时降级为纯确定性组装并如实标注。**可验证性路由与盲比复检（V2，ADR-008 第 6—8 条）**：诊断候选先对应计划维度按检查方式路由（只有确定性/盲比维度可自主修订；user_judgment 以非阻塞选项告知；unverifiable 不修订；对应不到=计划盲区）；修订复检为盲比（前后两版随机标 X/Y、只给计划标准、正反两序，不一致记 changed_unverified 不判改善）；判定分级 improved/changed_unverified/no_change/regression/unverified/unknown，improved 需盲比两序一致或确定性证据；报告逐维度展示判定。**交付前专业评审（T4 补修）**：结构检查通过后，Mentis 以渲染测量+双视口截图+真实模型诊断按领域标准评审工作稿；候选逐条审查（采纳/驳回/保持现状/待用户，理由留档 `professional-review.json`）；成立问题在预算内转成修订指令（位置/证据/保留项/复检办法）委托 Codex 并重新观察复检（诊断与复查为同源模型）；合格不改但留依据；回归不交付、测量不可信不判通过、预算耗尽如实留档。执行器超时会进入 unknown 并保留写锁，需人工核对产物后用 `collab-resume --confirm-outcome completed` 确认；委托从不自动重发。执行器反问（QUESTIONS.md）先由 Mentis 分流：素材可答与常规专业问题自主回答，只有用户独有事实/取舍/许可才请求决定。没有货币硬上限；只记录调用次数、时长与可取得的 token 用量。
+浏览器打开 **http://127.0.0.1:8874/**。新克隆的仓库没有历史任务；运行记录保存在你自己的 `runtime/`，未随仓库发布。
 
-## 指导修订循环（P3.2：诊断 → 修改指令 → 修订 → 复检）
+页面服务、预览和证据读取在本地进行。**发起真实任务之前**，需要完成下面的执行器与模型配置；这类任务会联网并消耗相应账号或 API 用量。
 
-```bash
-# 从 P2.3 真实运行冻结首稿，走完整闭环（真实运行必须显式 --real）
-py -3.14 -m mentis guide-revise --baseline runtime/collab/<运行ID> --real --timeout 600
+### 3. 配置真实任务所需资源
 
-# 诊断请求用户独有决定时暂停；回答后继续修订
-py -3.14 -m mentis guide-resume --state runtime/guidance/<运行ID>/state.json --answer "ix-4:需要"
+| 资源 | 用途 | 配置方式 |
+| :--- | :--- | :--- |
+| Git | 创建隔离任务工作区 | 本机 `git` 命令可用 |
+| Codex CLI | 制作网页、续接修订 | 安装后完成登录；工作台默认使用项目本地 `CODEX_HOME` |
+| DeepSeek API | 评估计划与专业诊断 | 环境变量 `DEEPSEEK_API_KEY`，或项目根目录 `.env` |
+| Chrome / Edge | 渲染测量与截图 | 本机浏览器；程序识别 PATH 或常见 Windows 安装路径 |
 
-# 执行器中断（非超时）后，核对无活跃写入者再续办（计入修订预算，不盲目重试）
-py -3.14 -m mentis guide-resume --state runtime/guidance/<运行ID>/state.json --retry
+为工作台准备项目本地 Codex 登录态：
+
+```powershell
+$env:CODEX_HOME = Join-Path (Get-Location) "runtime/codex-home"
+New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
+codex login
 ```
 
-## 真实使用会话（P5.2a：项目负责人本人操作）
+在项目根目录自行新建 `.env`，填入你的凭据：
 
-```bash
-# 路径 A：用你自己的话说目标 → 自主委托 → 三入口 → 当场逐字反馈（真实费用，约 5—15 分钟）
-py -3.14 -m mentis field-start --label 我的第一次委托 --goal "给周末读书会做一个报名页，温暖一点，能填姓名和电话"
-
-# 路径 B：先看已有真实产物，再补记逐字反馈（零成本）
-py -3.14 -m mentis field-feedback --run runtime/guidance/20260928_092745-5465 --satisfied no --quote "你的原话" --block "哪里卡住或没看懂"
+```dotenv
+DEEPSEEK_API_KEY=替换为你的DeepSeek密钥
 ```
 
-操作、系统行为、耗时、阻塞与你的原话自动归档在 `runtime/field/<会话ID>/`（操作/系统行为/研究者提示分列）。**P5.2a 当前未完成：入口已就绪，等待真实操作记录**；指南见 [docs/field-session-guide.md](docs/field-session-guide.md)。
+`.env` 和 `runtime/` 已被 Git 忽略。完成配置后，在同一终端重新启动工作台。当前默认诊断模型为 `deepseek-flash`，模型及执行器可用性依赖你的账号条件。
 
-## 交互追踪与回放（P2.4）
+完整启动说明见[工作台指南](docs/WORKBENCH_GUIDE.md)。
 
-```bash
-# 查看一次运行的追踪时间线（新运行=事件流回放+委托台账；历史运行=现存材料清单+未记录缺口，不回填）
-py -3.14 -m mentis trace --run runtime/trace-demo/<演示ID>   # 机制演示（FakeAdapter，非真实委托）
-py -3.14 -m mentis trace --run runtime/guidance/20260928_092745-5465   # 真实历史运行
-py -3.14 -m mentis trace --run runtime/t2-real-stream --follow        # 实时旁观（运行中另开终端；本例已收尾会自动结束）
+### 4. 发起首个任务
 
-# 导出可共享的白名单时间线（JSON：仅契约字段与文件哈希；不含 prompt 原文/用户逐字反馈/密钥值）
-py -3.14 -m mentis trace --run runtime/t2-real-stream --export 导出路径.json
-# 本地阅读确切委托、Codex 对外回复与动作摘要（不是白名单导出）
-py -3.14 -m mentis conversation --run runtime/collab/20260929_084347-5f82  # 本地交流视图
+初次体验可以使用与内置**虚构工作坊素材**匹配的目标：
+
+> 为拾光咖啡的周六手冲工作坊制作一个温暖、简洁的活动介绍页。本地单页，包含活动信息与报名表单，视觉和布局由你决定。
+
+完成后，从工作台查看 **作品 → 版本对比 → 依据**。反馈可以用自己的话表达，例如“整体有些像促销广告，想再自然一点，首图保留”；这是反馈输入示例，其专业解释和改善效果仍须通过实际作品检验。
+
+<details>
+<summary><strong>使用自己的文案素材：CLI 示例</strong></summary>
+
+当前素材文件入口在 CLI，工作台尚未提供素材上传。先准备 UTF-8 文件 `runtime/my-material.md`，使用程序支持的标签：
+
+```markdown
+# 周六手冲入门工作坊
+- 活动名称：周六手冲入门工作坊
+- 日期时间：2026-11-21 14:00–16:00
+- 地点：示例门店，梧桐街 12 号
+- 价格：¥99
+- 报名方式：填写姓名、联系方式
 ```
 
-`collab` / `guide-revise` 的每次委托**先归档确切指令**（`trace/prompts/<attempt>.md`，SHA-256 与实际发送文本一致）再调用执行器，并写 `trace/events.jsonl`（目标/授权/委托/执行器终态/复检/决策/收尾/核对确认）与 `trace/manifest.json`（完整性）。事件丢失时运行不得称完整追踪；历史运行不补写伪事件。契约见 [docs/TRACKING_EVENT_CONTRACT.md](docs/TRACKING_EVENT_CONTRACT.md)。故障与隐私边界：运行意外异常会收尾为 **ERROR** 并落盘（无终态尝试记 unknown，不假完成；`field-start` 的半份会话日志明确标注不完整并保留日志入口）；unknown 的人工核对确认以 `executor.confirmed` 事件入流；事件摘要与导出对已知密钥字段名（api_key/token/password/密码/密钥等）的赋值做确定性隐去——只认已知字段名，不承诺识别任意秘密；`input_tokens` 等用量计数不隐去；续接/恢复在回放中以 `run.resumed` + 中断区间与委托台账（同 thread 多 attempt）呈现。T4 真实运行核验记录（含一次真实 ERROR→核对→交付）见 [P2.4-T4 记录](docs/progress/P2.4-T4.md)。
+以上是人工编写的虚构素材示例。文件上限 64 KB；保持目标与素材主体一致。
 
-“看依据”现在另有本地 `conversation.md`：顺序展示给 Codex 的确切指令、Codex 对外回复全文和动作摘要；新运行的公开回复全文归档在 `trace/messages/` 并以哈希关联事件。它不包含内部推理或原生命令输出，也不进入白名单导出。**同一委托中的多条 Codex 进度消息不是 Mentis 与 Codex 的多轮往返。**T4 旧运行仅有一次委托、无真实反馈修订；原事件只存回复摘要，本机原生会话中可核对的五条公开回复另整理于 `runtime/t4-observed-exchange.md`（只读补充，不回填 36 条事件）。
-
-流程：冻结 v1（原运行不改动）→ 结构观察 + 渲染测量（iframe 包装获得真实 390/1280 布局，Windows 无头 500px 最小窗宽已被绕开）+ 真实视口截图 → DeepSeek 诊断（**双视口截图作为图像输入**，证据引用必须指向观察条目）→ 组装修改指令（缺陷与修法只来自模型诊断与机器测量，含必须保留的活动事实）→ 真实 Codex 修订（隔离 Git 工作区，v1 已提交为基线）→ 独立复检（保留项逐段核对、表单逐字段必填核对、溢出复测须测量可信、无网络声明 + 模型带图复查须绑定当前产物版本）→ 判定改善/无改善/回归/**未知**（测量报错、视口尺寸不符、缺复查截图或复查无法绑定当前产物时判 UNVERIFIED，不以零溢出判通过）；修复缺陷但破坏任一保留事实或任一字段必填 = 回归，不标改善。自动修改最多 2 轮。诊断提出的决策请求先由 Mentis 分流：触及保留决定（改价/改期/发布等）或需要素材外新事实才暂停等待用户，可逆的呈现取舍自主决定并留痕（分流的必要性本身未经证明，见 P3.2 记录）。`runtime/guidance/<运行ID>/report.md` 提供三个入口（v1/v2 作品与截图、同条件对比与保留项、完整指令/诊断/事件/用量）。
-
-`demo-routing` 展示：三份网页试点资源（信息组织/视觉表达/基础交互，规则分硬要求/建议/偏好/待验证假设四类）按任务需要加载；七类缺口分流到自决/工具查询/执行器咨询/小样实验/请求用户/受限未验证/升级，每条带理由；两条纪律自检（常规专业问题不转交用户、必要介入不省略）；未知领域与声明冲突的受限处理。
-
-`diagnose --fixture` 用真实 HTML 文件做**结构观察**，再处理 Mock 固定响应；它不证明视觉效果、交互行为或模型诊断正确。真实调用使用官方模型 ID `deepseek-flash`，需提供 `DEEPSEEK_API_KEY` 且显式加 `--real`。可在项目根目录新建 `.env`，写入单独一行 `DEEPSEEK_API_KEY=你的密钥`；程序会读取这个文件，无需额外安装依赖。若系统环境变量中已定义同名键，则它优先（即使为空）。`.env` 已被 Git 忽略，但仍需仅保存在可信电脑上，切勿提交或分享。`--real` 会发送页面结构、目标、反馈与领域规则至 `api.deepseek.com`；单次命令至多两次请求，每次输出上限 2000 token、输入文本上限 25000 字符。请只对已核对的数据执行。
-
-`observe-page` 需要本机 Chrome 或 Edge，将桌面 1280×800 与移动 390×844 的初始截图及 `observation.json` 保存至 `runtime/observations/`。它不调用模型，不执行点击、表单提交、对比度或自动溢出检测。P3.1 Codex CLI Adapter 见 [mentis/executors/codex_cli.py](mentis/executors/codex_cli.py)；需要本机 Codex CLI 已登录，写入任务应在独立 Git 工作区运行。真实隔离探针、能力矩阵和限制见 [P3.1 记录](docs/progress/P3.1.md)。
-
-## 开发检查
-
-```bash
-py -3.14 -m unittest discover -s tests -v
+```powershell
+py -3.14 -X utf8 -B -m mentis collab `
+  --goal "为周六手冲入门工作坊制作活动介绍页" `
+  --material runtime/my-material.md `
+  --non-interactive
 ```
 
-当前 235 项：入口、契约不变量、能力资源与分流、P2.2 网关/观察/诊断、P3.1 Adapter 与截图边界、P2.3 协作循环（含 v1→反馈→v2 修订路径核验：原目标/硬约束/旧版产物快照/修改依据保留）、P3.2 指导修订循环（合格不改、回归拒收、决策分流/暂停、失败轮核对续办、unknown 产物核对、状态恢复；验收修复：测量不可信判未知、保留项逐段与表单逐字段核对、复查绑定当前产物——均先复现误判后验证修复）、P5.2a 现场会话与逐字反馈归档、P2.4-T1 追踪写入与事后回放（seq/哈希/不回填）、P2.4-T2 逐行流与实时旁观、P2.4-T3 故障与隐私加固（敏感输出隐去、追踪写失败不粉饰、截断/限额不判成功、续接多 attempt 时间线、撤回落trace、现场会话异常收尾、导出白名单与旧记录兼容）、T4 补充（unknown 不崩溃回归、失败子项消息、核对确认事件、终态未入流的 session.json 交叉引用、公开回复全文归档与交流视图）、**T4 交付前专业评审**（有据触发修订、不成立/保持现状不触发、合格不改留依据、无截图不冒充视觉验证、测量不可信判 UNVERIFIED、回归不交付、预算耗尽留档、修订 unknown 停止、保留决定暂停修订、"保留当前"措辞防回归）、**E1 隔离与 stdin**（假 .cmd 执行器：UTF-8/引号完整性、启动+恢复双调用、不读 stdin 阻塞到共享截止时间、BrokenPipe 不判 completed、超时进程树杀；事务窗口：原 DACL 精确恢复含第三方 deny 保真、原子日志失败不开窗、部分 deny 失败全回滚、并发互斥、恢复失败逐项报告、执行器存活门控；探针四分类与缺测不计通过；准入七类拒绝路径；--no-codex 只产调试）、**V1 评估计划先行**（四层来源组装与逐条来源、provisional/hypothesis 不阻塞、计划先于委托且落盘失败零调用、硬要求读计划含异事实夹具、brief 改版计划改版且旧版本文件不改写、模型虚构来源拒收留痕、无凭据降级）、**V2 可验证性路由与盲比复检**（审美候选转用户选项不自动修订、盲区不采纳、盲比两序一致才 improved、虚构维度编号剔除、判定分级六值、guide-revise 接入计划与盲比、reverify 盲比绑定复用、存活门控排除 IDE app-server 误报）、**E1 公平运行器**（准入 fail-closed 零调用、两臂包展开一致、基线预算循环 unknown 不重发、M 臂全链路 improved/合格不改/预算耗尽如实收尾、计划先于委托）。Mock HTTP 响应只验证请求格式、用量采集与记录边界；真实调用证据另见阶段报告。
+启动工作台后可以查看该 CLI 任务。目标—素材一致性当前采用有限词面规则，已知边界见[限制与待修问题](docs/KNOWN_LIMITATIONS.md)。
 
-## 目录
+</details>
 
+## 架构
+
+Mentis 保有任务语义与审核责任，执行器负责制作。工作台的动作转发至既有 CLI，前端展示状态并收集输入。
+
+| 层 | 核心模块 | 职责 |
+| :--- | :--- | :--- |
+| **任务契约** | `contracts.py` · `session.py` | brief、策略、授权、交互、执行尝试与版本 |
+| **协作循环** | `collab.py` · `guidance.py` | 委托、缺口分流、反馈修订和复检 |
+| **专业依据** | `professional.py` · `evaluation_plan.py` | 冻结职责与资源；形成有来源的检查计划 |
+| **执行与观察** | `executors/` · `observation.py` · `render_measurement.py` · `browser_observation.py` | 原生任务事件、实际结构、渲染测量与双视口截图 |
+| **状态与证据** | `store.py` · `trace.py` · `run_projection.py` | SQLite、确切指令、事件、台账与只读投影 |
+| **本地界面** | `workbench.py` · `run_view.py` | 任务列表、动作、预览、版本对照与依据 |
+
+三条工程原则贯穿实现：
+
+- **执行完成与验收分别记录。** 产物、检查依据与当前目标版本共同决定接受结果。
+- **未知结果先核对。** 超时或中断保留 `unknown` 与已有作品，避免盲目重发外部写入。
+- **来源与权限随任务保留。** 用户事实、系统默认、专业选择与未验证判断分别标注；通知不要求答复，决定请求只阻塞相关动作。
+
+恢复机制有真实故障验证，也仍有未修边界；操作前查看[恢复指引](docs/RECOVERY_GUIDE.md)与[已知限制](docs/KNOWN_LIMITATIONS.md)。
+
+## 验证与边界
+
+| 证据 | 当前结论 | 阅读入口 |
+| :--- | :--- | :--- |
+| **模型与执行器接入** | 已有真实 Codex / DeepSeek 委托、观察与修订记录 | [指导修订闭环](docs/progress/P3.2.md) |
+| **中断与恢复** | 已做进程退出、超时、失败、撤回、改目标与单写入故障验证 | [P3.3 记录](docs/progress/P3.3.md) |
+| **浏览器工作台** | 已有真实发起、核对与反馈修订会话 | [P3.4 记录](docs/progress/P3.4.md) |
+| **目标与素材一致性** | 有匹配及不匹配场景的真实验证；词面变体仍有反例 | [一致性修复](docs/progress/goal-material-consistency.md) |
+| **自动化回归** | 2026-10-10 核验 419 项通过，含启用后的本机浏览器集成 | [阶段记录](docs/DEVELOPMENT_STATUS.md) |
+| **指导价值** | 20 臂探索性对照已运行；独立评审仍 `pending_human` | [E2 结果与负面观察](docs/evaluation/e2/RESULTS.md) |
+
+**当前是研究原型。** 已知待修包括活跃构建时的锁嵌套、陈旧状态覆盖授权、库保存失败后的恢复、素材主体识别和累计用量摘要。详见[限制与待修问题](docs/KNOWN_LIMITATIONS.md)。
+
+当前范围为本机单用户、本地单页作品。第二真实执行器、跨领域专业效果、独立用户收益和生产环境能力仍待验证。停止请求只记录停止意愿，不代表正在进行的执行器轮次已中断；尚无任务货币硬上限。业务登录、支付、部署与公网服务不在本轮试点范围。
+
+### 本地验证
+
+```powershell
+# 默认回归：模型/执行器替身，不发起真实付费委托
+py -3.14 -X utf8 -B -m unittest discover -s tests
+
+# 额外启用本机浏览器集成，需要程序能够识别 Chrome / Edge
+$env:MENTIS_BROWSER_INTEGRATION = "1"
+py -3.14 -X utf8 -B -m unittest discover -s tests
+Remove-Item Env:MENTIS_BROWSER_INTEGRATION
 ```
-AGENTS.md            Agent 协作约定（含每轮可观察交付要求，第 6 节）
-docs/                规划、开发计划、状态、决定记录、案例、阶段报告
-mentis/              contracts / session / persist / export / demo_contract
-                     capabilities/：registry 资源加载、selection 按需选择、routing 缺口分流
-                     models/：DeepSeek Model Gateway（含图像输入）；observation / diagnosis：候选与结构观察
-                     executors/：Codex CLI Adapter；browser_observation：本地双视口截图
-                     render_measurement：真实视口渲染测量（溢出/裁剪/表单）
-                     collab.py 协作循环 + collab_cli.py（collab / collab-resume）
-                     guidance.py 指导修订循环 + guidance_cli.py（guide-revise / guide-resume）
-resources/           首领域资源（草案）：registry.json + web_pilot/ 三份
-tests/               入口、契约不变量、能力与分流检查
-runtime/             默认忽略；演示与会话数据
+
+默认浏览器集成测试会跳过。Fake、人工样例、真实执行器运行和独立效果评价分别记账；测试通过只支持已覆盖的行为。
+
+## 开发文档
+
+| 想了解什么 | 文档 |
+| :--- | :--- |
+| 如何启动与使用 | [工作台指南](docs/WORKBENCH_GUIDE.md) · [早期使用会话](docs/field-session-guide.md) |
+| 当前做到哪里 | [开发状态](docs/DEVELOPMENT_STATUS.md) · [已知限制](docs/KNOWN_LIMITATIONS.md) |
+| 产品目标与架构 | [总体规划](docs/PROJECT_PLAN.md) · [领域策略](docs/DOMAIN_STRATEGY.md) |
+| 下一步如何验收 | [开发计划](docs/DEVELOPMENT_PLAN.md) · [本地产品路线](docs/LOCAL_PRODUCT_ROADMAP.md) |
+| 如何核对决定与证据 | [决定索引](docs/decisions/README.md) · [追踪契约](docs/TRACKING_EVENT_CONTRACT.md) |
+| 如何开展公平对照 | [评价框架](docs/cases/pilot_eval_framework.md) · [E2 协议](docs/evaluation/e2/PROTOCOL.md) |
+| 如何接手开发 | [AGENTS.md](AGENTS.md) |
+
+```text
+Mentis/
+├── mentis/          协作、执行、观察、持久化与界面
+├── resources/       首任务族的专业资源及来源
+├── tests/           契约、流程、恢复与集成回归
+├── docs/            规划、决定、阶段报告与评测协议
+└── runtime/         本机任务与证据，运行时生成，Git 忽略
 ```
 
-## 文档入口
+欢迎提交带有**目标、实际结果、复现步骤与预期行为**的 [Issue](https://github.com/Peter-Sherlock/Mentis/issues)。提交改动前请阅读接手约定；涉及专业效果的结论请附前后作品和评价依据。
 
-- [开发计划](docs/DEVELOPMENT_PLAN.md)：22 个工作包的真实执行顺序（不按编号排序）。
-- [领域策略](docs/DOMAIN_STRATEGY.md)：首试点（小型网页界面与交互，proposed）与领域能力组合。
-- [案例](docs/cases/README.md)：网页试点反馈链案例（草案）与文档问答回归草案。
+---
+
+<div align="center">
+
+**让专业协作留下可检查的作品、变化与依据。**
+
+<sub>Mentis · A local, artifact-driven agent collaboration prototype</sub>
+
+</div>

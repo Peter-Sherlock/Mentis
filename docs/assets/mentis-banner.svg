@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="620" viewBox="0 0 1600 620" fill="none" role="img" aria-labelledby="title desc">
+<title id="title">Mentis — From intent to evidence</title>
+<desc id="desc">Mentis 品牌封面。深蓝背景上的目标、委托、观察和修订闭环，表达以实际作品和证据推动协作。此图为概念示意，不是运行截图。</desc>
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="620" gradientUnits="userSpaceOnUse"><stop stop-color="#10152B"/><stop offset=".55" stop-color="#14233A"/><stop offset="1" stop-color="#122D35"/></linearGradient>
+ <linearGradient id="accent" x1="952" y1="140" x2="1448" y2="500" gradientUnits="userSpaceOnUse"><stop stop-color="#B5C5FF"/><stop offset=".55" stop-color="#9AF2DE"/><stop offset="1" stop-color="#50B8C4"/></linearGradient>
+ <linearGradient id="rule" x1="90" y1="450" x2="860" y2="450" gradientUnits="userSpaceOnUse"><stop stop-color="#8AE7D6" stop-opacity=".8"/><stop offset="1" stop-color="#8AE7D6" stop-opacity="0"/></linearGradient>
+ <radialGradient id="halo"><stop stop-color="#83E4CE" stop-opacity=".11"/><stop offset="1" stop-color="#83E4CE" stop-opacity="0"/></radialGradient>
+ <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#C4D3E3" opacity=".13"/></pattern>
+</defs>
+<rect width="1600" height="620" rx="26" fill="url(#bg)"/>
+<rect width="1600" height="620" rx="26" fill="url(#dots)"/>
+<ellipse cx="1260" cy="296" rx="390" ry="280" fill="url(#halo)"/>
+<path d="M91 87H120" stroke="#98EFDC" stroke-width="3" stroke-linecap="round"/>
+<text x="135" y="93" fill="#9DDCCD" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" letter-spacing="4">INTENT · CRAFT · EVIDENCE</text>
+<text x="88" y="253" fill="#F0F5FA" font-family="Segoe UI,Arial,sans-serif" font-size="140" font-weight="700" letter-spacing="-6">Mentis<tspan fill="#99E8D8">.</tspan></text>
+<text x="94" y="329" fill="#DBE8ED" font-family="Segoe UI,Microsoft YaHei,PingFang SC,sans-serif" font-size="35" font-weight="400">从你的想法，到有依据的作品。</text>
+<text x="96" y="386" fill="#9AAFC2" font-family="Segoe UI,Arial,sans-serif" font-size="24">From intent to evidence. From feedback to better work.</text>
+<path d="M96 438H808" stroke="url(#rule)"/>
+<g font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" letter-spacing="1.2">
+ <rect x="94" y="474" width="137" height="39" rx="19.5" fill="#20364A" stroke="#395469"/><text x="116" y="499" fill="#CEE4E8">LOCAL FIRST</text>
+ <rect x="245" y="474" width="198" height="39" rx="19.5" fill="#20364A" stroke="#395469"/><text x="266" y="499" fill="#CEE4E8">ARTIFACT DRIVEN</text>
+ <rect x="457" y="474" width="206" height="39" rx="19.5" fill="#20364A" stroke="#395469"/><text x="478" y="499" fill="#CEE4E8">EVIDENCE AWARE</text>
+</g>
+<g stroke="#8BDCCE" stroke-opacity=".2"><circle cx="1220" cy="292" r="196"/><circle cx="1220" cy="292" r="148" stroke-dasharray="3 13"/></g>
+<path d="M1096 167C1180 100 1320 107 1383 183M1401 232C1460 310 1396 423 1311 443M1247 457C1144 497 1030 430 1027 337M1030 277C1032 234 1048 198 1080 177" stroke="url(#accent)" stroke-width="2.5" stroke-linecap="round"/>
+<path d="M1368 183L1386 187L1381 169M1317 428L1305 444L1326 448M1040 337L1027 323L1013 340M1064 177L1084 173L1076 191" stroke="#9DE8DB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<g font-family="Segoe UI,Arial,sans-serif">
+ <rect x="987" y="119" width="240" height="87" rx="16" fill="#182B40" stroke="#4C6C82"/>
+ <circle cx="1015" cy="148" r="4" fill="#B5C5FF"/><text x="1030" y="154" fill="#ACBDD0" font-size="13" letter-spacing="2">01 / INTENT</text><text x="1013" y="185" fill="#EFF5F8" font-size="18" font-weight="600">Understand the goal</text>
+ <rect x="1320" y="204" width="220" height="87" rx="16" fill="#192E40" stroke="#4C6C82"/>
+ <circle cx="1348" cy="233" r="4" fill="#9DE8DB"/><text x="1363" y="239" fill="#ACBDD0" font-size="13" letter-spacing="2">02 / DELEGATE</text><text x="1346" y="270" fill="#EFF5F8" font-size="18" font-weight="600">Make the first draft</text>
+ <rect x="1190" y="420" width="248" height="87" rx="16" fill="#183443" stroke="#4C6C82"/>
+ <circle cx="1218" cy="449" r="4" fill="#9DE8DB"/><text x="1233" y="455" fill="#ACBDD0" font-size="13" letter-spacing="2">03 / OBSERVE</text><text x="1216" y="486" fill="#EFF5F8" font-size="18" font-weight="600">Inspect the real work</text>
+ <rect x="920" y="290" width="240" height="87" rx="16" fill="#182D41" stroke="#4C6C82"/>
+ <circle cx="948" cy="319" r="4" fill="#B5C5FF"/><text x="963" y="325" fill="#ACBDD0" font-size="13" letter-spacing="2">04 / REFINE</text><text x="946" y="356" fill="#EFF5F8" font-size="18" font-weight="600">Revise with evidence</text>
+</g>
+<g transform="translate(1184 252)" stroke="url(#accent)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"><path d="M0 69V0L36 44L72 0V69"/><path d="M16 83H57" stroke-width="3"/></g>
+<text x="1531" y="568" text-anchor="end" fill="#708A9C" font-family="Segoe UI,Arial,sans-serif" font-size="13" letter-spacing="2.4">A RESEARCH PROTOTYPE</text>
+</svg>
